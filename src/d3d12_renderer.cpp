@@ -233,6 +233,7 @@ void D3D12Renderer::Shutdown() {
     m_planePso.Reset();
     m_earthPso.Reset();
     m_skyboxPso.Reset();
+    m_terrainPso.Reset();
 
     m_sceneCb = {};
     m_objectCb = {};
@@ -240,6 +241,7 @@ void D3D12Renderer::Shutdown() {
     m_landmaskUpload.Reset();
     m_skyboxTexture.Reset();
     m_skyboxUpload.Reset();
+    m_hasTerrainMesh = false;
 
     m_srvHeap.Reset();
     m_rtvHeap.Reset();
@@ -336,6 +338,46 @@ bool D3D12Renderer::SetPlaneMesh(const MeshData& mesh, std::string& error) {
 
     updated.ReleaseUploadBuffers();
     m_planeMesh = std::move(updated);
+    return true;
+}
+
+bool D3D12Renderer::SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, std::string& error) {
+    if (!mesh.IsValid()) {
+        error = "SetTerrainMesh called with invalid mesh";
+        return false;
+    }
+
+    WaitForGpu();
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    FrameContext& frame = m_frames[m_frameIndex];
+    if (FAILED(frame.allocator->Reset())) {
+        error = "SetTerrainMesh allocator reset failed";
+        return false;
+    }
+    if (FAILED(m_commandList->Reset(frame.allocator.Get(), nullptr))) {
+        error = "SetTerrainMesh command list reset failed";
+        return false;
+    }
+
+    GpuMesh updated;
+    if (!updated.Upload(m_device.Get(), m_commandList.Get(), mesh, error)) {
+        return false;
+    }
+
+    if (FAILED(m_commandList->Close())) {
+        error = "SetTerrainMesh command list close failed";
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+
+    updated.ReleaseUploadBuffers();
+    m_terrainMesh = std::move(updated);
+    m_terrainAnchorEcef = anchorEcef;
+    m_hasTerrainMesh = true;
     return true;
 }
 
@@ -451,8 +493,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         m_skyboxMesh.Draw(m_commandList.Get());
     }
 
-    // Draw Earth.
-    {
+    // Draw Earth sphere (optional legacy ground/ocean backdrop).
+    if (m_renderOldEarthSphere) {
         ObjectConstants obj{};
         const DirectX::XMMATRIX model = DirectX::XMMatrixTranslation(
             static_cast<float>(earthCenterLocalD.x),
@@ -465,6 +507,23 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 1);
         m_commandList->SetPipelineState(m_earthPso.Get());
         m_earthMesh.Draw(m_commandList.Get());
+    }
+
+    // Draw primary terrain patch from ETOPO samples.
+    if (m_hasTerrainMesh && m_terrainMesh.IsValid()) {
+        const Double3 terrainOffsetD = m_terrainAnchorEcef - anchor;
+        ObjectConstants obj{};
+        const DirectX::XMMATRIX model = DirectX::XMMatrixTranslation(
+            static_cast<float>(terrainOffsetD.x),
+            static_cast<float>(terrainOffsetD.y),
+            static_cast<float>(terrainOffsetD.z));
+        DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
+        obj.colorAndFlags = {0.0f, 6000.0f, 0.0f, 0.0f};
+
+        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
+        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
+        m_commandList->SetPipelineState(m_terrainPso.Get());
+        m_terrainMesh.Draw(m_commandList.Get());
     }
 
     // Draw plane.
@@ -492,8 +551,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
         obj.colorAndFlags = {0.92f, 0.93f, 0.95f, 0.0f};
 
-        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
-        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
+        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
+        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
         m_commandList->SetPipelineState(m_planePso.Get());
         m_planeMesh.Draw(m_commandList.Get());
     }
@@ -816,6 +875,8 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     ComPtr<ID3DBlob> earthPs;
     ComPtr<ID3DBlob> skyVs;
     ComPtr<ID3DBlob> skyPs;
+    ComPtr<ID3DBlob> terrainVs;
+    ComPtr<ID3DBlob> terrainPs;
 
     if (!CompileShader(m_shaderDir / "basic.hlsl", "VSMain", "vs_5_0", basicVs, error)) {
         return false;
@@ -833,6 +894,12 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
     if (!CompileShader(m_shaderDir / "skybox.hlsl", "PSMain", "ps_5_0", skyPs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "terrain.hlsl", "VSMain", "vs_5_0", terrainVs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "terrain.hlsl", "PSMain", "ps_5_0", terrainPs, error)) {
         return false;
     }
 
@@ -926,6 +993,19 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
 
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC terrainPso = pso;
+    terrainPso.VS = {terrainVs->GetBufferPointer(), terrainVs->GetBufferSize()};
+    terrainPso.PS = {terrainPs->GetBufferPointer(), terrainPs->GetBufferSize()};
+    terrainPso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    terrainPso.DepthStencilState.DepthEnable = TRUE;
+    terrainPso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+
+    hr = m_device->CreateGraphicsPipelineState(&terrainPso, IID_PPV_ARGS(m_terrainPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(terrain) failed", hr);
+        return false;
+    }
+
     return true;
 }
 
@@ -966,7 +1046,7 @@ bool D3D12Renderer::CreateConstantBuffers(std::string& error) {
         }
 
         D3D12_RESOURCE_DESC objectDesc = sceneDesc;
-        objectDesc.Width = m_objectCbStride * 3;
+        objectDesc.Width = m_objectCbStride * 4;
 
         hr = m_device->CreateCommittedResource(
             &heapProps,

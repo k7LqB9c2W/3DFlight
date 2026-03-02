@@ -39,6 +39,9 @@ public:
     void Render(const FlightSim& sim, ImDrawData* imguiDrawData);
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
+    bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, std::string& error);
+    void SetRenderOldEarthSphere(bool enabled) { m_renderOldEarthSphere = enabled; }
+    [[nodiscard]] bool IsRenderOldEarthSphereEnabled() const { return m_renderOldEarthSphere; }
     [[nodiscard]] bool HasLandmask() const { return m_hasLandmaskTexture; }
 
 private:
@@ -143,10 +146,15 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_planePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_earthPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_skyboxPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_terrainPso;
 
     GpuMesh m_earthMesh;
     GpuMesh m_planeMesh;
     GpuMesh m_skyboxMesh;
+    GpuMesh m_terrainMesh;
+    Double3 m_terrainAnchorEcef{};
+    bool m_hasTerrainMesh = false;
+    bool m_renderOldEarthSphere = true;
 
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_sceneCb;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_objectCb;

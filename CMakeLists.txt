@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(imgui CONFIG REQUIRED)
+find_package(unofficial-gdal CONFIG QUIET)
+find_package(GDAL CONFIG QUIET)
 
 add_executable(d3d12_flight WIN32
     src/main.cpp
@@ -20,6 +22,12 @@ add_executable(d3d12_flight WIN32
     src/earth.h
     src/sim.cpp
     src/sim.h
+    src/terrain/etopo_tile.cpp
+    src/terrain/etopo_tile.h
+    src/terrain/terrain_system.cpp
+    src/terrain/terrain_system.h
+    src/terrain/terrain_mesh.cpp
+    src/terrain/terrain_mesh.h
     third_party/cgltf/cgltf.c
 )
 
@@ -49,6 +57,16 @@ target_link_libraries(d3d12_flight PRIVATE
     d3dcompiler
     windowscodecs
 )
+
+if(TARGET unofficial::gdal::gdal)
+    target_link_libraries(d3d12_flight PRIVATE unofficial::gdal::gdal)
+elseif(TARGET GDAL::GDAL)
+    target_link_libraries(d3d12_flight PRIVATE GDAL::GDAL)
+elseif(TARGET gdal)
+    target_link_libraries(d3d12_flight PRIVATE gdal)
+else()
+    message(FATAL_ERROR "GDAL target not found. Ensure vcpkg gdal package is installed.")
+endif()
 
 set_target_properties(d3d12_flight PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:d3d12_flight>"
