@@ -23,6 +23,7 @@ using flight::InputState;
 using flight::MeshData;
 using flight::terrain::TerrainPatchBuildResult;
 using flight::terrain::TerrainPatchSettings;
+using flight::terrain::TerrainSampleDebug;
 using flight::terrain::TerrainSystem;
 using flight::terrain::TileKey;
 
@@ -66,6 +67,25 @@ double LonDeltaDeg(double aDeg, double bDeg) {
         d += 360.0;
     }
     return d;
+}
+
+double WrapLonDeg(double lonDeg) {
+    while (lonDeg >= 180.0) {
+        lonDeg -= 360.0;
+    }
+    while (lonDeg < -180.0) {
+        lonDeg += 360.0;
+    }
+    return lonDeg;
+}
+
+void OffsetLatLonMeters(double latDeg, double lonDeg, double northMeters, double eastMeters, double& outLatDeg, double& outLonDeg) {
+    const double latRad = flight::DegToRad(latDeg);
+    const double dLatDeg = flight::RadToDeg(northMeters / flight::kEarthRadiusMeters);
+    const double cosLat = std::max(0.01, std::cos(latRad));
+    const double dLonDeg = flight::RadToDeg(eastMeters / (flight::kEarthRadiusMeters * cosLat));
+    outLatDeg = std::clamp(latDeg + dLatDeg, -89.999, 89.999);
+    outLonDeg = WrapLonDeg(lonDeg + dLonDeg);
 }
 
 } // namespace
@@ -166,7 +186,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     double groundHeightRaw = 0.0;
     double groundHeightClamped = 0.0;
     bool tileLoadedAtPlane = false;
+    TerrainSampleDebug terrainSampleDebug{};
     TileKey currentTileKey = TerrainSystem::KeyForLatLon(sim.LatitudeDeg(), sim.LongitudeDeg());
+    double terrainPatchMinRaw = 0.0;
+    double terrainPatchMaxRaw = 0.0;
+    float debugProbeStepKm = 10.0f;
 
     std::string terrainRuntimeError;
 
@@ -213,12 +237,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         sim.SetStart(editableStart);
         sim.Update(dt, input, static_cast<double>(timeScale));
 
-        currentTileKey = TerrainSystem::KeyForLatLon(sim.LatitudeDeg(), sim.LongitudeDeg());
         if (terrainSystemReady) {
-            groundHeightRaw = terrainSystem.SampleHeightMeters(sim.LatitudeDeg(), sim.LongitudeDeg(), &tileLoadedAtPlane);
+            groundHeightRaw = terrainSystem.SampleHeightMetersDebug(sim.LatitudeDeg(), sim.LongitudeDeg(), terrainSampleDebug);
+            currentTileKey = terrainSampleDebug.key;
+            tileLoadedAtPlane = terrainSampleDebug.tileLoaded;
         } else {
             groundHeightRaw = 0.0;
             tileLoadedAtPlane = false;
+            terrainSampleDebug = {};
+            currentTileKey = TerrainSystem::KeyForLatLon(sim.LatitudeDeg(), sim.LongitudeDeg());
         }
         groundHeightClamped = std::max(groundHeightRaw, 0.0);
 
@@ -251,6 +278,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     if (renderer.SetTerrainMesh(patch.mesh, patch.anchorEcef, terrainUploadError)) {
                         patchCenterLatDeg = patch.centerLatDeg;
                         patchCenterLonDeg = patch.centerLonDeg;
+                        terrainPatchMinRaw = patch.minHeightRaw;
+                        terrainPatchMaxRaw = patch.maxHeightRaw;
                         havePatchCenter = true;
                         regenerateTerrainRequested = false;
                         terrainRuntimeError.clear();
@@ -328,6 +357,63 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Text("Throttle Up/Down arrows");
         ImGui::Text("Altitude R/F, Reset Backspace");
         ImGui::Text("Landmask: %s", renderer.HasLandmask() ? "loaded" : "fallback");
+        ImGui::End();
+
+        ImGui::Begin("Terrain Probe");
+        if (!terrainSystemReady) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Terrain system is not ready.");
+        } else {
+            const std::string expectedPath = terrainSampleDebug.expectedTilePath.string();
+            const std::string resolvedPath = terrainSampleDebug.tilePathFound ? terrainSampleDebug.resolvedTilePath.string() : "(missing)";
+
+            ImGui::Text("Sample Lat/Lon: %.6f, %.6f", sim.LatitudeDeg(), sim.LongitudeDeg());
+            ImGui::Text("Tile key: %s", terrainSampleDebug.key.ToCompactString().c_str());
+            ImGui::Text("Cache hit: %s", terrainSampleDebug.cacheHit ? "yes" : "no");
+            ImGui::Text("Tile available: %s", terrainSampleDebug.tileLoaded ? "yes" : "no");
+            ImGui::Text("Loaded this frame: %s", terrainSampleDebug.tileLoadedThisCall ? "yes" : "no");
+            ImGui::Text("Expected file: %s", expectedPath.c_str());
+            ImGui::Text("Resolved file: %s", resolvedPath.c_str());
+
+            const auto& probe = terrainSampleDebug.tileSample;
+            ImGui::Separator();
+            ImGui::Text("Map success: %s", probe.mapSucceeded ? "yes" : "no");
+            ImGui::Text("Map mode: %s", flight::terrain::PixelMappingModeToString(probe.mappingMode));
+            ImGui::Text("Mapped lon: %.6f (wrap %+g)", probe.mappedLonDeg, probe.lonWrapAppliedDeg);
+            ImGui::Text("Raw pixel: (%.3f, %.3f)", probe.rawPixelX, probe.rawPixelY);
+            ImGui::Text("Clamped pixel: (%.3f, %.3f)", probe.pixelX, probe.pixelY);
+            ImGui::Text("Texels: (%d,%d)-(%d,%d)", probe.x0, probe.y0, probe.x1, probe.y1);
+            ImGui::Text("Bilinear frac: tx=%.3f ty=%.3f", probe.tx, probe.ty);
+            ImGui::Text("Samples: h00=%.1f h10=%.1f h01=%.1f h11=%.1f", probe.h00, probe.h10, probe.h01, probe.h11);
+            ImGui::Text("Tile bounds lat[%.6f, %.6f] lon[%.6f, %.6f]", probe.latSouth, probe.latNorth, probe.lonWest, probe.lonEast);
+            ImGui::Text("Tile raster: %d x %d", probe.width, probe.height);
+            ImGui::Text("Patch raw min/max: %.1f / %.1f m", terrainPatchMinRaw, terrainPatchMaxRaw);
+
+            ImGui::Separator();
+            ImGui::SliderFloat("Probe Step (km)", &debugProbeStepKm, 1.0f, 100.0f, "%.1f");
+            ImGui::Text("3x3 raw heights around plane (north rows, west->east cols)");
+            for (int row = 1; row >= -1; --row) {
+                double rowSamples[3]{};
+                for (int col = -1; col <= 1; ++col) {
+                    double sampleLatDeg = 0.0;
+                    double sampleLonDeg = 0.0;
+                    OffsetLatLonMeters(
+                        sim.LatitudeDeg(),
+                        sim.LongitudeDeg(),
+                        static_cast<double>(row) * static_cast<double>(debugProbeStepKm) * 1000.0,
+                        static_cast<double>(col) * static_cast<double>(debugProbeStepKm) * 1000.0,
+                        sampleLatDeg,
+                        sampleLonDeg);
+                    rowSamples[col + 1] = terrainSystem.SampleHeightMeters(sampleLatDeg, sampleLonDeg);
+                }
+                ImGui::Text(
+                    "%+5.1f km N: %8.1f  %8.1f  %8.1f",
+                    static_cast<double>(row) * static_cast<double>(debugProbeStepKm),
+                    rowSamples[0],
+                    rowSamples[1],
+                    rowSamples[2]);
+            }
+            ImGui::Text("Columns are west / center / east at %+0.1f km.", debugProbeStepKm);
+        }
         ImGui::End();
 
         ImGui::Render();

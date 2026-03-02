@@ -52,10 +52,13 @@ bool TerrainSystem::Initialize(const std::filesystem::path& tilesDirectory, std:
 }
 
 TileKey TerrainSystem::KeyForLatLon(double latDeg, double lonDeg) {
-    latDeg = std::clamp(latDeg, -90.0, 89.999999);
+    latDeg = std::clamp(latDeg, -89.999999, 89.999999);
     NormalizeLon(lonDeg);
 
-    const int tileLat = static_cast<int>(std::floor(latDeg / 15.0)) * 15;
+    // ETOPO 15s filenames are keyed by the tile's northern latitude edge.
+    // Example: N45W135 covers lat [30,45] and lon [-135,-120].
+    constexpr double kBinEpsilon = 1e-9;
+    const int tileLat = static_cast<int>(std::floor((latDeg - kBinEpsilon) / 15.0)) * 15 + 15;
     const int tileLon = static_cast<int>(std::floor(lonDeg / 15.0)) * 15;
     return TileKey{tileLat, tileLon};
 }
@@ -74,6 +77,29 @@ double TerrainSystem::SampleHeightMeters(double latDeg, double lonDeg, bool* out
     }
 
     return tile->SampleHeightMeters(latDeg, lonDeg);
+}
+
+double TerrainSystem::SampleHeightMetersDebug(double latDeg, double lonDeg, TerrainSampleDebug& debug) {
+    debug = {};
+    debug.latDeg = latDeg;
+    debug.lonDeg = lonDeg;
+    debug.key = KeyForLatLon(latDeg, lonDeg);
+    debug.expectedTilePath = m_tilesDirectory / debug.key.ToFilename();
+    debug.resolvedTilePath = ResolveTilePath(debug.key);
+    debug.tilePathFound = !debug.resolvedTilePath.empty();
+    debug.cacheHit = IsTileLoaded(debug.key);
+
+    bool loaded = false;
+    TilePtr tile = GetOrLoadTile(debug.key, loaded);
+    debug.tileLoaded = loaded && (tile != nullptr);
+    debug.tileLoadedThisCall = debug.tileLoaded && !debug.cacheHit;
+    if (!tile) {
+        debug.sampledHeightMeters = 0.0;
+        return 0.0;
+    }
+
+    debug.sampledHeightMeters = tile->SampleHeightMetersDebug(latDeg, lonDeg, debug.tileSample);
+    return debug.sampledHeightMeters;
 }
 
 bool TerrainSystem::IsTileLoaded(const TileKey& key) const {
@@ -104,6 +130,9 @@ TerrainSystem::TilePtr TerrainSystem::GetOrLoadTile(const TileKey& key, bool& ou
     if (!tile->LoadFromFile(tilePath, error)) {
         return {};
     }
+    // ETOPO filenames are keyed by the north-west tag (NxxWyyy), so the actual
+    // bounds are lat [tag-15, tag] and lon [tag, tag+15].
+    tile->OverrideBoundsFromTileKey(key.latSouthDeg - 15, key.lonWestDeg, 15);
 
     m_cache.emplace(key, tile);
     m_lru.push_front(key);

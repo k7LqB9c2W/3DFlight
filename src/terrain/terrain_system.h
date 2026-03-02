@@ -27,6 +27,22 @@ struct TileKeyHasher {
     std::size_t operator()(const TileKey& key) const noexcept;
 };
 
+struct TerrainSampleDebug {
+    double latDeg = 0.0;
+    double lonDeg = 0.0;
+    TileKey key{};
+
+    std::filesystem::path expectedTilePath;
+    std::filesystem::path resolvedTilePath;
+    bool tilePathFound = false;
+    bool cacheHit = false;
+    bool tileLoaded = false;
+    bool tileLoadedThisCall = false;
+
+    double sampledHeightMeters = 0.0;
+    TileSampleDebug tileSample;
+};
+
 class TerrainSystem {
 public:
     bool Initialize(const std::filesystem::path& tilesDirectory, std::size_t cacheCapacity, std::string& error);
@@ -34,6 +50,7 @@ public:
     [[nodiscard]] static TileKey KeyForLatLon(double latDeg, double lonDeg);
 
     double SampleHeightMeters(double latDeg, double lonDeg, bool* outTileLoaded = nullptr);
+    double SampleHeightMetersDebug(double latDeg, double lonDeg, TerrainSampleDebug& debug);
 
     [[nodiscard]] bool IsTileLoaded(const TileKey& key) const;
     [[nodiscard]] std::size_t LoadedTileCount() const;
