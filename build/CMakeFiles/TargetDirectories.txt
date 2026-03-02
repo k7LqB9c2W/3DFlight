@@ -1,0 +1,3 @@
+C:/Users/Jacob/Documents/code/3DFlight/build/CMakeFiles/d3d12_flight.dir
+C:/Users/Jacob/Documents/code/3DFlight/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/Jacob/Documents/code/3DFlight/build/CMakeFiles/ZERO_CHECK.dir

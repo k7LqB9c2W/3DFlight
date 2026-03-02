@@ -1,0 +1,1156 @@
+#include "d3d12_renderer.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include <d3dcompiler.h>
+#include <imgui.h>
+#include <imgui_impl_dx12.h>
+#include <imgui_impl_win32.h>
+
+#include "earth.h"
+#include "mesh.h"
+
+namespace flight {
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
+
+UINT64 Align256(UINT64 v) {
+    return (v + 255ull) & ~255ull;
+}
+
+DirectX::XMFLOAT3 ToFloat3(const Double3& v) {
+    return {static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z)};
+}
+
+std::string HrMessage(const char* context, HRESULT hr) {
+    return std::string(context) + " (hr=0x" + std::to_string(static_cast<unsigned>(hr)) + ")";
+}
+
+} // namespace
+
+bool D3D12Renderer::Initialize(
+    HWND hwnd,
+    uint32_t width,
+    uint32_t height,
+    const std::filesystem::path& shaderDir,
+    const std::filesystem::path& assetDir,
+    std::string& error) {
+    m_hwnd = hwnd;
+    m_width = std::max(width, 1u);
+    m_height = std::max(height, 1u);
+    m_shaderDir = shaderDir;
+    m_assetDir = assetDir;
+
+    m_viewport = {0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height), 0.0f, 1.0f};
+    m_scissor = {0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height)};
+
+#if defined(_DEBUG)
+    {
+        ComPtr<ID3D12Debug> debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(debug.GetAddressOf())))) {
+            debug->EnableDebugLayer();
+        }
+    }
+#endif
+
+    if (!CreateDeviceResources(error)) {
+        return false;
+    }
+    if (!CreateSwapchainResources(error)) {
+        return false;
+    }
+    if (!CreateDepthBuffer(error)) {
+        return false;
+    }
+    if (!CreatePipeline(error)) {
+        return false;
+    }
+    if (!CreateConstantBuffers(error)) {
+        return false;
+    }
+
+    // Upload static resources (earth mesh, fallback plane mesh, landmask texture).
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    FrameContext& frame = m_frames[m_frameIndex];
+
+    const HRESULT resetAllocHr = frame.allocator->Reset();
+    if (FAILED(resetAllocHr)) {
+        error = HrMessage("Command allocator reset failed", resetAllocHr);
+        return false;
+    }
+    const HRESULT resetListHr = m_commandList->Reset(frame.allocator.Get(), nullptr);
+    if (FAILED(resetListHr)) {
+        error = HrMessage("Command list reset failed", resetListHr);
+        return false;
+    }
+
+    {
+        std::string meshError;
+        MeshData earthData = GenerateEarthSphere(static_cast<float>(kEarthRadiusMeters));
+        if (!m_earthMesh.Upload(m_device.Get(), m_commandList.Get(), earthData, meshError)) {
+            error = "Earth mesh upload failed: " + meshError;
+            return false;
+        }
+
+        MeshData fallbackPlane = CreatePlaceholderPlane();
+        if (!m_planeMesh.Upload(m_device.Get(), m_commandList.Get(), fallbackPlane, meshError)) {
+            error = "Fallback plane mesh upload failed: " + meshError;
+            return false;
+        }
+    }
+
+    if (!CreateLandmaskTexture(m_commandList.Get(), error)) {
+        return false;
+    }
+
+    const HRESULT closeHr = m_commandList->Close();
+    if (FAILED(closeHr)) {
+        error = HrMessage("Command list close failed", closeHr);
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+
+    m_earthMesh.ReleaseUploadBuffers();
+    m_planeMesh.ReleaseUploadBuffers();
+    m_landmaskUpload.Reset();
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+
+    if (!ImGui_ImplWin32_Init(m_hwnd)) {
+        error = "ImGui Win32 backend initialization failed";
+        return false;
+    }
+
+    const bool imguiDx12Ok = ImGui_ImplDX12_Init(
+        m_device.Get(),
+        static_cast<int>(kFrameCount),
+        kBackBufferFormat,
+        m_srvHeap.Get(),
+        CpuSrv(kFontSrvIndex),
+        GpuSrv(kFontSrvIndex));
+
+    if (!imguiDx12Ok) {
+        error = "ImGui DX12 backend initialization failed";
+        return false;
+    }
+    m_imguiInitialized = true;
+
+    return true;
+}
+
+void D3D12Renderer::Shutdown() {
+    WaitForGpu();
+
+    if (m_imguiInitialized) {
+        ImGui_ImplDX12_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        m_imguiInitialized = false;
+    }
+
+    if (m_fenceEvent != nullptr) {
+        CloseHandle(m_fenceEvent);
+        m_fenceEvent = nullptr;
+    }
+
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        if (m_sceneCb[i]) {
+            m_sceneCb[i]->Unmap(0, nullptr);
+        }
+        if (m_objectCb[i]) {
+            m_objectCb[i]->Unmap(0, nullptr);
+        }
+    }
+
+    ReleaseRenderTargets();
+    m_depthBuffer.Reset();
+    m_commandList.Reset();
+    for (auto& frame : m_frames) {
+        frame.allocator.Reset();
+        frame.fenceValue = 0;
+    }
+
+    m_rootSignature.Reset();
+    m_planePso.Reset();
+    m_earthPso.Reset();
+
+    m_sceneCb = {};
+    m_objectCb = {};
+    m_landmaskTexture.Reset();
+    m_landmaskUpload.Reset();
+
+    m_srvHeap.Reset();
+    m_rtvHeap.Reset();
+    m_dsvHeap.Reset();
+
+    m_swapChain.Reset();
+    m_commandQueue.Reset();
+    m_fence.Reset();
+    m_device.Reset();
+    m_factory.Reset();
+    m_wicFactory.Reset();
+}
+
+void D3D12Renderer::WaitForGpu() {
+    if (!m_commandQueue || !m_fence) {
+        return;
+    }
+
+    const UINT64 signalValue = ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), signalValue);
+    m_fence->SetEventOnCompletion(signalValue, m_fenceEvent);
+    WaitForSingleObject(m_fenceEvent, INFINITE);
+
+    for (auto& frame : m_frames) {
+        frame.fenceValue = signalValue;
+    }
+}
+
+void D3D12Renderer::Resize(uint32_t width, uint32_t height) {
+    if (!m_swapChain || width == 0 || height == 0) {
+        return;
+    }
+
+    WaitForGpu();
+    ReleaseRenderTargets();
+    m_depthBuffer.Reset();
+
+    DXGI_SWAP_CHAIN_DESC desc{};
+    m_swapChain->GetDesc(&desc);
+
+    if (FAILED(m_swapChain->ResizeBuffers(kFrameCount, width, height, desc.BufferDesc.Format, desc.Flags))) {
+        return;
+    }
+
+    m_width = width;
+    m_height = height;
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+
+    CreateRenderTargetViews();
+    std::string ignore;
+    CreateDepthBuffer(ignore);
+
+    m_viewport = {0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height), 0.0f, 1.0f};
+    m_scissor = {0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height)};
+}
+
+void D3D12Renderer::BeginImGuiFrame() {
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+}
+
+bool D3D12Renderer::SetPlaneMesh(const MeshData& mesh, std::string& error) {
+    if (!mesh.IsValid()) {
+        error = "SetPlaneMesh called with invalid mesh";
+        return false;
+    }
+
+    WaitForGpu();
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    FrameContext& frame = m_frames[m_frameIndex];
+    if (FAILED(frame.allocator->Reset())) {
+        error = "SetPlaneMesh allocator reset failed";
+        return false;
+    }
+    if (FAILED(m_commandList->Reset(frame.allocator.Get(), nullptr))) {
+        error = "SetPlaneMesh command list reset failed";
+        return false;
+    }
+
+    GpuMesh updated;
+    if (!updated.Upload(m_device.Get(), m_commandList.Get(), mesh, error)) {
+        return false;
+    }
+
+    if (FAILED(m_commandList->Close())) {
+        error = "SetPlaneMesh command list close failed";
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+
+    updated.ReleaseUploadBuffers();
+    m_planeMesh = std::move(updated);
+    return true;
+}
+
+void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
+    if (!m_swapChain) {
+        return;
+    }
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    WaitForFrame(m_frameIndex);
+
+    FrameContext& frame = m_frames[m_frameIndex];
+    frame.allocator->Reset();
+    m_commandList->Reset(frame.allocator.Get(), nullptr);
+
+    D3D12_RESOURCE_BARRIER toRender{};
+    toRender.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toRender.Transition.pResource = m_renderTargets[m_frameIndex].Get();
+    toRender.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    toRender.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toRender.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &toRender);
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = {
+        m_rtvHeap->GetCPUDescriptorHandleForHeapStart().ptr + static_cast<SIZE_T>(m_frameIndex) * m_rtvDescriptorSize};
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+
+    constexpr float clearColor[4] = {0.02f, 0.04f, 0.09f, 1.0f};
+    m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+    m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+    m_commandList->RSSetViewports(1, &m_viewport);
+    m_commandList->RSSetScissorRects(1, &m_scissor);
+
+    ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    const Double3 planeEcef = sim.PlaneEcef();
+    const Double3 forwardEcef = Normalize(sim.ForwardEcef());
+    const Double3 upEcef = Normalize(sim.UpEcef());
+
+    const Double3 cameraEcef = planeEcef - forwardEcef * 900.0 + upEcef * 280.0;
+    const Double3 anchor = cameraEcef;
+
+    const Double3 planeLocalD = planeEcef - anchor;
+    const Double3 earthCenterLocalD = Double3{-anchor.x, -anchor.y, -anchor.z};
+    const Double3 cameraTarget = planeLocalD + forwardEcef * 150.0;
+
+    const DirectX::XMVECTOR eye = DirectX::XMVectorZero();
+    const DirectX::XMVECTOR at = DirectX::XMVectorSet(
+        static_cast<float>(cameraTarget.x),
+        static_cast<float>(cameraTarget.y),
+        static_cast<float>(cameraTarget.z),
+        1.0f);
+    const DirectX::XMVECTOR up = DirectX::XMVectorSet(
+        static_cast<float>(upEcef.x),
+        static_cast<float>(upEcef.y),
+        static_cast<float>(upEcef.z),
+        0.0f);
+
+    const DirectX::XMMATRIX view = DirectX::XMMatrixLookAtLH(eye, at, up);
+    const float aspect = static_cast<float>(m_width) / static_cast<float>(std::max(m_height, 1u));
+    const DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(DirectX::XMConvertToRadians(60.0f), aspect, 10.0f, 50000000.0f);
+    const DirectX::XMMATRIX viewProj = view * proj;
+
+    SceneConstants sceneCb{};
+    DirectX::XMStoreFloat4x4(&sceneCb.viewProj, DirectX::XMMatrixTranspose(viewProj));
+    sceneCb.earthCenterRadius = {
+        static_cast<float>(earthCenterLocalD.x),
+        static_cast<float>(earthCenterLocalD.y),
+        static_cast<float>(earthCenterLocalD.z),
+        static_cast<float>(kEarthRadiusMeters),
+    };
+    std::memcpy(m_sceneCbMapped[m_frameIndex], &sceneCb, sizeof(sceneCb));
+
+    const D3D12_GPU_VIRTUAL_ADDRESS sceneCbGpu = m_sceneCb[m_frameIndex]->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS objectCbGpuBase = m_objectCb[m_frameIndex]->GetGPUVirtualAddress();
+
+    m_commandList->SetGraphicsRootConstantBufferView(0, sceneCbGpu);
+    m_commandList->SetGraphicsRootDescriptorTable(2, GpuSrv(kLandmaskSrvIndex));
+
+    // Draw Earth.
+    {
+        ObjectConstants obj{};
+        const DirectX::XMMATRIX model = DirectX::XMMatrixTranslation(
+            static_cast<float>(earthCenterLocalD.x),
+            static_cast<float>(earthCenterLocalD.y),
+            static_cast<float>(earthCenterLocalD.z));
+        DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
+        obj.colorAndFlags = {0.25f, 0.60f, 0.22f, m_hasLandmaskTexture ? 1.0f : 0.0f};
+
+        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 0), &obj, sizeof(obj));
+        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 0);
+        m_commandList->SetPipelineState(m_earthPso.Get());
+        m_earthMesh.Draw(m_commandList.Get());
+    }
+
+    // Draw plane.
+    {
+        Double3 rightEcef = Normalize(Cross(upEcef, forwardEcef));
+        if (Length(rightEcef) < 1e-6) {
+            rightEcef = {1.0, 0.0, 0.0};
+        }
+        Double3 upOrtho = Normalize(Cross(forwardEcef, rightEcef));
+
+        const double c = std::cos(sim.RollRad());
+        const double s = std::sin(sim.RollRad());
+        const Double3 rightRolled = Normalize(rightEcef * c + upOrtho * s);
+        const Double3 upRolled = Normalize(Cross(forwardEcef, rightRolled));
+
+        const DirectX::XMFLOAT3 pos = ToFloat3(planeLocalD);
+
+        const DirectX::XMMATRIX model(
+            static_cast<float>(rightRolled.x), static_cast<float>(rightRolled.y), static_cast<float>(rightRolled.z), 0.0f,
+            static_cast<float>(upRolled.x), static_cast<float>(upRolled.y), static_cast<float>(upRolled.z), 0.0f,
+            static_cast<float>(forwardEcef.x), static_cast<float>(forwardEcef.y), static_cast<float>(forwardEcef.z), 0.0f,
+            pos.x, pos.y, pos.z, 1.0f);
+
+        ObjectConstants obj{};
+        DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
+        obj.colorAndFlags = {0.92f, 0.93f, 0.95f, 0.0f};
+
+        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 1), &obj, sizeof(obj));
+        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 1);
+        m_commandList->SetPipelineState(m_planePso.Get());
+        m_planeMesh.Draw(m_commandList.Get());
+    }
+
+    if (imguiDrawData != nullptr) {
+        ImGui_ImplDX12_RenderDrawData(imguiDrawData, m_commandList.Get());
+    }
+
+    D3D12_RESOURCE_BARRIER toPresent{};
+    toPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toPresent.Transition.pResource = m_renderTargets[m_frameIndex].Get();
+    toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    toPresent.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &toPresent);
+
+    m_commandList->Close();
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    m_swapChain->Present(1, 0);
+
+    const UINT64 signalValue = ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), signalValue);
+    m_frames[m_frameIndex].fenceValue = signalValue;
+}
+
+bool D3D12Renderer::CreateDeviceResources(std::string& error) {
+    UINT dxgiFlags = 0;
+#if defined(_DEBUG)
+    dxgiFlags |= DXGI_CREATE_FACTORY_DEBUG;
+#endif
+
+    HRESULT hr = CreateDXGIFactory2(dxgiFlags, IID_PPV_ARGS(m_factory.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateDXGIFactory2 failed", hr);
+        return false;
+    }
+
+    hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(m_device.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("D3D12CreateDevice failed", hr);
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC queueDesc{};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(m_commandQueue.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandQueue failed", hr);
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
+    rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtvDesc.NumDescriptors = kFrameCount;
+    hr = m_device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(m_rtvHeap.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateDescriptorHeap(RTV) failed", hr);
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC dsvDesc{};
+    dsvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsvDesc.NumDescriptors = 1;
+    hr = m_device->CreateDescriptorHeap(&dsvDesc, IID_PPV_ARGS(m_dsvHeap.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateDescriptorHeap(DSV) failed", hr);
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC srvDesc{};
+    srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvDesc.NumDescriptors = 8;
+    srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = m_device->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(m_srvHeap.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateDescriptorHeap(SRV) failed", hr);
+        return false;
+    }
+
+    m_rtvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    m_srvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        hr = m_device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(m_frames[i].allocator.ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage("CreateCommandAllocator failed", hr);
+            return false;
+        }
+    }
+
+    hr = m_device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        m_frames[0].allocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(m_commandList.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandList failed", hr);
+        return false;
+    }
+    m_commandList->Close();
+
+    hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_fence.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateFence failed", hr);
+        return false;
+    }
+
+    m_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (m_fenceEvent == nullptr) {
+        error = "CreateEvent for fence failed";
+        return false;
+    }
+
+    hr = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(m_wicFactory.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CoCreateInstance(WICImagingFactory) failed", hr);
+        return false;
+    }
+
+    return true;
+}
+
+bool D3D12Renderer::CreateSwapchainResources(std::string& error) {
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = m_width;
+    desc.Height = m_height;
+    desc.Format = kBackBufferFormat;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = kFrameCount;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+    ComPtr<IDXGISwapChain1> swapChain1;
+    HRESULT hr = m_factory->CreateSwapChainForHwnd(
+        m_commandQueue.Get(),
+        m_hwnd,
+        &desc,
+        nullptr,
+        nullptr,
+        swapChain1.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        error = HrMessage("CreateSwapChainForHwnd failed", hr);
+        return false;
+    }
+
+    hr = swapChain1.As(&m_swapChain);
+    if (FAILED(hr)) {
+        error = HrMessage("Query IDXGISwapChain3 failed", hr);
+        return false;
+    }
+
+    m_factory->MakeWindowAssociation(m_hwnd, DXGI_MWA_NO_ALT_ENTER);
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    CreateRenderTargetViews();
+    return true;
+}
+
+bool D3D12Renderer::CreateDepthBuffer(std::string& error) {
+    D3D12_HEAP_PROPERTIES heapProps{};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = m_width;
+    desc.Height = m_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = kDepthFormat;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE clearValue{};
+    clearValue.Format = kDepthFormat;
+    clearValue.DepthStencil.Depth = 1.0f;
+
+    const HRESULT hr = m_device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &clearValue,
+        IID_PPV_ARGS(m_depthBuffer.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(depth) failed", hr);
+        return false;
+    }
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = kDepthFormat;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsv.Flags = D3D12_DSV_FLAG_NONE;
+    m_device->CreateDepthStencilView(m_depthBuffer.Get(), &dsv, m_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    return true;
+}
+
+bool D3D12Renderer::CompileShader(
+    const std::filesystem::path& path,
+    const char* entry,
+    const char* target,
+    ComPtr<ID3DBlob>& outBlob,
+    std::string& error) {
+    UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#if defined(_DEBUG)
+    flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+    ComPtr<ID3DBlob> errors;
+    const std::wstring ws = path.wstring();
+    const HRESULT hr = D3DCompileFromFile(
+        ws.c_str(),
+        nullptr,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        entry,
+        target,
+        flags,
+        0,
+        outBlob.ReleaseAndGetAddressOf(),
+        errors.GetAddressOf());
+
+    if (FAILED(hr)) {
+        std::string compilerErrors;
+        if (errors) {
+            compilerErrors.assign(
+                static_cast<const char*>(errors->GetBufferPointer()),
+                errors->GetBufferSize());
+        }
+        error = "Shader compile failed for " + path.string() + ": " + compilerErrors;
+        return false;
+    }
+
+    return true;
+}
+
+bool D3D12Renderer::CreatePipeline(std::string& error) {
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    range.BaseShaderRegister = 0;
+    range.RegisterSpace = 0;
+    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[3]{};
+
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0;
+    params[0].Descriptor.RegisterSpace = 0;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].Descriptor.ShaderRegister = 1;
+    params[1].Descriptor.RegisterSpace = 0;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &range;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.ShaderRegister = 0;
+    sampler.RegisterSpace = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+
+    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+    rootDesc.NumParameters = static_cast<UINT>(std::size(params));
+    rootDesc.pParameters = params;
+    rootDesc.NumStaticSamplers = 1;
+    rootDesc.pStaticSamplers = &sampler;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> sig;
+    ComPtr<ID3DBlob> sigErrors;
+    HRESULT hr = D3D12SerializeRootSignature(
+        &rootDesc,
+        D3D_ROOT_SIGNATURE_VERSION_1,
+        sig.ReleaseAndGetAddressOf(),
+        sigErrors.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        std::string detail;
+        if (sigErrors) {
+            detail.assign(
+                static_cast<const char*>(sigErrors->GetBufferPointer()),
+                sigErrors->GetBufferSize());
+        }
+        error = "D3D12SerializeRootSignature failed: " + detail;
+        return false;
+    }
+
+    hr = m_device->CreateRootSignature(
+        0,
+        sig->GetBufferPointer(),
+        sig->GetBufferSize(),
+        IID_PPV_ARGS(m_rootSignature.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateRootSignature failed", hr);
+        return false;
+    }
+
+    ComPtr<ID3DBlob> basicVs;
+    ComPtr<ID3DBlob> basicPs;
+    ComPtr<ID3DBlob> earthVs;
+    ComPtr<ID3DBlob> earthPs;
+
+    if (!CompileShader(m_shaderDir / "basic.hlsl", "VSMain", "vs_5_0", basicVs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "basic.hlsl", "PSMain", "ps_5_0", basicPs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "earth.hlsl", "VSMain", "vs_5_0", earthVs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "earth.hlsl", "PSMain", "ps_5_0", earthPs, error)) {
+        return false;
+    }
+
+    D3D12_INPUT_ELEMENT_DESC input[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+
+    D3D12_RASTERIZER_DESC rasterizer{};
+    rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+    rasterizer.CullMode = D3D12_CULL_MODE_BACK;
+    rasterizer.FrontCounterClockwise = FALSE;
+    rasterizer.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+    rasterizer.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    rasterizer.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    rasterizer.DepthClipEnable = TRUE;
+    rasterizer.MultisampleEnable = FALSE;
+    rasterizer.AntialiasedLineEnable = FALSE;
+    rasterizer.ForcedSampleCount = 0;
+    rasterizer.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    D3D12_BLEND_DESC blend{};
+    blend.AlphaToCoverageEnable = FALSE;
+    blend.IndependentBlendEnable = FALSE;
+    const D3D12_RENDER_TARGET_BLEND_DESC defaultRtBlend{
+        FALSE,
+        FALSE,
+        D3D12_BLEND_ONE,
+        D3D12_BLEND_ZERO,
+        D3D12_BLEND_OP_ADD,
+        D3D12_BLEND_ONE,
+        D3D12_BLEND_ZERO,
+        D3D12_BLEND_OP_ADD,
+        D3D12_LOGIC_OP_NOOP,
+        D3D12_COLOR_WRITE_ENABLE_ALL};
+    for (auto& rt : blend.RenderTarget) {
+        rt = defaultRtBlend;
+    }
+
+    D3D12_DEPTH_STENCIL_DESC depthStencil{};
+    depthStencil.DepthEnable = TRUE;
+    depthStencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    depthStencil.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    depthStencil.StencilEnable = FALSE;
+    depthStencil.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    depthStencil.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = m_rootSignature.Get();
+    pso.InputLayout = {input, static_cast<UINT>(std::size(input))};
+    pso.RasterizerState = rasterizer;
+    pso.BlendState = blend;
+    pso.DepthStencilState = depthStencil;
+    pso.SampleMask = UINT_MAX;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1;
+    pso.RTVFormats[0] = kBackBufferFormat;
+    pso.DSVFormat = kDepthFormat;
+    pso.SampleDesc.Count = 1;
+
+    pso.VS = {basicVs->GetBufferPointer(), basicVs->GetBufferSize()};
+    pso.PS = {basicPs->GetBufferPointer(), basicPs->GetBufferSize()};
+
+    hr = m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(m_planePso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(plane) failed", hr);
+        return false;
+    }
+
+    pso.VS = {earthVs->GetBufferPointer(), earthVs->GetBufferSize()};
+    pso.PS = {earthPs->GetBufferPointer(), earthPs->GetBufferSize()};
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+
+    hr = m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(m_earthPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(earth) failed", hr);
+        return false;
+    }
+
+    return true;
+}
+
+bool D3D12Renderer::CreateConstantBuffers(std::string& error) {
+    m_sceneCbSize = Align256(sizeof(SceneConstants));
+    m_objectCbStride = Align256(sizeof(ObjectConstants));
+
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        D3D12_HEAP_PROPERTIES heapProps{};
+        heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC sceneDesc{};
+        sceneDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        sceneDesc.Width = m_sceneCbSize;
+        sceneDesc.Height = 1;
+        sceneDesc.DepthOrArraySize = 1;
+        sceneDesc.MipLevels = 1;
+        sceneDesc.SampleDesc.Count = 1;
+        sceneDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        HRESULT hr = m_device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &sceneDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(m_sceneCb[i].ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage("CreateCommittedResource(scene CB) failed", hr);
+            return false;
+        }
+
+        D3D12_RANGE readRange{};
+        hr = m_sceneCb[i]->Map(0, &readRange, reinterpret_cast<void**>(&m_sceneCbMapped[i]));
+        if (FAILED(hr)) {
+            error = HrMessage("Map(scene CB) failed", hr);
+            return false;
+        }
+
+        D3D12_RESOURCE_DESC objectDesc = sceneDesc;
+        objectDesc.Width = m_objectCbStride * 2;
+
+        hr = m_device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &objectDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(m_objectCb[i].ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage("CreateCommittedResource(object CB) failed", hr);
+            return false;
+        }
+
+        hr = m_objectCb[i]->Map(0, &readRange, reinterpret_cast<void**>(&m_objectCbMapped[i]));
+        if (FAILED(hr)) {
+            error = HrMessage("Map(object CB) failed", hr);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool D3D12Renderer::LoadLandmaskPixels(
+    const std::filesystem::path& imagePath,
+    std::vector<uint8_t>& pixels,
+    uint32_t& outWidth,
+    uint32_t& outHeight,
+    std::string& error) {
+    if (!m_wicFactory) {
+        error = "WIC factory is not initialized";
+        return false;
+    }
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    HRESULT hr = m_wicFactory->CreateDecoderFromFilename(
+        imagePath.wstring().c_str(),
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnDemand,
+        decoder.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        error = HrMessage("CreateDecoderFromFilename failed", hr);
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, frame.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        error = HrMessage("WIC GetFrame failed", hr);
+        return false;
+    }
+
+    UINT srcW = 0;
+    UINT srcH = 0;
+    frame->GetSize(&srcW, &srcH);
+
+    // Downsample very large masks for quicker startup/memory use.
+    const UINT maxDim = 4096;
+    UINT dstW = srcW;
+    UINT dstH = srcH;
+
+    ComPtr<IWICBitmapSource> source;
+    if (std::max(srcW, srcH) > maxDim) {
+        const double scale = static_cast<double>(maxDim) / static_cast<double>(std::max(srcW, srcH));
+        dstW = std::max(1u, static_cast<UINT>(std::floor(srcW * scale)));
+        dstH = std::max(1u, static_cast<UINT>(std::floor(srcH * scale)));
+
+        ComPtr<IWICBitmapScaler> scaler;
+        hr = m_wicFactory->CreateBitmapScaler(scaler.ReleaseAndGetAddressOf());
+        if (FAILED(hr)) {
+            error = HrMessage("CreateBitmapScaler failed", hr);
+            return false;
+        }
+        hr = scaler->Initialize(frame.Get(), dstW, dstH, WICBitmapInterpolationModeLinear);
+        if (FAILED(hr)) {
+            error = HrMessage("BitmapScaler Initialize failed", hr);
+            return false;
+        }
+        source = scaler;
+    } else {
+        source = frame;
+    }
+
+    ComPtr<IWICFormatConverter> converter;
+    hr = m_wicFactory->CreateFormatConverter(converter.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        error = HrMessage("CreateFormatConverter failed", hr);
+        return false;
+    }
+
+    hr = converter->Initialize(
+        source.Get(),
+        GUID_WICPixelFormat8bppGray,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        error = HrMessage("FormatConverter Initialize failed", hr);
+        return false;
+    }
+
+    pixels.resize(static_cast<size_t>(dstW) * static_cast<size_t>(dstH));
+    hr = converter->CopyPixels(nullptr, dstW, static_cast<UINT>(pixels.size()), pixels.data());
+    if (FAILED(hr)) {
+        error = HrMessage("CopyPixels failed", hr);
+        return false;
+    }
+
+    outWidth = dstW;
+    outHeight = dstH;
+    return true;
+}
+
+bool D3D12Renderer::CreateLandmaskTextureFromPixels(
+    ID3D12GraphicsCommandList* commandList,
+    const uint8_t* pixels,
+    uint32_t width,
+    uint32_t height,
+    bool markLandmaskPresent,
+    std::string& error) {
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC texDesc{};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    HRESULT hr = m_device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(m_landmaskTexture.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(landmask texture) failed", hr);
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT numRows = 0;
+    UINT64 rowBytes = 0;
+    UINT64 uploadBytes = 0;
+    m_device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowBytes, &uploadBytes);
+
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC uploadDesc{};
+    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDesc.Width = uploadBytes;
+    uploadDesc.Height = 1;
+    uploadDesc.DepthOrArraySize = 1;
+    uploadDesc.MipLevels = 1;
+    uploadDesc.SampleDesc.Count = 1;
+    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    hr = m_device->CreateCommittedResource(
+        &uploadHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(m_landmaskUpload.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(landmask upload) failed", hr);
+        return false;
+    }
+
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE readRange{};
+    hr = m_landmaskUpload->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+    if (FAILED(hr)) {
+        error = HrMessage("Map(landmask upload) failed", hr);
+        return false;
+    }
+
+    const uint8_t* src = pixels;
+    uint8_t* dst = mapped + footprint.Offset;
+    for (UINT row = 0; row < numRows; ++row) {
+        std::memcpy(dst + row * footprint.Footprint.RowPitch, src + row * width, width);
+    }
+    m_landmaskUpload->Unmap(0, nullptr);
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+    dstLoc.pResource = m_landmaskTexture.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+    srcLoc.pResource = m_landmaskUpload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint = footprint;
+
+    commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = m_landmaskTexture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_landmaskTexture.Get(), &srv, CpuSrv(kLandmaskSrvIndex));
+
+    m_hasLandmaskTexture = markLandmaskPresent;
+    return true;
+}
+
+bool D3D12Renderer::CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList, std::string& error) {
+    std::vector<std::filesystem::path> candidates = {
+        m_assetDir / "textures" / "landmask_16k.png",
+        m_assetDir / "textures" / "landmask.png",
+        m_assetDir / "landmask_16k.png",
+        m_assetDir / "landmask.png",
+    };
+
+    for (const auto& p : candidates) {
+        if (!std::filesystem::exists(p)) {
+            continue;
+        }
+
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::string loadError;
+        if (LoadLandmaskPixels(p, pixels, width, height, loadError)) {
+            return CreateLandmaskTextureFromPixels(commandList, pixels.data(), width, height, true, error);
+        }
+    }
+
+    // Fallback: 1x1 ocean pixel.
+    const uint8_t ocean = 0;
+    return CreateLandmaskTextureFromPixels(commandList, &ocean, 1, 1, false, error);
+}
+
+void D3D12Renderer::WaitForFrame(UINT frameIndex) {
+    if (m_fence->GetCompletedValue() < m_frames[frameIndex].fenceValue) {
+        m_fence->SetEventOnCompletion(m_frames[frameIndex].fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+}
+
+void D3D12Renderer::CreateRenderTargetViews() {
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        m_swapChain->GetBuffer(i, IID_PPV_ARGS(m_renderTargets[i].ReleaseAndGetAddressOf()));
+        m_device->CreateRenderTargetView(m_renderTargets[i].Get(), nullptr, handle);
+        handle.ptr += m_rtvDescriptorSize;
+    }
+}
+
+void D3D12Renderer::ReleaseRenderTargets() {
+    for (auto& rt : m_renderTargets) {
+        rt.Reset();
+    }
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE D3D12Renderer::CpuSrv(UINT index) const {
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(index) * m_srvDescriptorSize;
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE D3D12Renderer::GpuSrv(UINT index) const {
+    D3D12_GPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(index) * static_cast<UINT64>(m_srvDescriptorSize);
+    return handle;
+}
+
+} // namespace flight

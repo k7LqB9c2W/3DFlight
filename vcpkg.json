@@ -1,0 +1,14 @@
+{
+  "name": "d3d12-flight-prototype",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "imgui",
+      "default-features": false,
+      "features": [
+        "dx12-binding",
+        "win32-binding"
+      ]
+    }
+  ]
+}
