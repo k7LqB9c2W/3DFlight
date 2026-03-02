@@ -20,6 +20,9 @@ struct TerrainPatchBuildResult {
     double centerLonDeg = 0.0;
     double minHeightRaw = 0.0;
     double maxHeightRaw = 0.0;
+    // x = near LOD radius (m), y = terrain color range max height (m),
+    // z = LOD transition width (m), w = far LOD radius (m).
+    DirectX::XMFLOAT4 renderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
 };
 
 bool BuildTerrainPatch(

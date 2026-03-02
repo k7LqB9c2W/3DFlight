@@ -93,7 +93,7 @@ void OffsetLatLonMeters(double latDeg, double lonDeg, double northMeters, double
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     CoInitializeEx(nullptr, COINITBASE_MULTITHREADED);
 
-    const wchar_t* kClassName = L"D3D12FlightPrototypeClass";
+    const wchar_t* kClassName = L"3DFlightClass";
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WindowProc;
@@ -112,7 +112,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     HWND hwnd = CreateWindowExW(
         0,
         kClassName,
-        L"D3D12 Flight Prototype",
+        L"3DFlight",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -168,7 +168,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     TerrainSystem terrainSystem;
     bool terrainSystemReady = false;
     std::string terrainInitError;
-    if (!terrainSystem.Initialize(std::filesystem::path("assets") / "etopo" / "tiles", 9, terrainInitError)) {
+    if (!terrainSystem.Initialize(std::filesystem::path("assets") / "etopo" / "tiles", 49, terrainInitError)) {
         terrainInitError = "Terrain init failed: " + terrainInitError;
     } else {
         terrainSystemReady = true;
@@ -238,6 +238,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         sim.Update(dt, input, static_cast<double>(timeScale));
 
         if (terrainSystemReady) {
+            terrainSystem.PrefetchAround(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.HeadingDeg(), sim.SpeedMps(), 2);
+        }
+
+        if (terrainSystemReady) {
             groundHeightRaw = terrainSystem.SampleHeightMetersDebug(sim.LatitudeDeg(), sim.LongitudeDeg(), terrainSampleDebug);
             currentTileKey = terrainSampleDebug.key;
             tileLoadedAtPlane = terrainSampleDebug.tileLoaded;
@@ -275,7 +279,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                         patch,
                         buildError)) {
                     std::string terrainUploadError;
-                    if (renderer.SetTerrainMesh(patch.mesh, patch.anchorEcef, terrainUploadError)) {
+                    if (renderer.SetTerrainMesh(patch.mesh, patch.anchorEcef, patch.renderParams, terrainUploadError)) {
                         patchCenterLatDeg = patch.centerLatDeg;
                         patchCenterLonDeg = patch.centerLonDeg;
                         terrainPatchMinRaw = patch.minHeightRaw;

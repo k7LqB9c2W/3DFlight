@@ -353,7 +353,11 @@ bool D3D12Renderer::SetPlaneMesh(const MeshData& mesh, std::string& error) {
     return true;
 }
 
-bool D3D12Renderer::SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, std::string& error) {
+bool D3D12Renderer::SetTerrainMesh(
+    const MeshData& mesh,
+    const Double3& anchorEcef,
+    const DirectX::XMFLOAT4& renderParams,
+    std::string& error) {
     if (!mesh.IsValid()) {
         error = "SetTerrainMesh called with invalid mesh";
         return false;
@@ -389,6 +393,7 @@ bool D3D12Renderer::SetTerrainMesh(const MeshData& mesh, const Double3& anchorEc
     updated.ReleaseUploadBuffers();
     m_terrainMesh = std::move(updated);
     m_terrainAnchorEcef = anchorEcef;
+    m_terrainRenderParams = renderParams;
     m_hasTerrainMesh = true;
     return true;
 }
@@ -595,7 +600,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(terrainOffsetD.y),
             static_cast<float>(terrainOffsetD.z));
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
-        obj.colorAndFlags = {0.0f, 6000.0f, 0.0f, 0.0f};
+        obj.colorAndFlags = m_terrainRenderParams;
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);

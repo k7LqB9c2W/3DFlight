@@ -39,7 +39,7 @@ public:
     void Render(const FlightSim& sim, ImDrawData* imguiDrawData);
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
-    bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, std::string& error);
+    bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, const DirectX::XMFLOAT4& renderParams, std::string& error);
     void SetRenderOldEarthSphere(bool enabled) { m_renderOldEarthSphere = enabled; }
     [[nodiscard]] bool IsRenderOldEarthSphereEnabled() const { return m_renderOldEarthSphere; }
     [[nodiscard]] bool HasLandmask() const { return m_hasLandmaskTexture; }
@@ -203,6 +203,7 @@ private:
     GpuMesh m_skyboxMesh;
     GpuMesh m_terrainMesh;
     Double3 m_terrainAnchorEcef{};
+    DirectX::XMFLOAT4 m_terrainRenderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
     bool m_hasTerrainMesh = false;
     bool m_renderOldEarthSphere = true;
 

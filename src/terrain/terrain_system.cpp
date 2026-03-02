@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <vector>
+
+#include "sim.h"
 
 namespace flight::terrain {
 namespace {
@@ -17,7 +20,47 @@ void NormalizeLon(double& lonDeg) {
     }
 }
 
+int NormalizeTileLon(int lonDeg) {
+    while (lonDeg >= 180) {
+        lonDeg -= 360;
+    }
+    while (lonDeg < -180) {
+        lonDeg += 360;
+    }
+    return lonDeg;
+}
+
+int ClampTileLatNorthKey(int latKeyDeg) {
+    return std::clamp(latKeyDeg, -75, 90);
+}
+
+void OffsetLatLonByHeading(double latDeg, double lonDeg, double headingDeg, double distanceMeters, double& outLatDeg, double& outLonDeg) {
+    const double lat1 = DegToRad(latDeg);
+    const double lon1 = DegToRad(lonDeg);
+    const double bearing = DegToRad(headingDeg);
+    const double delta = distanceMeters / kEarthRadiusMeters;
+
+    const double sinLat1 = std::sin(lat1);
+    const double cosLat1 = std::cos(lat1);
+    const double sinDelta = std::sin(delta);
+    const double cosDelta = std::cos(delta);
+
+    const double sinLat2 = std::clamp(sinLat1 * cosDelta + cosLat1 * sinDelta * std::cos(bearing), -1.0, 1.0);
+    const double lat2 = std::asin(sinLat2);
+    const double y = std::sin(bearing) * sinDelta * cosLat1;
+    const double x = cosDelta - sinLat1 * sinLat2;
+    const double lon2 = lon1 + std::atan2(y, x);
+
+    outLatDeg = std::clamp(RadToDeg(lat2), -89.999, 89.999);
+    outLonDeg = RadToDeg(lon2);
+    NormalizeLon(outLonDeg);
+}
+
 } // namespace
+
+TerrainSystem::~TerrainSystem() {
+    Shutdown();
+}
 
 std::string TileKey::ToCompactString() const {
     char latHem = (latSouthDeg >= 0) ? 'N' : 'S';
@@ -43,12 +86,72 @@ bool TerrainSystem::Initialize(const std::filesystem::path& tilesDirectory, std:
         return false;
     }
 
-    m_tilesDirectory = tilesDirectory;
-    m_cacheCapacity = std::max<std::size_t>(cacheCapacity, 9);
+    Shutdown();
+
+    {
+        std::scoped_lock<std::mutex> lock(m_mutex);
+        m_tilesDirectory = tilesDirectory;
+        // Keep at least 5x5 terrain tile residency.
+        m_cacheCapacity = std::max<std::size_t>(cacheCapacity, 25);
+        m_cache.clear();
+        m_lru.clear();
+        m_lruLookup.clear();
+        m_prefetchQueue.clear();
+        m_prefetchQueuedSet.clear();
+        m_prefetchStop = false;
+    }
+
+    StartWorker();
+    return true;
+}
+
+void TerrainSystem::Shutdown() {
+    StopWorker();
+    std::scoped_lock<std::mutex> lock(m_mutex);
     m_cache.clear();
     m_lru.clear();
     m_lruLookup.clear();
-    return true;
+    m_prefetchQueue.clear();
+    m_prefetchQueuedSet.clear();
+}
+
+void TerrainSystem::StartWorker() {
+    std::scoped_lock<std::mutex> lock(m_mutex);
+    if (m_prefetchThread.joinable()) {
+        return;
+    }
+    m_prefetchStop = false;
+    m_prefetchThread = std::thread([this]() { WorkerLoop(); });
+}
+
+void TerrainSystem::StopWorker() {
+    {
+        std::scoped_lock<std::mutex> lock(m_mutex);
+        m_prefetchStop = true;
+    }
+    m_prefetchCv.notify_all();
+    if (m_prefetchThread.joinable()) {
+        m_prefetchThread.join();
+    }
+}
+
+void TerrainSystem::WorkerLoop() {
+    while (true) {
+        TileKey key{};
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_prefetchCv.wait(lock, [this]() { return m_prefetchStop || !m_prefetchQueue.empty(); });
+            if (m_prefetchStop && m_prefetchQueue.empty()) {
+                break;
+            }
+            key = m_prefetchQueue.front();
+            m_prefetchQueue.pop_front();
+            m_prefetchQueuedSet.erase(key);
+        }
+
+        bool loaded = false;
+        (void)GetOrLoadTile(key, loaded);
+    }
 }
 
 TileKey TerrainSystem::KeyForLatLon(double latDeg, double lonDeg) {
@@ -102,15 +205,61 @@ double TerrainSystem::SampleHeightMetersDebug(double latDeg, double lonDeg, Terr
     return debug.sampledHeightMeters;
 }
 
+void TerrainSystem::PrefetchAround(double latDeg, double lonDeg, double headingDeg, double speedMps, int radiusTiles) {
+    radiusTiles = std::clamp(radiusTiles, 1, 4);
+
+    std::unordered_set<TileKey, TileKeyHasher> uniqueKeys;
+    auto addNeighborhood = [&](const TileKey& center, int radius) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                TileKey key{};
+                key.latSouthDeg = ClampTileLatNorthKey(center.latSouthDeg + dy * 15);
+                key.lonWestDeg = NormalizeTileLon(center.lonWestDeg + dx * 15);
+                uniqueKeys.insert(key);
+            }
+        }
+    };
+
+    addNeighborhood(KeyForLatLon(latDeg, lonDeg), radiusTiles);
+
+    const int lookAheadSteps = std::clamp(static_cast<int>(speedMps / 140.0) + 1, 1, 4);
+    for (int i = 1; i <= lookAheadSteps; ++i) {
+        const double lookAheadMeters = static_cast<double>(i) * 180000.0;
+        double predLatDeg = latDeg;
+        double predLonDeg = lonDeg;
+        OffsetLatLonByHeading(latDeg, lonDeg, headingDeg, lookAheadMeters, predLatDeg, predLonDeg);
+        addNeighborhood(KeyForLatLon(predLatDeg, predLonDeg), 1);
+    }
+
+    for (const TileKey& key : uniqueKeys) {
+        QueuePrefetchKey(key);
+    }
+}
+
+void TerrainSystem::QueuePrefetchKey(const TileKey& key) {
+    std::scoped_lock<std::mutex> lock(m_mutex);
+    if (m_cache.find(key) != m_cache.end()) {
+        return;
+    }
+    if (m_prefetchQueuedSet.find(key) != m_prefetchQueuedSet.end()) {
+        return;
+    }
+    m_prefetchQueue.push_back(key);
+    m_prefetchQueuedSet.insert(key);
+    m_prefetchCv.notify_one();
+}
+
 bool TerrainSystem::IsTileLoaded(const TileKey& key) const {
+    std::scoped_lock<std::mutex> lock(m_mutex);
     return m_cache.find(key) != m_cache.end();
 }
 
 std::size_t TerrainSystem::LoadedTileCount() const {
+    std::scoped_lock<std::mutex> lock(m_mutex);
     return m_cache.size();
 }
 
-TerrainSystem::TilePtr TerrainSystem::GetOrLoadTile(const TileKey& key, bool& outLoaded) {
+TerrainSystem::TilePtr TerrainSystem::GetOrLoadTileNoLock(const TileKey& key, bool& outLoaded) {
     outLoaded = false;
 
     const auto found = m_cache.find(key);
@@ -141,6 +290,11 @@ TerrainSystem::TilePtr TerrainSystem::GetOrLoadTile(const TileKey& key, bool& ou
 
     outLoaded = true;
     return tile;
+}
+
+TerrainSystem::TilePtr TerrainSystem::GetOrLoadTile(const TileKey& key, bool& outLoaded) {
+    std::scoped_lock<std::mutex> lock(m_mutex);
+    return GetOrLoadTileNoLock(key, outLoaded);
 }
 
 void TerrainSystem::TouchLru(const TileKey& key) {
