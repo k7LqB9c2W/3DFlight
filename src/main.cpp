@@ -36,6 +36,8 @@ namespace {
 
 D3D12Renderer* g_renderer = nullptr;
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kMetersToFeet = 3.280839895013123;
+constexpr double kMetersPerSecondToMph = 2.2369362920544025;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
@@ -154,6 +156,14 @@ flight::Double3 ComputeSunDirectionFromLocalSolarTime(
     return flight::Normalize(eastAxis * east + northAxis * north + upAxis * up);
 }
 
+double ToDisplayAltitude(double meters, bool useImperialUnits) {
+    return useImperialUnits ? (meters * kMetersToFeet) : meters;
+}
+
+double ToDisplaySpeed(double metersPerSecond, bool useImperialUnits) {
+    return useImperialUnits ? (metersPerSecond * kMetersPerSecondToMph) : metersPerSecond;
+}
+
 struct GraphicsTuningConfig {
     float patchSizeKm = 80.0f;
     int gridResolution = 257;
@@ -166,13 +176,13 @@ struct GraphicsTuningConfig {
 
     float colorHeightMaxMeters = 6000.0f;
     float lodTransitionWidthMeters = 5000.0f;
-    float hazeStrength = 0.40f;
-    float hazeAltitudeRangeMeters = 16000.0f;
+    float hazeStrength = 0.0f;
+    float hazeAltitudeRangeMeters = 25000.0f;
     float colorContrast = 1.0f;
     float slopeShadingStrength = 0.35f;
     float specularStrength = 0.14f;
-    float lodSeamBlendStrength = 0.45f;
-    float aerialPerspectiveDepthMeters = 32000.0f;
+    float lodSeamBlendStrength = 0.20f;
+    float aerialPerspectiveDepthMeters = 120000.0f;
 };
 
 void SanitizeGraphicsTuning(GraphicsTuningConfig& cfg) {
@@ -211,13 +221,13 @@ GraphicsTuningConfig MakeRealisticTuningPreset() {
     cfg.verticalExaggeration = 1.0f;
     cfg.colorHeightMaxMeters = 7200.0f;
     cfg.lodTransitionWidthMeters = 7000.0f;
-    cfg.hazeStrength = 0.30f;
-    cfg.hazeAltitudeRangeMeters = 18000.0f;
+    cfg.hazeStrength = 0.0f;
+    cfg.hazeAltitudeRangeMeters = 25000.0f;
     cfg.colorContrast = 1.10f;
     cfg.slopeShadingStrength = 0.42f;
     cfg.specularStrength = 0.10f;
-    cfg.lodSeamBlendStrength = 0.42f;
-    cfg.aerialPerspectiveDepthMeters = 65000.0f;
+    cfg.lodSeamBlendStrength = 0.18f;
+    cfg.aerialPerspectiveDepthMeters = 140000.0f;
     SanitizeGraphicsTuning(cfg);
     return cfg;
 }
@@ -226,10 +236,10 @@ GraphicsTuningConfig MakeCinematicTuningPreset() {
     GraphicsTuningConfig cfg = MakeRealisticTuningPreset();
     cfg.verticalExaggeration = 1.15f;
     cfg.colorContrast = 1.25f;
-    cfg.hazeStrength = 0.42f;
-    cfg.hazeAltitudeRangeMeters = 14000.0f;
+    cfg.hazeStrength = 0.10f;
+    cfg.hazeAltitudeRangeMeters = 22000.0f;
     cfg.specularStrength = 0.18f;
-    cfg.aerialPerspectiveDepthMeters = 55000.0f;
+    cfg.aerialPerspectiveDepthMeters = 120000.0f;
     SanitizeGraphicsTuning(cfg);
     return cfg;
 }
@@ -241,10 +251,10 @@ GraphicsTuningConfig MakeCrispTerrainTuningPreset() {
     cfg.verticalExaggeration = 1.18f;
     cfg.nearToMidMultiplier = 2.05f;
     cfg.midToFarMultiplier = 1.95f;
-    cfg.hazeStrength = 0.16f;
+    cfg.hazeStrength = 0.0f;
     cfg.colorContrast = 1.35f;
     cfg.slopeShadingStrength = 0.58f;
-    cfg.aerialPerspectiveDepthMeters = 90000.0f;
+    cfg.aerialPerspectiveDepthMeters = 220000.0f;
     SanitizeGraphicsTuning(cfg);
     return cfg;
 }
@@ -323,6 +333,14 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
     readFloat("lod_seam_blend_strength", outCfg.lodSeamBlendStrength);
     readFloat("aerial_perspective_depth_m", outCfg.aerialPerspectiveDepthMeters);
 
+    // Migrate older profiles that used heavy non-physical haze defaults.
+    const int version = j.value("config_version", 1);
+    if (version < 2) {
+        outCfg.hazeStrength = std::min(outCfg.hazeStrength * 0.25f, 0.12f);
+        outCfg.lodSeamBlendStrength = std::min(outCfg.lodSeamBlendStrength, 0.22f);
+        outCfg.aerialPerspectiveDepthMeters = std::max(outCfg.aerialPerspectiveDepthMeters, 120000.0f);
+    }
+
     SanitizeGraphicsTuning(outCfg);
     return true;
 }
@@ -360,6 +378,7 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
     j["specular_strength"] = cfg.specularStrength;
     j["lod_seam_blend_strength"] = cfg.lodSeamBlendStrength;
     j["aerial_perspective_depth_m"] = cfg.aerialPerspectiveDepthMeters;
+    j["config_version"] = 2;
 
     out << j.dump(2) << "\n";
     return true;
@@ -441,6 +460,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     FlightSim sim;
     FlightStart editableStart = sim.GetStart();
     float simTimeScale = 1.0f;
+    bool useImperialUnits = false;
     float localSolarTimeHours = 14.0f;
     int dayOfYear = 172;
     bool autoTimeOfDay = false;
@@ -654,15 +674,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Begin("Flight HUD");
         ImGui::Text("Lat: %.6f deg", sim.LatitudeDeg());
         ImGui::Text("Lon: %.6f deg", sim.LongitudeDeg());
-        ImGui::Text("Altitude: %.1f m", sim.AltitudeMeters());
-        ImGui::Text("Speed: %.1f m/s", sim.SpeedMps());
+        if (useImperialUnits) {
+            ImGui::Text("Altitude: %.1f ft", ToDisplayAltitude(sim.AltitudeMeters(), true));
+            ImGui::Text("Speed: %.1f mph", ToDisplaySpeed(sim.SpeedMps(), true));
+        } else {
+            ImGui::Text("Altitude: %.1f m", sim.AltitudeMeters());
+            ImGui::Text("Speed: %.1f m/s", sim.SpeedMps());
+        }
         ImGui::Text("Heading: %.2f deg", sim.HeadingDeg());
+        ImGui::Checkbox("Imperial Units (mph/ft)", &useImperialUnits);
 
         ImGui::Separator();
         ImGui::Text("Terrain Debug");
         ImGui::Text("Tile key: %s", currentTileKey.ToCompactString().c_str());
-        ImGui::Text("Ground raw: %.2f m", groundHeightRaw);
-        ImGui::Text("Ground clamped: %.2f m", groundHeightClamped);
+        if (useImperialUnits) {
+            ImGui::Text("Ground raw: %.2f ft", ToDisplayAltitude(groundHeightRaw, true));
+            ImGui::Text("Ground clamped: %.2f ft", ToDisplayAltitude(groundHeightClamped, true));
+        } else {
+            ImGui::Text("Ground raw: %.2f m", groundHeightRaw);
+            ImGui::Text("Ground clamped: %.2f m", groundHeightClamped);
+        }
         ImGui::Text("Tile loaded: %s", tileLoadedAtPlane ? "yes" : "no");
         ImGui::Text("Cache: %zu / %zu", terrainSystem.LoadedTileCount(), terrainSystem.CacheCapacity());
 
@@ -719,7 +750,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Text("Start/Respawn");
         ImGui::InputDouble("Start Latitude", &editableStart.latitudeDeg, 0.1, 1.0, "%.6f");
         ImGui::InputDouble("Start Longitude", &editableStart.longitudeDeg, 0.1, 1.0, "%.6f");
-        ImGui::InputDouble("Start Altitude (m)", &editableStart.altitudeMeters, 10.0, 100.0, "%.1f");
+        if (useImperialUnits) {
+            double startAltitudeFeet = ToDisplayAltitude(editableStart.altitudeMeters, true);
+            if (ImGui::InputDouble("Start Altitude (ft)", &startAltitudeFeet, 100.0, 1000.0, "%.1f")) {
+                editableStart.altitudeMeters = std::max(0.0, startAltitudeFeet / kMetersToFeet);
+            }
+        } else {
+            ImGui::InputDouble("Start Altitude (m)", &editableStart.altitudeMeters, 10.0, 100.0, "%.1f");
+        }
         if (ImGui::Button("Respawn At Start")) {
             sim.SetStart(editableStart);
             sim.Respawn();
@@ -777,10 +815,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (ImGui::SliderFloat("LOD Transition Width (m)", &graphicsTuning.lodTransitionWidthMeters, 250.0f, 50000.0f, "%.0f")) {
             visualTuningChanged = true;
         }
-        if (ImGui::SliderFloat("Haze Strength", &graphicsTuning.hazeStrength, 0.0f, 2.0f, "%.2f")) {
+        if (ImGui::SliderFloat("Artistic Haze Strength", &graphicsTuning.hazeStrength, 0.0f, 2.0f, "%.2f")) {
             visualTuningChanged = true;
         }
-        if (ImGui::SliderFloat("Haze Altitude Range (m)", &graphicsTuning.hazeAltitudeRangeMeters, 1000.0f, 80000.0f, "%.0f")) {
+        if (ImGui::SliderFloat("Artistic Haze Alt Range (m)", &graphicsTuning.hazeAltitudeRangeMeters, 1000.0f, 80000.0f, "%.0f")) {
             visualTuningChanged = true;
         }
         if (ImGui::SliderFloat("Color Contrast", &graphicsTuning.colorContrast, 0.2f, 3.0f, "%.2f")) {
@@ -870,6 +908,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (!graphicsConfigStatus.empty()) {
             ImGui::TextWrapped("%s", graphicsConfigStatus.c_str());
         }
+        ImGui::TextUnformatted("For physical atmosphere, keep Artistic Haze Strength at 0.");
         ImGui::TextUnformatted("Mesh sliders trigger terrain regeneration. Visual sliders apply live.");
         ImGui::End();
 
@@ -900,11 +939,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("Samples: h00=%.1f h10=%.1f h01=%.1f h11=%.1f", probe.h00, probe.h10, probe.h01, probe.h11);
             ImGui::Text("Tile bounds lat[%.6f, %.6f] lon[%.6f, %.6f]", probe.latSouth, probe.latNorth, probe.lonWest, probe.lonEast);
             ImGui::Text("Tile raster: %d x %d", probe.width, probe.height);
-            ImGui::Text("Patch raw min/max: %.1f / %.1f m", terrainPatchMinRaw, terrainPatchMaxRaw);
+            if (useImperialUnits) {
+                ImGui::Text(
+                    "Patch raw min/max: %.1f / %.1f ft",
+                    ToDisplayAltitude(terrainPatchMinRaw, true),
+                    ToDisplayAltitude(terrainPatchMaxRaw, true));
+            } else {
+                ImGui::Text("Patch raw min/max: %.1f / %.1f m", terrainPatchMinRaw, terrainPatchMaxRaw);
+            }
 
             ImGui::Separator();
             ImGui::SliderFloat("Probe Step (km)", &debugProbeStepKm, 1.0f, 100.0f, "%.1f");
-            ImGui::Text("3x3 raw heights around plane (north rows, west->east cols)");
+            ImGui::Text("3x3 raw heights around plane (%s, north rows, west->east cols)", useImperialUnits ? "ft" : "m");
             for (int row = 1; row >= -1; --row) {
                 double rowSamples[3]{};
                 for (int col = -1; col <= 1; ++col) {
@@ -919,12 +965,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                         sampleLonDeg);
                     rowSamples[col + 1] = terrainSystem.SampleHeightMeters(sampleLatDeg, sampleLonDeg);
                 }
+                const double s0 = ToDisplayAltitude(rowSamples[0], useImperialUnits);
+                const double s1 = ToDisplayAltitude(rowSamples[1], useImperialUnits);
+                const double s2 = ToDisplayAltitude(rowSamples[2], useImperialUnits);
                 ImGui::Text(
                     "%+5.1f km N: %8.1f  %8.1f  %8.1f",
                     static_cast<double>(row) * static_cast<double>(debugProbeStepKm),
-                    rowSamples[0],
-                    rowSamples[1],
-                    rowSamples[2]);
+                    s0,
+                    s1,
+                    s2);
             }
             ImGui::Text("Columns are west / center / east at %+0.1f km.", debugProbeStepKm);
         }

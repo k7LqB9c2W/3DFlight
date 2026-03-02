@@ -28,12 +28,12 @@ public:
         float lodTransitionWidthMeters = 5000.0f;
         float midRingMultiplier = 2.6f;
         float farRingMultiplier = 2.6f;
-        float hazeStrength = 0.40f;
-        float hazeAltitudeRangeMeters = 16000.0f;
+        float hazeStrength = 0.0f;
+        float hazeAltitudeRangeMeters = 25000.0f;
         float colorContrast = 1.0f;
         float slopeShadingStrength = 0.35f;
         float specularStrength = 0.14f;
-        float lodSeamBlendStrength = 0.45f;
+        float lodSeamBlendStrength = 0.20f;
     };
 
     bool Initialize(
@@ -256,7 +256,7 @@ private:
     bool m_atmosphereEnabled = true;
     bool m_multipleScatteringEnabled = true;
     float m_atmosphereExposure = 1.0f;
-    float m_aerialPerspectiveDepthMeters = 32000.0f;
+    float m_aerialPerspectiveDepthMeters = 120000.0f;
 
     bool m_imguiInitialized = false;
 };

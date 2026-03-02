@@ -61,14 +61,6 @@ float4 PSMain(VSOutput input) : SV_Target
     float3 baseColor = gColorAndFlags.rgb;
     float3 lit = baseColor * (ambient + diffuse) + spec.xxx + rim * float3(0.52, 0.62, 0.75);
 
-    const float distMeters = length(input.worldPos);
-    const float cameraAltitude = max(0.0, length(CameraPosition() - PlanetCenter()) - GroundRadiusMeters());
-    const float lowAltitudeFactor = saturate(1.0 - cameraAltitude / 16000.0);
-    const float haze = lowAltitudeFactor * saturate(distMeters / 280000.0);
-    const float2 skyUv = DirectionToSkyViewUv(normalize(input.worldPos), normalize(gCameraUpAndTime.xyz), L);
-    const float3 skyColor = gSkyViewLut.SampleLevel(gClampSampler, skyUv, 0).rgb;
-    lit = lerp(lit, skyColor, haze * 0.25);
-
     lit = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), lit);
     lit = 1.0 - exp(-lit * max(gAtmosphereFlags.z, 0.01));
     return float4(saturate(lit), 1.0);

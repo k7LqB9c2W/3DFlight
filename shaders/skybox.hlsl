@@ -63,9 +63,6 @@ float4 PSMain(VSOutput input) : SV_Target
         float halo = pow(saturate(cosAngle), 96.0);
         float3 sunColor = float3(1.0, 0.95, 0.84) * (0.35 * gSunDirIntensity.w);
         color += sunColor * (disk * 6.0 + halo * 0.12);
-
-        // Optional subtle detail from cube map without making it primary daytime source.
-        color = lerp(color, color * 0.94 + gSkybox.Sample(gWrapSampler, dir).rgb * 0.06, 0.12);
     }
     else
     {

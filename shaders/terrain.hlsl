@@ -104,21 +104,23 @@ float4 PSMain(VSOutput input) : SV_Target
             1.0 - saturate(abs(distMeters - boundary1) / transitionWidth)),
         1.0 - saturate(abs(distMeters - boundary2) / transitionWidth));
 
-    const float3 skyDir = normalize(input.worldPos);
-    const float2 skyUv = DirectionToSkyViewUv(skyDir, normalize(gCameraUpAndTime.xyz), L);
-    const float3 skyColor = gSkyViewLut.SampleLevel(gClampSampler, skyUv, 0).rgb;
-
     // Dithered LOD transition softening to hide ring swaps.
     const float lodBlend = saturate((blend0 + blend1 + blend2) / 3.0);
     const float seamBlend = saturate(seamMask * gTuning1.w + lodBlend * 0.12);
-    color = lerp(color, color * 0.93 + skyColor * 0.07, seamBlend);
+    color *= lerp(1.0, 0.985, seamBlend * 0.35);
 
-    // Altitude-dependent distance haze (stronger close to sea level).
-    const float cameraAltitude = max(0.0, length(CameraPosition() - PlanetCenter()) - GroundRadiusMeters());
-    const float lowAltitudeFactor = saturate(1.0 - cameraAltitude / max(gTuning0.w, 1000.0));
-    const float farFieldFactor = saturate(distMeters / max(gColorAndFlags.w, 1.0));
-    const float extraHaze = lowAltitudeFactor * farFieldFactor * farFieldFactor;
-    color = lerp(color, skyColor, extraHaze * gTuning0.z);
+    // Optional artistic haze (non-physical). Keep at 0 for realistic mode.
+    if (gTuning0.z > 1e-4)
+    {
+        const float3 skyDir = normalize(input.worldPos);
+        const float2 skyUv = DirectionToSkyViewUv(skyDir, normalize(gCameraUpAndTime.xyz), L);
+        const float3 skyColor = gSkyViewLut.SampleLevel(gClampSampler, skyUv, 0).rgb;
+        const float cameraAltitude = max(0.0, length(CameraPosition() - PlanetCenter()) - GroundRadiusMeters());
+        const float lowAltitudeFactor = saturate(1.0 - cameraAltitude / max(gTuning0.w, 1000.0));
+        const float farFieldFactor = saturate(distMeters / max(gColorAndFlags.w, 1.0));
+        const float extraHaze = lowAltitudeFactor * farFieldFactor * farFieldFactor;
+        color = lerp(color, skyColor, extraHaze * gTuning0.z);
+    }
 
     color = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), color);
     color = 1.0 - exp(-color * max(gAtmosphereFlags.z, 0.01));
