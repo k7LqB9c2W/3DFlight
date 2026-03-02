@@ -32,6 +32,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg
 namespace {
 
 D3D12Renderer* g_renderer = nullptr;
+constexpr double kPi = 3.14159265358979323846;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
@@ -86,6 +87,68 @@ void OffsetLatLonMeters(double latDeg, double lonDeg, double northMeters, double
     const double dLonDeg = flight::RadToDeg(eastMeters / (flight::kEarthRadiusMeters * cosLat));
     outLatDeg = std::clamp(latDeg + dLatDeg, -89.999, 89.999);
     outLonDeg = WrapLonDeg(lonDeg + dLonDeg);
+}
+
+double WrapHours24(double hours) {
+    while (hours >= 24.0) {
+        hours -= 24.0;
+    }
+    while (hours < 0.0) {
+        hours += 24.0;
+    }
+    return hours;
+}
+
+void AdvanceLocalSolarClock(float& localSolarTimeHours, int& dayOfYear, double deltaHours) {
+    double hours = static_cast<double>(localSolarTimeHours) + deltaHours;
+    int day = std::clamp(dayOfYear, 1, 365);
+    while (hours >= 24.0) {
+        hours -= 24.0;
+        day += 1;
+        if (day > 365) {
+            day = 1;
+        }
+    }
+    while (hours < 0.0) {
+        hours += 24.0;
+        day -= 1;
+        if (day < 1) {
+            day = 365;
+        }
+    }
+    localSolarTimeHours = static_cast<float>(hours);
+    dayOfYear = day;
+}
+
+flight::Double3 ComputeSunDirectionFromLocalSolarTime(
+    double latitudeDeg,
+    double longitudeDeg,
+    int dayOfYear,
+    double localSolarTimeHours) {
+    const int clampedDay = std::clamp(dayOfYear, 1, 365);
+    const double wrappedHours = WrapHours24(localSolarTimeHours);
+
+    const double latRad = flight::DegToRad(latitudeDeg);
+    const double lonRad = flight::DegToRad(longitudeDeg);
+    const double declinationRad =
+        flight::DegToRad(23.44) * std::sin((2.0 * kPi / 365.0) * (static_cast<double>(clampedDay) - 81.0));
+    const double hourAngleRad = flight::DegToRad((wrappedHours - 12.0) * 15.0);
+
+    const double cosDecl = std::cos(declinationRad);
+    const double sinDecl = std::sin(declinationRad);
+    const double cosLat = std::cos(latRad);
+    const double sinLat = std::sin(latRad);
+    const double cosHour = std::cos(hourAngleRad);
+    const double sinHour = std::sin(hourAngleRad);
+
+    // Local ENU sun direction; east sign keeps morning sun in the east and afternoon sun in the west.
+    const double east = -cosDecl * sinHour;
+    const double north = cosLat * sinDecl - sinLat * cosDecl * cosHour;
+    const double up = sinLat * sinDecl + cosLat * cosDecl * cosHour;
+
+    flight::Double3 eastAxis, northAxis, upAxis;
+    flight::BuildEnuBasis(latRad, lonRad, eastAxis, northAxis, upAxis);
+    return flight::Normalize(eastAxis * east + northAxis * north + upAxis * up);
 }
 
 } // namespace
@@ -163,7 +226,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
     FlightSim sim;
     FlightStart editableStart = sim.GetStart();
-    float timeScale = 1.0f;
+    float simTimeScale = 1.0f;
+    float localSolarTimeHours = 14.0f;
+    int dayOfYear = 172;
+    bool autoTimeOfDay = false;
+    float timeOfDayRateHoursPerSecond = 0.5f;
 
     TerrainSystem terrainSystem;
     bool terrainSystemReady = false;
@@ -235,7 +302,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         previousBackspace = backspaceDown;
 
         sim.SetStart(editableStart);
-        sim.Update(dt, input, static_cast<double>(timeScale));
+        sim.Update(dt, input, static_cast<double>(simTimeScale));
+
+        if (autoTimeOfDay) {
+            AdvanceLocalSolarClock(localSolarTimeHours, dayOfYear, static_cast<double>(timeOfDayRateHoursPerSecond) * dt);
+        }
+        localSolarTimeHours = static_cast<float>(WrapHours24(localSolarTimeHours));
+        dayOfYear = std::clamp(dayOfYear, 1, 365);
+
+        const flight::Double3 sunDir =
+            ComputeSunDirectionFromLocalSolarTime(sim.LatitudeDeg(), sim.LongitudeDeg(), dayOfYear, localSolarTimeHours);
+        renderer.SetSunDirection(sunDir);
+        const double sunElevationDeg = flight::RadToDeg(std::asin(std::clamp(flight::Dot(sunDir, sim.UpEcef()), -1.0, 1.0)));
 
         if (terrainSystemReady) {
             terrainSystem.PrefetchAround(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.HeadingDeg(), sim.SpeedMps(), 2);
@@ -329,6 +407,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             renderer.SetAtmosphereExposure(atmosphereExposure);
         }
 
+        ImGui::Separator();
+        ImGui::Text("Time Of Day");
+        ImGui::Checkbox("Auto Time Advance", &autoTimeOfDay);
+        if (ImGui::SliderFloat("Local Solar Time (h)", &localSolarTimeHours, 0.0f, 24.0f, "%.2f")) {
+            localSolarTimeHours = static_cast<float>(WrapHours24(localSolarTimeHours));
+        }
+        ImGui::SliderInt("Day Of Year", &dayOfYear, 1, 365);
+        ImGui::SliderFloat("Time Rate (h/s)", &timeOfDayRateHoursPerSecond, -4.0f, 20.0f, "%.2f");
+        if (ImGui::Button("Sunrise")) {
+            localSolarTimeHours = 6.0f;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Noon")) {
+            localSolarTimeHours = 12.0f;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Sunset")) {
+            localSolarTimeHours = 18.0f;
+        }
+        ImGui::Text("Sun Elevation: %.2f deg", sunElevationDeg);
+
+        ImGui::Separator();
         if (ImGui::Checkbox("Render old Earth sphere", &renderOldEarthSphere)) {
             renderer.SetRenderOldEarthSphere(renderOldEarthSphere);
         }
@@ -368,7 +468,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             regenerateTerrainRequested = true;
         }
 
-        ImGui::SliderFloat("Time Scale", &timeScale, 1.0f, 20.0f, "%.1fx");
+        ImGui::SliderFloat("Sim Time Scale", &simTimeScale, 1.0f, 20.0f, "%.1fx");
 
         ImGui::Separator();
         ImGui::Text("Controls");

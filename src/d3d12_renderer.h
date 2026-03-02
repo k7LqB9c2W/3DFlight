@@ -40,6 +40,8 @@ public:
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
     bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, const DirectX::XMFLOAT4& renderParams, std::string& error);
+    void SetSunDirection(const Double3& dir);
+    [[nodiscard]] Double3 SunDirection() const { return m_sunDirection; }
     void SetRenderOldEarthSphere(bool enabled) { m_renderOldEarthSphere = enabled; }
     [[nodiscard]] bool IsRenderOldEarthSphereEnabled() const { return m_renderOldEarthSphere; }
     [[nodiscard]] bool HasLandmask() const { return m_hasLandmaskTexture; }
@@ -230,6 +232,7 @@ private:
     D3D12_RECT m_scissor{};
 
     AtmosphereSettings m_atmosphereSettings{};
+    Double3 m_sunDirection{0.35, 0.82, 0.45};
     bool m_atmosphereEnabled = true;
     bool m_multipleScatteringEnabled = true;
     float m_atmosphereExposure = 1.0f;

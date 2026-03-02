@@ -398,6 +398,14 @@ bool D3D12Renderer::SetTerrainMesh(
     return true;
 }
 
+void D3D12Renderer::SetSunDirection(const Double3& dir) {
+    const Double3 normalized = Normalize(dir);
+    if (Length(normalized) < 1e-8) {
+        return;
+    }
+    m_sunDirection = normalized;
+}
+
 void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     if (!m_swapChain) {
         return;
@@ -483,7 +491,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         static_cast<float>(earthCenterLocalD.z),
         static_cast<float>(kEarthRadiusMeters),
     };
-    const Double3 sunDir = Normalize(Double3{0.35, 0.82, 0.45});
+    const Double3 sunDir = Normalize(m_sunDirection);
     sceneCb.sunDirIntensity = {
         static_cast<float>(sunDir.x),
         static_cast<float>(sunDir.y),
