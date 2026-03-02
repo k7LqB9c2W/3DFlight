@@ -37,6 +37,38 @@ std::string HrMessage(const char* context, HRESULT hr) {
     return std::string(context) + " (hr=0x" + std::to_string(static_cast<unsigned>(hr)) + ")";
 }
 
+MeshData GenerateSkyboxCube(float halfExtent) {
+    MeshData mesh;
+    const float s = halfExtent;
+    const DirectX::XMFLOAT3 p[8] = {
+        {-s, -s, -s},
+        {s, -s, -s},
+        {s, s, -s},
+        {-s, s, -s},
+        {-s, -s, s},
+        {s, -s, s},
+        {s, s, s},
+        {-s, s, s},
+    };
+
+    mesh.vertices.resize(8);
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        mesh.vertices[i].position = p[i];
+        mesh.vertices[i].normal = {0.0f, 1.0f, 0.0f};
+        mesh.vertices[i].uv = {0.0f, 0.0f};
+    }
+
+    mesh.indices = {
+        4, 5, 6, 4, 6, 7, // +Z
+        1, 0, 3, 1, 3, 2, // -Z
+        0, 4, 7, 0, 7, 3, // -X
+        5, 1, 2, 5, 2, 6, // +X
+        3, 7, 6, 3, 6, 2, // +Y
+        0, 1, 5, 0, 5, 4, // -Y
+    };
+    return mesh;
+}
+
 } // namespace
 
 bool D3D12Renderer::Initialize(
@@ -80,7 +112,7 @@ bool D3D12Renderer::Initialize(
         return false;
     }
 
-    // Upload static resources (earth mesh, fallback plane mesh, landmask texture).
+    // Upload static resources (earth mesh, fallback plane mesh, skybox mesh, textures).
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
     FrameContext& frame = m_frames[m_frameIndex];
 
@@ -108,9 +140,18 @@ bool D3D12Renderer::Initialize(
             error = "Fallback plane mesh upload failed: " + meshError;
             return false;
         }
+
+        MeshData skyboxData = GenerateSkyboxCube(1.0f);
+        if (!m_skyboxMesh.Upload(m_device.Get(), m_commandList.Get(), skyboxData, meshError)) {
+            error = "Skybox mesh upload failed: " + meshError;
+            return false;
+        }
     }
 
     if (!CreateLandmaskTexture(m_commandList.Get(), error)) {
+        return false;
+    }
+    if (!CreateSkyboxTexture(m_commandList.Get(), error)) {
         return false;
     }
 
@@ -126,7 +167,9 @@ bool D3D12Renderer::Initialize(
 
     m_earthMesh.ReleaseUploadBuffers();
     m_planeMesh.ReleaseUploadBuffers();
+    m_skyboxMesh.ReleaseUploadBuffers();
     m_landmaskUpload.Reset();
+    m_skyboxUpload.Reset();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -189,11 +232,14 @@ void D3D12Renderer::Shutdown() {
     m_rootSignature.Reset();
     m_planePso.Reset();
     m_earthPso.Reset();
+    m_skyboxPso.Reset();
 
     m_sceneCb = {};
     m_objectCb = {};
     m_landmaskTexture.Reset();
     m_landmaskUpload.Reset();
+    m_skyboxTexture.Reset();
+    m_skyboxUpload.Reset();
 
     m_srvHeap.Reset();
     m_rtvHeap.Reset();
@@ -376,6 +422,14 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         static_cast<float>(earthCenterLocalD.z),
         static_cast<float>(kEarthRadiusMeters),
     };
+    const Double3 sunDir = Normalize(Double3{0.35, 0.82, 0.45});
+    sceneCb.sunDirIntensity = {
+        static_cast<float>(sunDir.x),
+        static_cast<float>(sunDir.y),
+        static_cast<float>(sunDir.z),
+        1.0f,
+    };
+    sceneCb.atmosphereParams = {0.95f, 0.18f, 0.0f, 0.0f};
     std::memcpy(m_sceneCbMapped[m_frameIndex], &sceneCb, sizeof(sceneCb));
 
     const D3D12_GPU_VIRTUAL_ADDRESS sceneCbGpu = m_sceneCb[m_frameIndex]->GetGPUVirtualAddress();
@@ -383,6 +437,19 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
 
     m_commandList->SetGraphicsRootConstantBufferView(0, sceneCbGpu);
     m_commandList->SetGraphicsRootDescriptorTable(2, GpuSrv(kLandmaskSrvIndex));
+
+    // Draw skybox first with depth disabled.
+    {
+        ObjectConstants obj{};
+        const DirectX::XMMATRIX model = DirectX::XMMatrixScaling(30000000.0f, 30000000.0f, 30000000.0f);
+        DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
+        obj.colorAndFlags = {1.0f, 1.0f, 1.0f, 0.0f};
+
+        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 0), &obj, sizeof(obj));
+        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 0);
+        m_commandList->SetPipelineState(m_skyboxPso.Get());
+        m_skyboxMesh.Draw(m_commandList.Get());
+    }
 
     // Draw Earth.
     {
@@ -394,8 +461,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
         obj.colorAndFlags = {0.25f, 0.60f, 0.22f, m_hasLandmaskTexture ? 1.0f : 0.0f};
 
-        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 0), &obj, sizeof(obj));
-        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 0);
+        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 1), &obj, sizeof(obj));
+        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 1);
         m_commandList->SetPipelineState(m_earthPso.Get());
         m_earthMesh.Draw(m_commandList.Get());
     }
@@ -425,8 +492,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
         obj.colorAndFlags = {0.92f, 0.93f, 0.95f, 0.0f};
 
-        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 1), &obj, sizeof(obj));
-        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 1);
+        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
+        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
         m_commandList->SetPipelineState(m_planePso.Get());
         m_planeMesh.Draw(m_commandList.Get());
     }
@@ -676,7 +743,7 @@ bool D3D12Renderer::CompileShader(
 bool D3D12Renderer::CreatePipeline(std::string& error) {
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1;
+    range.NumDescriptors = 2;
     range.BaseShaderRegister = 0;
     range.RegisterSpace = 0;
     range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -747,6 +814,8 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     ComPtr<ID3DBlob> basicPs;
     ComPtr<ID3DBlob> earthVs;
     ComPtr<ID3DBlob> earthPs;
+    ComPtr<ID3DBlob> skyVs;
+    ComPtr<ID3DBlob> skyPs;
 
     if (!CompileShader(m_shaderDir / "basic.hlsl", "VSMain", "vs_5_0", basicVs, error)) {
         return false;
@@ -758,6 +827,12 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
     if (!CompileShader(m_shaderDir / "earth.hlsl", "PSMain", "ps_5_0", earthPs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "skybox.hlsl", "VSMain", "vs_5_0", skyVs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "skybox.hlsl", "PSMain", "ps_5_0", skyPs, error)) {
         return false;
     }
 
@@ -838,6 +913,19 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
 
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC skyPso = pso;
+    skyPso.VS = {skyVs->GetBufferPointer(), skyVs->GetBufferSize()};
+    skyPso.PS = {skyPs->GetBufferPointer(), skyPs->GetBufferSize()};
+    skyPso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    skyPso.DepthStencilState.DepthEnable = FALSE;
+    skyPso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+
+    hr = m_device->CreateGraphicsPipelineState(&skyPso, IID_PPV_ARGS(m_skyboxPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(skybox) failed", hr);
+        return false;
+    }
+
     return true;
 }
 
@@ -878,7 +966,7 @@ bool D3D12Renderer::CreateConstantBuffers(std::string& error) {
         }
 
         D3D12_RESOURCE_DESC objectDesc = sceneDesc;
-        objectDesc.Width = m_objectCbStride * 2;
+        objectDesc.Width = m_objectCbStride * 3;
 
         hr = m_device->CreateCommittedResource(
             &heapProps,
@@ -986,6 +1074,95 @@ bool D3D12Renderer::LoadLandmaskPixels(
     hr = converter->CopyPixels(nullptr, dstW, static_cast<UINT>(pixels.size()), pixels.data());
     if (FAILED(hr)) {
         error = HrMessage("CopyPixels failed", hr);
+        return false;
+    }
+
+    outWidth = dstW;
+    outHeight = dstH;
+    return true;
+}
+
+bool D3D12Renderer::LoadColorPixels(
+    const std::filesystem::path& imagePath,
+    std::vector<uint8_t>& pixelsRgba,
+    uint32_t& outWidth,
+    uint32_t& outHeight,
+    std::string& error) {
+    if (!m_wicFactory) {
+        error = "WIC factory is not initialized";
+        return false;
+    }
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    HRESULT hr = m_wicFactory->CreateDecoderFromFilename(
+        imagePath.wstring().c_str(),
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnDemand,
+        decoder.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        error = HrMessage("CreateDecoderFromFilename(color) failed", hr);
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, frame.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        error = HrMessage("WIC GetFrame(color) failed", hr);
+        return false;
+    }
+
+    UINT srcW = 0;
+    UINT srcH = 0;
+    frame->GetSize(&srcW, &srcH);
+
+    ComPtr<IWICBitmapSource> source = frame;
+    const UINT maxDim = 4096;
+    UINT dstW = srcW;
+    UINT dstH = srcH;
+    if (std::max(srcW, srcH) > maxDim) {
+        const double scale = static_cast<double>(maxDim) / static_cast<double>(std::max(srcW, srcH));
+        dstW = std::max(1u, static_cast<UINT>(std::floor(srcW * scale)));
+        dstH = std::max(1u, static_cast<UINT>(std::floor(srcH * scale)));
+
+        ComPtr<IWICBitmapScaler> scaler;
+        hr = m_wicFactory->CreateBitmapScaler(scaler.ReleaseAndGetAddressOf());
+        if (FAILED(hr)) {
+            error = HrMessage("CreateBitmapScaler(color) failed", hr);
+            return false;
+        }
+        hr = scaler->Initialize(frame.Get(), dstW, dstH, WICBitmapInterpolationModeLinear);
+        if (FAILED(hr)) {
+            error = HrMessage("BitmapScaler Initialize(color) failed", hr);
+            return false;
+        }
+        source = scaler;
+    }
+
+    ComPtr<IWICFormatConverter> converter;
+    hr = m_wicFactory->CreateFormatConverter(converter.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        error = HrMessage("CreateFormatConverter(color) failed", hr);
+        return false;
+    }
+
+    hr = converter->Initialize(
+        source.Get(),
+        GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        error = HrMessage("FormatConverter Initialize(color) failed", hr);
+        return false;
+    }
+
+    const UINT stride = dstW * 4;
+    pixelsRgba.resize(static_cast<size_t>(stride) * static_cast<size_t>(dstH));
+    hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(pixelsRgba.size()), pixelsRgba.data());
+    if (FAILED(hr)) {
+        error = HrMessage("CopyPixels(color) failed", hr);
         return false;
     }
 
@@ -1102,6 +1279,124 @@ bool D3D12Renderer::CreateLandmaskTextureFromPixels(
     return true;
 }
 
+bool D3D12Renderer::CreateSkyboxTextureFromFaces(
+    ID3D12GraphicsCommandList* commandList,
+    const std::array<std::vector<uint8_t>, 6>& facePixels,
+    uint32_t width,
+    uint32_t height,
+    std::string& error) {
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC texDesc{};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 6;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    HRESULT hr = m_device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(m_skyboxTexture.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(skybox texture) failed", hr);
+        return false;
+    }
+
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 6> footprints{};
+    std::array<UINT, 6> numRows{};
+    std::array<UINT64, 6> rowSizes{};
+    UINT64 uploadBytes = 0;
+    m_device->GetCopyableFootprints(
+        &texDesc,
+        0,
+        6,
+        0,
+        footprints.data(),
+        numRows.data(),
+        rowSizes.data(),
+        &uploadBytes);
+
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC uploadDesc{};
+    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDesc.Width = uploadBytes;
+    uploadDesc.Height = 1;
+    uploadDesc.DepthOrArraySize = 1;
+    uploadDesc.MipLevels = 1;
+    uploadDesc.SampleDesc.Count = 1;
+    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    hr = m_device->CreateCommittedResource(
+        &uploadHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(m_skyboxUpload.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(skybox upload) failed", hr);
+        return false;
+    }
+
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE readRange{};
+    hr = m_skyboxUpload->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+    if (FAILED(hr)) {
+        error = HrMessage("Map(skybox upload) failed", hr);
+        return false;
+    }
+
+    for (UINT face = 0; face < 6; ++face) {
+        const uint8_t* src = facePixels[face].data();
+        uint8_t* dst = mapped + footprints[face].Offset;
+        for (UINT row = 0; row < numRows[face]; ++row) {
+            std::memcpy(dst + row * footprints[face].Footprint.RowPitch, src + row * width * 4, width * 4);
+        }
+    }
+    m_skyboxUpload->Unmap(0, nullptr);
+
+    for (UINT face = 0; face < 6; ++face) {
+        D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+        dstLoc.pResource = m_skyboxTexture.Get();
+        dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dstLoc.SubresourceIndex = face;
+
+        D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+        srcLoc.pResource = m_skyboxUpload.Get();
+        srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcLoc.PlacedFootprint = footprints[face];
+
+        commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = m_skyboxTexture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.TextureCube.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_skyboxTexture.Get(), &srv, CpuSrv(kSkyboxSrvIndex));
+    return true;
+}
+
 bool D3D12Renderer::CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList, std::string& error) {
     std::vector<std::filesystem::path> candidates = {
         m_assetDir / "textures" / "landmask_16k.png",
@@ -1127,6 +1422,62 @@ bool D3D12Renderer::CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList
     // Fallback: 1x1 ocean pixel.
     const uint8_t ocean = 0;
     return CreateLandmaskTextureFromPixels(commandList, &ocean, 1, 1, false, error);
+}
+
+bool D3D12Renderer::CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, std::string& error) {
+    const std::array<std::filesystem::path, 6> facePaths = {
+        m_assetDir / "textures" / "skybox" / "daylight_posx.png", // +X right
+        m_assetDir / "textures" / "skybox" / "daylight_negx.png", // -X left
+        m_assetDir / "textures" / "skybox" / "daylight_posy.png", // +Y top
+        m_assetDir / "textures" / "skybox" / "daylight_negy.png", // -Y bottom
+        m_assetDir / "textures" / "skybox" / "daylight_posz.png", // +Z front
+        m_assetDir / "textures" / "skybox" / "daylight_negz.png", // -Z back
+    };
+
+    bool allFacesPresent = true;
+    for (const auto& path : facePaths) {
+        if (!std::filesystem::exists(path)) {
+            allFacesPresent = false;
+            break;
+        }
+    }
+
+    if (allFacesPresent) {
+        std::array<std::vector<uint8_t>, 6> faces{};
+        uint32_t width = 0;
+        uint32_t height = 0;
+        for (size_t i = 0; i < facePaths.size(); ++i) {
+            uint32_t w = 0;
+            uint32_t h = 0;
+            std::string loadError;
+            if (!LoadColorPixels(facePaths[i], faces[i], w, h, loadError)) {
+                allFacesPresent = false;
+                break;
+            }
+            if (i == 0) {
+                width = w;
+                height = h;
+            } else if (w != width || h != height) {
+                allFacesPresent = false;
+                break;
+            }
+        }
+
+        if (allFacesPresent && width > 0 && height > 0) {
+            return CreateSkyboxTextureFromFaces(commandList, faces, width, height, error);
+        }
+    }
+
+    // Fallback day-like cubemap if files are missing.
+    std::array<std::vector<uint8_t>, 6> fallback{};
+    fallback[0] = {146, 187, 244, 255};
+    fallback[1] = {146, 187, 244, 255};
+    fallback[2] = {120, 170, 242, 255};
+    fallback[3] = {100, 145, 220, 255};
+    fallback[4] = {164, 200, 250, 255};
+    fallback[5] = {164, 200, 250, 255};
+
+    return CreateSkyboxTextureFromFaces(commandList, fallback, 1, 1, error);
 }
 
 void D3D12Renderer::WaitForFrame(UINT frameIndex) {

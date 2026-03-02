@@ -45,6 +45,7 @@ private:
     static constexpr UINT kFrameCount = 2;
     static constexpr UINT kFontSrvIndex = 0;
     static constexpr UINT kLandmaskSrvIndex = 1;
+    static constexpr UINT kSkyboxSrvIndex = 2;
 
     struct FrameContext {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -54,6 +55,8 @@ private:
     struct alignas(256) SceneConstants {
         DirectX::XMFLOAT4X4 viewProj{};
         DirectX::XMFLOAT4 earthCenterRadius{};
+        DirectX::XMFLOAT4 sunDirIntensity{};
+        DirectX::XMFLOAT4 atmosphereParams{};
     };
 
     struct alignas(256) ObjectConstants {
@@ -67,6 +70,7 @@ private:
     bool CreatePipeline(std::string& error);
     bool CreateConstantBuffers(std::string& error);
     bool CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
+    bool CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateLandmaskTextureFromPixels(
         ID3D12GraphicsCommandList* commandList,
         const uint8_t* pixels,
@@ -79,6 +83,18 @@ private:
         std::vector<uint8_t>& pixels,
         uint32_t& outWidth,
         uint32_t& outHeight,
+        std::string& error);
+    bool LoadColorPixels(
+        const std::filesystem::path& imagePath,
+        std::vector<uint8_t>& pixelsRgba,
+        uint32_t& outWidth,
+        uint32_t& outHeight,
+        std::string& error);
+    bool CreateSkyboxTextureFromFaces(
+        ID3D12GraphicsCommandList* commandList,
+        const std::array<std::vector<uint8_t>, 6>& facePixels,
+        uint32_t width,
+        uint32_t height,
         std::string& error);
 
     bool CompileShader(
@@ -126,9 +142,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_planePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_earthPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_skyboxPso;
 
     GpuMesh m_earthMesh;
     GpuMesh m_planeMesh;
+    GpuMesh m_skyboxMesh;
 
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_sceneCb;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_objectCb;
@@ -140,6 +158,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_landmaskTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_landmaskUpload;
     bool m_hasLandmaskTexture = false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxUpload;
 
     Microsoft::WRL::ComPtr<IWICImagingFactory> m_wicFactory;
 
