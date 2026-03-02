@@ -1,14 +1,14 @@
-Texture2D gLandmask : register(t0);
-TextureCube gSkybox : register(t1);
-SamplerState gSampler : register(s0);
+#include "atmosphere_common.hlsli"
 
-cbuffer SceneCB : register(b0)
-{
-    float4x4 gViewProj;
-    float4 gEarthCenterRadius;
-    float4 gSunDirIntensity;
-    float4 gAtmosphereParams;
-};
+Texture2D<float> gLandmask : register(t0);
+TextureCube<float4> gSkybox : register(t1);
+Texture2D<float4> gTransmittanceLut : register(t2);
+Texture2D<float4> gSkyViewLut : register(t3);
+Texture2D<float4> gMultipleScatteringLut : register(t4);
+Texture3D<float4> gAerialPerspectiveLut : register(t5);
+
+SamplerState gWrapSampler : register(s0);
+SamplerState gClampSampler : register(s1);
 
 cbuffer ObjectCB : register(b1)
 {
@@ -44,21 +44,16 @@ VSOutput VSMain(VSInput input)
 
 float3 TerrainColor(float heightMeters)
 {
-    const float seaLevel = 0.0;
-    if (heightMeters <= seaLevel + 0.5)
+    if (heightMeters <= 0.5)
     {
-        return float3(0.07, 0.23, 0.53);
+        return float3(0.05, 0.18, 0.40);
     }
 
     float h01 = saturate(heightMeters / max(gColorAndFlags.y, 1.0));
     float3 low = float3(0.17, 0.43, 0.16);
     float3 mid = float3(0.38, 0.32, 0.20);
     float3 high = float3(0.82, 0.82, 0.84);
-
-    float3 c = (h01 < 0.55)
-        ? lerp(low, mid, h01 / 0.55)
-        : lerp(mid, high, (h01 - 0.55) / 0.45);
-    return c;
+    return (h01 < 0.55) ? lerp(low, mid, h01 / 0.55) : lerp(mid, high, (h01 - 0.55) / 0.45);
 }
 
 float4 PSMain(VSOutput input) : SV_Target
@@ -70,21 +65,17 @@ float4 PSMain(VSOutput input) : SV_Target
     float3 L = normalize(gSunDirIntensity.xyz);
 
     float ndl = saturate(dot(N, L));
-    float hemi = saturate(N.y * 0.5 + 0.5);
+    float hemi = saturate(dot(N, normalize(gCameraUpAndTime.xyz)) * 0.5 + 0.5);
 
-    float ambient = lerp(0.10, 0.30, hemi);
+    float ambient = lerp(0.09, 0.25, hemi);
     float diffuse = 0.80 * ndl;
-
     float3 H = normalize(V + L);
-    float spec = pow(saturate(dot(N, H)), 48.0) * 0.16;
+    float spec = pow(saturate(dot(N, H)), 48.0) * 0.14;
 
     float3 baseColor = TerrainColor(clampedHeight);
     float3 color = baseColor * (ambient + diffuse) + spec.xxx;
 
-    // Daytime aerial haze.
-    float horizon = pow(1.0 - abs(V.y), 1.8);
-    float3 sky = gSkybox.Sample(gSampler, float3(0.0, 1.0, 0.0)).rgb;
-    color = lerp(color, sky, 0.18 * horizon);
-
+    color = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), color);
+    color = 1.0 - exp(-color * max(gAtmosphereFlags.z, 0.01));
     return float4(saturate(color), 1.0);
 }

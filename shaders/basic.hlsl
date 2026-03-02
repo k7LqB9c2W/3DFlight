@@ -1,10 +1,14 @@
-cbuffer SceneCB : register(b0)
-{
-    float4x4 gViewProj;
-    float4 gEarthCenterRadius;
-    float4 gSunDirIntensity;
-    float4 gAtmosphereParams;
-};
+#include "atmosphere_common.hlsli"
+
+Texture2D<float> gLandmask : register(t0);
+TextureCube<float4> gSkybox : register(t1);
+Texture2D<float4> gTransmittanceLut : register(t2);
+Texture2D<float4> gSkyViewLut : register(t3);
+Texture2D<float4> gMultipleScatteringLut : register(t4);
+Texture3D<float4> gAerialPerspectiveLut : register(t5);
+
+SamplerState gWrapSampler : register(s0);
+SamplerState gClampSampler : register(s1);
 
 cbuffer ObjectCB : register(b1)
 {
@@ -45,17 +49,19 @@ float4 PSMain(VSOutput input) : SV_Target
     float3 L = normalize(gSunDirIntensity.xyz);
 
     float ndl = saturate(dot(N, L));
-    float hemi = saturate(N.y * 0.5 + 0.5);
+    float hemi = saturate(dot(N, normalize(gCameraUpAndTime.xyz)) * 0.5 + 0.5);
 
     float3 H = normalize(L + V);
     float spec = pow(saturate(dot(N, H)), 64.0) * 0.25;
     float rim = pow(1.0 - saturate(dot(N, V)), 4.0) * 0.18;
 
-    float ambient = lerp(0.10, 0.28, hemi);
+    float ambient = lerp(0.08, 0.25, hemi);
     float diffuse = 0.85 * ndl;
 
     float3 baseColor = gColorAndFlags.rgb;
-    float3 lit = baseColor * (ambient + diffuse) + spec.xxx + rim * float3(0.60, 0.70, 0.85);
+    float3 lit = baseColor * (ambient + diffuse) + spec.xxx + rim * float3(0.52, 0.62, 0.75);
 
+    lit = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), lit);
+    lit = 1.0 - exp(-lit * max(gAtmosphereFlags.z, 0.01));
     return float4(saturate(lit), 1.0);
 }

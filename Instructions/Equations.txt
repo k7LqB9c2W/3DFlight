@@ -1,0 +1,208 @@
+Key equations and LUT definitions in LaTeX (with PDF page refs)
+1) Core participating media equations (PDF page 3/10)
+
+These define the base sky and fog math: camera radiance is ground term attenuated by transmittance plus integrated in-scattering; transmittance is Beer-Lambert; in-scattering sums over directional lights; the shadow term includes planet visibility and sun-path transmittance. 
+
+egsr2020
+
+% (1) Observed luminance along view ray
+L(c, v) = T(c, p)\,L_o(p, v) + \int_{0}^{\|p-c\|} L_{\mathrm{scat}}(c,\,c - t v,\,v)\,dt
+
+% (2) Transmittance between two points along the segment
+T(x_a, x_b) = \exp\!\left(-\int_{x=x_a}^{x_b} \sigma_t(x)\,\|dx\|\right)
+
+% (3) Single-scattering in-scattered luminance at point x toward view v
+L_{\mathrm{scat}}(c, x, v) =
+\sigma_s(x)\,\sum_{i=1}^{N_{\mathrm{light}}}
+\Big( T(c, x)\,S(x, l_i)\,p(v, l_i)\,E_i \Big)
+
+% (4) Shadowing term toward light direction l_i
+S(x, l_i) = \mathrm{Vis}(l_i)\,T\!\big(x,\,x + t_{\mathrm{atmo}}\,l_i\big)
+
+Also used everywhere:
+
+\sigma_t = \sigma_a + \sigma_s
+
+egsr2020
+
+2) Planet and atmosphere shell radii (PDF page 3/10)
+
+Earth-like defaults in the paper: ground and atmosphere top are spheres; altitude is measured above ground. 
+
+egsr2020
+
+R_{\mathrm{ground}} = 6360\,\mathrm{km}
+R_{\mathrm{top}}    = 6460\,\mathrm{km}
+h = \text{altitude above ground}
+3) Phase functions (PDF page 3/10)
+
+Rayleigh is smooth; Mie uses Cornette-Shanks with asymmetry parameter g (default 0.8); isotropic phase function is used later for the multiple scattering approximation. 
+
+egsr2020
+
+ 
+
+egsr2020
+
+% Rayleigh phase function (pr)
+p_r(\theta) = \frac{3\,(1 + \cos^2\theta)}{16\pi}
+
+% Cornette-Shanks Mie phase function (pm)
+p_m(\theta, g) =
+\frac{3}{8\pi}\,
+\frac{(1-g^2)\,(1+\cos^2\theta)}
+{(2+g^2)\,\left(1+g^2-2g\cos\theta\right)^{3/2}}
+
+% Isotropic phase function (pu)
+p_u = \frac{1}{4\pi}
+4) Altitude-based density falloff (PDF page 3/10)
+
+Rayleigh and Mie densities decay exponentially with different scale heights; ozone is a tent distribution centered at 25 km and only absorbs (no scattering). 
+
+egsr2020
+
+% Rayleigh density
+d_r(h) = \exp\!\left(-\frac{h}{8\,\mathrm{km}}\right)
+
+% Mie density
+d_m(h) = \exp\!\left(-\frac{h}{1.2\,\mathrm{km}}\right)
+
+% Ozone density (tent), width 30 km centered at 25 km
+d_o(h) = \max\!\left(0,\ 1 - \frac{|h - 25|}{15}\right)
+% (h in km for this expression as written in the paper)
+5) Scattering and absorption coefficients (Table 1, PDF page 3/10)
+
+Earth-like coefficients used by the paper (values are in units of 
+×
+10
+−
+6
+
+m
+−
+1
+×10
+−6
+m
+−1
+). 
+
+egsr2020
+
+% Table 1 coefficients (x 10^{-6} m^{-1})
+
+% Rayleigh:
+\sigma^r_s = (5.802,\ 13.558,\ 33.1)
+\sigma^r_a = (0,\ 0,\ 0)
+
+% Mie:
+\sigma^m_s = (3.996,\ 3.996,\ 3.996)
+\sigma^m_a = (4.40,\ 4.40,\ 4.40)
+
+% Ozone:
+\sigma^o_s = (0,\ 0,\ 0)
+\sigma^o_a = (0.650,\ 1.881,\ 0.085)
+6) Transmittance LUT (PDF page 4/10)
+
+The paper stores the shadowing transmittance function 
+𝑇
+T in a LUT to avoid a second ray march to the sun for every single-scattering sample. 
+
+egsr2020
+
+Definition to implement:
+
+% Transmittance LUT stores T(x_a, x_b) from Eq (2),
+% specifically used for shadowing toward the sun in Eq (4).
+7) Sky-View LUT and its non-linear latitude mapping (PDF page 4/10)
+
+The sky is rendered into a lat-long texture oriented so the horizon stays horizontal; a non-linear mapping concentrates resolution near the horizon; sun disk is composited after applying the Sky-View LUT. 
+
+egsr2020
+
+% Non-linear latitude remap used for Sky-View LUT v coordinate:
+v = 0.5 + 0.5 \cdot \mathrm{sign}(l)\cdot \sqrt{\frac{|l|}{\pi/2}}
+\quad\text{with}\quad l \in [-\pi/2,\ \pi/2]
+8) Aerial Perspective LUT (PDF page 4/10)
+
+A volume texture fit to the camera frustum stores in-scattering and transmittance toward the camera for consistent haze on terrain and other opaque geometry; in-scattering in RGB, transmittance in A as a mean of wavelength-dependent RGB transmittance. Default resolution given. 
+
+egsr2020
+
+Definition to implement:
+
+% Aerial Perspective LUT stores:
+AP.rgb = in_scattering_to_camera
+AP.a   = mean(transmittance_rgb_to_camera)
+
+% Default example resolution in the paper:
+screen_grid = 32 x 32
+depth_slices = 32 over 32 km
+9) Multiple Scattering LUT parameterization (PDF page 6/10)
+
+A small 2D texture indexed by sun zenith angle and altitude (normalized to the atmosphere shell). 
+
+egsr2020
+
+u = 0.5 + 0.5 \cos(\theta_s)
+
+v = \max\!\left(0,\ \min\!\left(\frac{h - R_{\mathrm{ground}}}{R_{\mathrm{top}} - R_{\mathrm{ground}}},\ 1\right)\right)
+10) Multiple scattering approximation equations (PDF page 6/10)
+
+This is the “production” part: compute a second-order term, compute a normalized transfer factor, turn it into an infinite series, then add it into the main in-scattering expression. 
+
+egsr2020
+
+% (5) Second-order scattered luminance integrated over the sphere
+L_{\mathrm{2ndorder}} =
+\int_{\Omega_{4\pi}} L'(x_s, -\omega)\,p_u\,d\omega
+
+% (6) L' term: single directional light with unit illuminance E_I = 1 (as per paper text)
+L'(x, v) =
+T(x, p)\,L_o(p, v) +
+\int_{0}^{\|p-x\|}
+\sigma_s(x)\,T(x, x - t v)\,S(x, \omega_s)\,p_u\,E_I\,dt
+
+% (7) Normalized transfer factor around x_s
+f_{ms} =
+\int_{\Omega_{4\pi}} L_f(x_s, -\omega)\,p_u\,d\omega
+
+% (8) Lf term: integration without phase function and without shadowing term
+L_f(x, v) =
+\int_{0}^{\|p-x\|}
+\sigma_s(x)\,T(x, x - t v)\cdot 1\,dt
+
+% (9) Infinite geometric series factor
+F_{ms} = 1 + f_{ms} + f_{ms}^2 + f_{ms}^3 + \cdots = \frac{1}{1 - f_{ms}}
+
+% (10) Multiple scattering contribution stored in LUT
+\Psi_{ms} = L_{\mathrm{2ndorder}}\,F_{ms}
+
+% (11) Final in-scattering with multiple scattering added
+L_{\mathrm{scat}}(c, x, v) =
+\sigma_s(x)\,\sum_{i=1}^{N_{\mathrm{light}}}
+\Big( T(c, x)\,S(x, l_i)\,p(v, l_i) + \Psi_{ms} \Big)\,E_i
+
+The paper notes the sphere integrals for 
+𝐿
+2
+n
+d
+o
+r
+d
+e
+r
+L
+2ndorder
+	
+
+ and 
+𝑓
+𝑚
+𝑠
+f
+ms
+	
+
+ are done with 64 uniformly distributed directions in their real-time use case. 

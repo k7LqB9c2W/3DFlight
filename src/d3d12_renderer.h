@@ -43,23 +43,66 @@ public:
     void SetRenderOldEarthSphere(bool enabled) { m_renderOldEarthSphere = enabled; }
     [[nodiscard]] bool IsRenderOldEarthSphereEnabled() const { return m_renderOldEarthSphere; }
     [[nodiscard]] bool HasLandmask() const { return m_hasLandmaskTexture; }
+    void SetAtmosphereEnabled(bool enabled) { m_atmosphereEnabled = enabled; }
+    [[nodiscard]] bool IsAtmosphereEnabled() const { return m_atmosphereEnabled; }
+    void SetMultipleScatteringEnabled(bool enabled) { m_multipleScatteringEnabled = enabled; }
+    [[nodiscard]] bool IsMultipleScatteringEnabled() const { return m_multipleScatteringEnabled; }
+    void SetAtmosphereExposure(float exposure) { m_atmosphereExposure = exposure; }
+    [[nodiscard]] float AtmosphereExposure() const { return m_atmosphereExposure; }
 
 private:
     static constexpr UINT kFrameCount = 2;
     static constexpr UINT kFontSrvIndex = 0;
+    static constexpr UINT kSrvTableStartIndex = 1;
     static constexpr UINT kLandmaskSrvIndex = 1;
     static constexpr UINT kSkyboxSrvIndex = 2;
+    static constexpr UINT kTransmittanceSrvIndex = 3;
+    static constexpr UINT kSkyViewSrvIndex = 4;
+    static constexpr UINT kMultipleScatteringSrvIndex = 5;
+    static constexpr UINT kAerialPerspectiveSrvIndex = 6;
+    static constexpr UINT kUavTableStartIndex = 16;
+    static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
+    static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
+    static constexpr UINT kMultipleScatteringUavIndex = kUavTableStartIndex + 2;
+    static constexpr UINT kAerialPerspectiveUavIndex = kUavTableStartIndex + 3;
 
     struct FrameContext {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
         UINT64 fenceValue = 0;
     };
 
+    struct AtmosphereSettings {
+        // EGSR 2020 Table 1 coefficients, converted from x 1e-6 m^-1 to m^-1.
+        DirectX::XMFLOAT3 rayleighScattering = {5.802e-6f, 13.558e-6f, 33.1e-6f};
+        DirectX::XMFLOAT3 rayleighAbsorption = {0.0f, 0.0f, 0.0f};
+        DirectX::XMFLOAT3 mieScattering = {3.996e-6f, 3.996e-6f, 3.996e-6f};
+        DirectX::XMFLOAT3 mieAbsorption = {4.40e-6f, 4.40e-6f, 4.40e-6f};
+        DirectX::XMFLOAT3 ozoneAbsorption = {0.650e-6f, 1.881e-6f, 0.085e-6f};
+        float rayleighScaleHeightMeters = 8000.0f;
+        float mieScaleHeightMeters = 1200.0f;
+        float ozoneCenterHeightMeters = 25000.0f;
+        float ozoneHalfWidthMeters = 15000.0f;
+        float atmosphereHeightMeters = 100000.0f;
+        float miePhaseG = 0.8f;
+        float sunAngularRadiusRad = 0.004675f; // ~0.267 deg
+        float sunIlluminance = 20.0f;
+    };
+
     struct alignas(256) SceneConstants {
         DirectX::XMFLOAT4X4 viewProj{};
+        DirectX::XMFLOAT4X4 invViewProj{};
         DirectX::XMFLOAT4 earthCenterRadius{};
         DirectX::XMFLOAT4 sunDirIntensity{};
-        DirectX::XMFLOAT4 atmosphereParams{};
+        DirectX::XMFLOAT4 cameraPosTopRadius{};
+        DirectX::XMFLOAT4 cameraUpAndTime{};
+        DirectX::XMFLOAT4 viewportAndAerialDepth{};
+        DirectX::XMFLOAT4 atmosphereFlags{};
+        DirectX::XMFLOAT4 rayleighScatteringAndScale{};
+        DirectX::XMFLOAT4 rayleighAbsorptionPad{};
+        DirectX::XMFLOAT4 mieScatteringAndScale{};
+        DirectX::XMFLOAT4 mieAbsorptionAndG{};
+        DirectX::XMFLOAT4 ozoneAbsorptionAndCenter{};
+        DirectX::XMFLOAT4 ozoneHalfWidthAtmosphereHeightSunRadius{};
     };
 
     struct alignas(256) ObjectConstants {
@@ -72,6 +115,8 @@ private:
     bool CreateDepthBuffer(std::string& error);
     bool CreatePipeline(std::string& error);
     bool CreateConstantBuffers(std::string& error);
+    bool CreateAtmosphereResources(std::string& error);
+    void DispatchAtmosphereLuts(ID3D12GraphicsCommandList* commandList, const SceneConstants& sceneCb);
     bool CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateLandmaskTextureFromPixels(
@@ -143,10 +188,15 @@ private:
     HANDLE m_fenceEvent = nullptr;
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_computeRootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_planePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_earthPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_skyboxPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_terrainPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_transmittanceLutPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_skyViewLutPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_multiScatteringLutPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_aerialPerspectiveLutPso;
 
     GpuMesh m_earthMesh;
     GpuMesh m_planeMesh;
@@ -168,11 +218,21 @@ private:
     bool m_hasLandmaskTexture = false;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxUpload;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_transmittanceLut;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_skyViewLut;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_multipleScatteringLut;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_aerialPerspectiveLut;
 
     Microsoft::WRL::ComPtr<IWICImagingFactory> m_wicFactory;
 
     D3D12_VIEWPORT m_viewport{};
     D3D12_RECT m_scissor{};
+
+    AtmosphereSettings m_atmosphereSettings{};
+    bool m_atmosphereEnabled = true;
+    bool m_multipleScatteringEnabled = true;
+    float m_atmosphereExposure = 1.0f;
+    float m_aerialPerspectiveDepthMeters = 32000.0f;
 
     bool m_imguiInitialized = false;
 };

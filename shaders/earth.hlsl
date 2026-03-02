@@ -1,14 +1,14 @@
-Texture2D gLandmask : register(t0);
-TextureCube gSkybox : register(t1);
-SamplerState gSampler : register(s0);
+#include "atmosphere_common.hlsli"
 
-cbuffer SceneCB : register(b0)
-{
-    float4x4 gViewProj;
-    float4 gEarthCenterRadius;
-    float4 gSunDirIntensity;
-    float4 gAtmosphereParams;
-};
+Texture2D<float> gLandmask : register(t0);
+TextureCube<float4> gSkybox : register(t1);
+Texture2D<float4> gTransmittanceLut : register(t2);
+Texture2D<float4> gSkyViewLut : register(t3);
+Texture2D<float4> gMultipleScatteringLut : register(t4);
+Texture3D<float4> gAerialPerspectiveLut : register(t5);
+
+SamplerState gWrapSampler : register(s0);
+SamplerState gClampSampler : register(s1);
 
 cbuffer ObjectCB : register(b1)
 {
@@ -54,35 +54,29 @@ float4 PSMain(VSOutput input) : SV_Target
     float3 baseColor = water;
     if (gColorAndFlags.a > 0.5)
     {
-        float mask = gLandmask.Sample(gSampler, input.uv).r;
+        float mask = gLandmask.Sample(gWrapSampler, input.uv).r;
         baseColor = (mask > 0.5) ? land : water;
     }
     else
     {
-        float band = saturate((N.y + 0.15) * 1.2);
+        float band = saturate((dot(N, normalize(gCameraUpAndTime.xyz)) + 0.15) * 1.2);
         baseColor = lerp(water, float3(0.20, 0.45, 0.25), 0.35 * band);
     }
 
     float ndl = saturate(dot(N, L));
-    float hemi = saturate(N.y * 0.5 + 0.5);
+    float hemi = saturate(dot(N, normalize(gCameraUpAndTime.xyz)) * 0.5 + 0.5);
 
-    // Subtle water glancing-angle brightening.
     float fresnel = pow(1.0 - saturate(dot(N, V)), 5.0);
-    float waterBoost = (1.0 - gColorAndFlags.a) * 0.25 * fresnel;
+    float waterBoost = (1.0 - gColorAndFlags.a) * 0.20 * fresnel;
 
-    float ambient = lerp(0.12, 0.30, hemi);
+    float ambient = lerp(0.10, 0.27, hemi);
     float diffuse = 0.78 * ndl;
     float3 color = baseColor * (ambient + diffuse + waterBoost);
 
-    // Atmospheric rim and horizon haze for daytime Earth look.
     float rim = pow(1.0 - saturate(dot(N, V)), 3.0);
-    float sunScatter = pow(saturate(dot(V, L)), 4.0);
-    float3 skyTint = gSkybox.Sample(gSampler, N).rgb;
-    float3 atmoColor = lerp(float3(0.35, 0.56, 0.92), skyTint, 0.45) * (0.30 + 0.70 * sunScatter);
-    color += atmoColor * rim * gAtmosphereParams.x;
+    color += float3(0.30, 0.43, 0.68) * rim * 0.30;
 
-    float horizon = pow(1.0 - abs(V.y), 2.0);
-    color += float3(0.10, 0.15, 0.22) * horizon * gAtmosphereParams.y;
-
+    color = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), color);
+    color = 1.0 - exp(-color * max(gAtmosphereFlags.z, 0.01));
     return float4(saturate(color), 1.0);
 }

@@ -1,14 +1,14 @@
-Texture2D gLandmask : register(t0);
-TextureCube gSkybox : register(t1);
-SamplerState gSampler : register(s0);
+#include "atmosphere_common.hlsli"
 
-cbuffer SceneCB : register(b0)
-{
-    float4x4 gViewProj;
-    float4 gEarthCenterRadius;
-    float4 gSunDirIntensity;
-    float4 gAtmosphereParams;
-};
+Texture2D<float> gLandmask : register(t0);
+TextureCube<float4> gSkybox : register(t1);
+Texture2D<float4> gTransmittanceLut : register(t2);
+Texture2D<float4> gSkyViewLut : register(t3);
+Texture2D<float4> gMultipleScatteringLut : register(t4);
+Texture3D<float4> gAerialPerspectiveLut : register(t5);
+
+SamplerState gWrapSampler : register(s0);
+SamplerState gClampSampler : register(s1);
 
 cbuffer ObjectCB : register(b1)
 {
@@ -38,14 +38,40 @@ VSOutput VSMain(VSInput input)
     return o;
 }
 
+float SunDisk(float cosAngle)
+{
+    float sunRadius = max(gOzoneHalfWidthAtmosphereHeightSunRadius.z, 1e-4);
+    float cosInner = cos(sunRadius);
+    float cosOuter = cos(sunRadius * 1.35);
+    return smoothstep(cosOuter, cosInner, cosAngle);
+}
+
 float4 PSMain(VSOutput input) : SV_Target
 {
     float3 dir = normalize(input.dir);
-    float3 color = gSkybox.Sample(gSampler, dir).rgb;
+    float3 sunDir = normalize(gSunDirIntensity.xyz);
+    float3 color = 0.0;
 
-    // Light daytime enhancement around sun direction.
-    float sunAmount = pow(saturate(dot(dir, normalize(gSunDirIntensity.xyz))), 180.0);
-    color += float3(1.0, 0.93, 0.80) * sunAmount * 0.35;
+    if (gViewportAndAerialDepth.w > 0.5)
+    {
+        float2 uv = DirectionToSkyViewUv(dir, normalize(gCameraUpAndTime.xyz), sunDir);
+        color = gSkyViewLut.SampleLevel(gClampSampler, uv, 0).rgb;
 
+        // Composite sun disk after applying the Sky-View LUT (paper recommendation).
+        float cosAngle = dot(dir, sunDir);
+        float disk = SunDisk(cosAngle);
+        float halo = pow(saturate(cosAngle), 96.0);
+        float3 sunColor = float3(1.0, 0.95, 0.84) * (0.35 * gSunDirIntensity.w);
+        color += sunColor * (disk * 6.0 + halo * 0.12);
+
+        // Optional subtle detail from cube map without making it primary daytime source.
+        color = lerp(color, color * 0.94 + gSkybox.Sample(gWrapSampler, dir).rgb * 0.06, 0.12);
+    }
+    else
+    {
+        color = gSkybox.Sample(gWrapSampler, dir).rgb;
+    }
+
+    color = 1.0 - exp(-color * max(gAtmosphereFlags.z, 0.01));
     return float4(saturate(color), 1.0);
 }

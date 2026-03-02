@@ -111,6 +111,9 @@ bool D3D12Renderer::Initialize(
     if (!CreateConstantBuffers(error)) {
         return false;
     }
+    if (!CreateAtmosphereResources(error)) {
+        return false;
+    }
 
     // Upload static resources (earth mesh, fallback plane mesh, skybox mesh, textures).
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
@@ -230,10 +233,15 @@ void D3D12Renderer::Shutdown() {
     }
 
     m_rootSignature.Reset();
+    m_computeRootSignature.Reset();
     m_planePso.Reset();
     m_earthPso.Reset();
     m_skyboxPso.Reset();
     m_terrainPso.Reset();
+    m_transmittanceLutPso.Reset();
+    m_skyViewLutPso.Reset();
+    m_multiScatteringLutPso.Reset();
+    m_aerialPerspectiveLutPso.Reset();
 
     m_sceneCb = {};
     m_objectCb = {};
@@ -241,6 +249,10 @@ void D3D12Renderer::Shutdown() {
     m_landmaskUpload.Reset();
     m_skyboxTexture.Reset();
     m_skyboxUpload.Reset();
+    m_transmittanceLut.Reset();
+    m_skyViewLut.Reset();
+    m_multipleScatteringLut.Reset();
+    m_aerialPerspectiveLut.Reset();
     m_hasTerrainMesh = false;
 
     m_srvHeap.Reset();
@@ -415,8 +427,6 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
 
     ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
     m_commandList->SetDescriptorHeaps(1, heaps);
-    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     const Double3 planeEcef = sim.PlaneEcef();
     const Double3 forwardEcef = Normalize(sim.ForwardEcef());
@@ -455,9 +465,13 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         10.0f,
         50000000.0f);
     const DirectX::XMMATRIX viewProj = view * proj;
+    const DirectX::XMMATRIX invViewProj = DirectX::XMMatrixInverse(nullptr, viewProj);
+    const Double3 cameraUp = Normalize(Double3{-earthCenterLocalD.x, -earthCenterLocalD.y, -earthCenterLocalD.z});
+    const float topRadius = static_cast<float>(kEarthRadiusMeters + static_cast<double>(m_atmosphereSettings.atmosphereHeightMeters));
 
     SceneConstants sceneCb{};
     DirectX::XMStoreFloat4x4(&sceneCb.viewProj, DirectX::XMMatrixTranspose(viewProj));
+    DirectX::XMStoreFloat4x4(&sceneCb.invViewProj, DirectX::XMMatrixTranspose(invViewProj));
     sceneCb.earthCenterRadius = {
         static_cast<float>(earthCenterLocalD.x),
         static_cast<float>(earthCenterLocalD.y),
@@ -469,16 +483,79 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         static_cast<float>(sunDir.x),
         static_cast<float>(sunDir.y),
         static_cast<float>(sunDir.z),
-        1.0f,
+        m_atmosphereSettings.sunIlluminance,
     };
-    sceneCb.atmosphereParams = {0.95f, 0.18f, 0.0f, 0.0f};
+    sceneCb.cameraPosTopRadius = {
+        0.0f,
+        0.0f,
+        0.0f,
+        topRadius,
+    };
+    sceneCb.cameraUpAndTime = {
+        static_cast<float>(cameraUp.x),
+        static_cast<float>(cameraUp.y),
+        static_cast<float>(cameraUp.z),
+        static_cast<float>(GetTickCount64() * 0.001),
+    };
+    sceneCb.viewportAndAerialDepth = {
+        static_cast<float>(m_width),
+        static_cast<float>(m_height),
+        m_aerialPerspectiveDepthMeters,
+        m_atmosphereEnabled ? 1.0f : 0.0f,
+    };
+    sceneCb.atmosphereFlags = {
+        m_multipleScatteringEnabled ? 1.0f : 0.0f,
+        m_atmosphereSettings.miePhaseG,
+        m_atmosphereExposure,
+        0.0f,
+    };
+    sceneCb.rayleighScatteringAndScale = {
+        m_atmosphereSettings.rayleighScattering.x,
+        m_atmosphereSettings.rayleighScattering.y,
+        m_atmosphereSettings.rayleighScattering.z,
+        m_atmosphereSettings.rayleighScaleHeightMeters,
+    };
+    sceneCb.rayleighAbsorptionPad = {
+        m_atmosphereSettings.rayleighAbsorption.x,
+        m_atmosphereSettings.rayleighAbsorption.y,
+        m_atmosphereSettings.rayleighAbsorption.z,
+        0.0f,
+    };
+    sceneCb.mieScatteringAndScale = {
+        m_atmosphereSettings.mieScattering.x,
+        m_atmosphereSettings.mieScattering.y,
+        m_atmosphereSettings.mieScattering.z,
+        m_atmosphereSettings.mieScaleHeightMeters,
+    };
+    sceneCb.mieAbsorptionAndG = {
+        m_atmosphereSettings.mieAbsorption.x,
+        m_atmosphereSettings.mieAbsorption.y,
+        m_atmosphereSettings.mieAbsorption.z,
+        m_atmosphereSettings.miePhaseG,
+    };
+    sceneCb.ozoneAbsorptionAndCenter = {
+        m_atmosphereSettings.ozoneAbsorption.x,
+        m_atmosphereSettings.ozoneAbsorption.y,
+        m_atmosphereSettings.ozoneAbsorption.z,
+        m_atmosphereSettings.ozoneCenterHeightMeters,
+    };
+    sceneCb.ozoneHalfWidthAtmosphereHeightSunRadius = {
+        m_atmosphereSettings.ozoneHalfWidthMeters,
+        m_atmosphereSettings.atmosphereHeightMeters,
+        m_atmosphereSettings.sunAngularRadiusRad,
+        0.0f,
+    };
     std::memcpy(m_sceneCbMapped[m_frameIndex], &sceneCb, sizeof(sceneCb));
 
     const D3D12_GPU_VIRTUAL_ADDRESS sceneCbGpu = m_sceneCb[m_frameIndex]->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS objectCbGpuBase = m_objectCb[m_frameIndex]->GetGPUVirtualAddress();
 
+    DispatchAtmosphereLuts(m_commandList.Get(), sceneCb);
+
+    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->SetGraphicsRootConstantBufferView(0, sceneCbGpu);
-    m_commandList->SetGraphicsRootDescriptorTable(2, GpuSrv(kLandmaskSrvIndex));
+    m_commandList->SetGraphicsRootDescriptorTable(2, GpuSrv(kSrvTableStartIndex));
 
     // Draw skybox first with depth disabled.
     {
@@ -627,7 +704,7 @@ bool D3D12Renderer::CreateDeviceResources(std::string& error) {
 
     D3D12_DESCRIPTOR_HEAP_DESC srvDesc{};
     srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvDesc.NumDescriptors = 8;
+    srvDesc.NumDescriptors = 32;
     srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = m_device->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(m_srvHeap.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
@@ -800,51 +877,60 @@ bool D3D12Renderer::CompileShader(
 }
 
 bool D3D12Renderer::CreatePipeline(std::string& error) {
-    D3D12_DESCRIPTOR_RANGE range{};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 2;
-    range.BaseShaderRegister = 0;
-    range.RegisterSpace = 0;
-    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_DESCRIPTOR_RANGE graphicsSrvRange{};
+    graphicsSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    graphicsSrvRange.NumDescriptors = 6; // t0..t5
+    graphicsSrvRange.BaseShaderRegister = 0;
+    graphicsSrvRange.RegisterSpace = 0;
+    graphicsSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[3]{};
+    D3D12_ROOT_PARAMETER graphicsParams[3]{};
 
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[0].Descriptor.ShaderRegister = 0;
-    params[0].Descriptor.RegisterSpace = 0;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    graphicsParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    graphicsParams[0].Descriptor.ShaderRegister = 0;
+    graphicsParams[0].Descriptor.RegisterSpace = 0;
+    graphicsParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[1].Descriptor.ShaderRegister = 1;
-    params[1].Descriptor.RegisterSpace = 0;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    graphicsParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    graphicsParams[1].Descriptor.ShaderRegister = 1;
+    graphicsParams[1].Descriptor.RegisterSpace = 0;
+    graphicsParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 1;
-    params[2].DescriptorTable.pDescriptorRanges = &range;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    graphicsParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    graphicsParams[2].DescriptorTable.NumDescriptorRanges = 1;
+    graphicsParams[2].DescriptorTable.pDescriptorRanges = &graphicsSrvRange;
+    graphicsParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.ShaderRegister = 0;
-    sampler.RegisterSpace = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    std::array<D3D12_STATIC_SAMPLER_DESC, 2> staticSamplers{};
+    staticSamplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSamplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSamplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSamplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSamplers[0].ShaderRegister = 0;
+    staticSamplers[0].RegisterSpace = 0;
+    staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    staticSamplers[0].MaxLOD = D3D12_FLOAT32_MAX;
 
-    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-    rootDesc.NumParameters = static_cast<UINT>(std::size(params));
-    rootDesc.pParameters = params;
-    rootDesc.NumStaticSamplers = 1;
-    rootDesc.pStaticSamplers = &sampler;
-    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    staticSamplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSamplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSamplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSamplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSamplers[1].ShaderRegister = 1;
+    staticSamplers[1].RegisterSpace = 0;
+    staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    staticSamplers[1].MaxLOD = D3D12_FLOAT32_MAX;
+
+    D3D12_ROOT_SIGNATURE_DESC graphicsRootDesc{};
+    graphicsRootDesc.NumParameters = static_cast<UINT>(std::size(graphicsParams));
+    graphicsRootDesc.pParameters = graphicsParams;
+    graphicsRootDesc.NumStaticSamplers = static_cast<UINT>(staticSamplers.size());
+    graphicsRootDesc.pStaticSamplers = staticSamplers.data();
+    graphicsRootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ComPtr<ID3DBlob> sig;
     ComPtr<ID3DBlob> sigErrors;
     HRESULT hr = D3D12SerializeRootSignature(
-        &rootDesc,
+        &graphicsRootDesc,
         D3D_ROOT_SIGNATURE_VERSION_1,
         sig.ReleaseAndGetAddressOf(),
         sigErrors.ReleaseAndGetAddressOf());
@@ -855,7 +941,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
                 static_cast<const char*>(sigErrors->GetBufferPointer()),
                 sigErrors->GetBufferSize());
         }
-        error = "D3D12SerializeRootSignature failed: " + detail;
+        error = "D3D12SerializeRootSignature(graphics) failed: " + detail;
         return false;
     }
 
@@ -865,7 +951,72 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         sig->GetBufferSize(),
         IID_PPV_ARGS(m_rootSignature.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
-        error = HrMessage("CreateRootSignature failed", hr);
+        error = HrMessage("CreateRootSignature(graphics) failed", hr);
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_RANGE computeSrvRange{};
+    computeSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    computeSrvRange.NumDescriptors = 6; // t0..t5
+    computeSrvRange.BaseShaderRegister = 0;
+    computeSrvRange.RegisterSpace = 0;
+    computeSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_DESCRIPTOR_RANGE computeUavRange{};
+    computeUavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    computeUavRange.NumDescriptors = 4; // u0..u3
+    computeUavRange.BaseShaderRegister = 0;
+    computeUavRange.RegisterSpace = 0;
+    computeUavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER computeParams[3]{};
+    computeParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    computeParams[0].Descriptor.ShaderRegister = 0;
+    computeParams[0].Descriptor.RegisterSpace = 0;
+    computeParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    computeParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    computeParams[1].DescriptorTable.NumDescriptorRanges = 1;
+    computeParams[1].DescriptorTable.pDescriptorRanges = &computeSrvRange;
+    computeParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    computeParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    computeParams[2].DescriptorTable.NumDescriptorRanges = 1;
+    computeParams[2].DescriptorTable.pDescriptorRanges = &computeUavRange;
+    computeParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC computeRootDesc{};
+    computeRootDesc.NumParameters = static_cast<UINT>(std::size(computeParams));
+    computeRootDesc.pParameters = computeParams;
+    computeRootDesc.NumStaticSamplers = static_cast<UINT>(staticSamplers.size());
+    computeRootDesc.pStaticSamplers = staticSamplers.data();
+    computeRootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    sig.Reset();
+    sigErrors.Reset();
+    hr = D3D12SerializeRootSignature(
+        &computeRootDesc,
+        D3D_ROOT_SIGNATURE_VERSION_1,
+        sig.ReleaseAndGetAddressOf(),
+        sigErrors.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        std::string detail;
+        if (sigErrors) {
+            detail.assign(
+                static_cast<const char*>(sigErrors->GetBufferPointer()),
+                sigErrors->GetBufferSize());
+        }
+        error = "D3D12SerializeRootSignature(compute) failed: " + detail;
+        return false;
+    }
+
+    hr = m_device->CreateRootSignature(
+        0,
+        sig->GetBufferPointer(),
+        sig->GetBufferSize(),
+        IID_PPV_ARGS(m_computeRootSignature.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateRootSignature(compute) failed", hr);
         return false;
     }
 
@@ -877,6 +1028,10 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     ComPtr<ID3DBlob> skyPs;
     ComPtr<ID3DBlob> terrainVs;
     ComPtr<ID3DBlob> terrainPs;
+    ComPtr<ID3DBlob> transCs;
+    ComPtr<ID3DBlob> skyViewCs;
+    ComPtr<ID3DBlob> multiCs;
+    ComPtr<ID3DBlob> aerialCs;
 
     if (!CompileShader(m_shaderDir / "basic.hlsl", "VSMain", "vs_5_0", basicVs, error)) {
         return false;
@@ -900,6 +1055,18 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
     if (!CompileShader(m_shaderDir / "terrain.hlsl", "PSMain", "ps_5_0", terrainPs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "atmosphere_lut.hlsl", "CSGenerateTransmittance", "cs_5_0", transCs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "atmosphere_lut.hlsl", "CSGenerateSkyView", "cs_5_0", skyViewCs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "atmosphere_lut.hlsl", "CSGenerateMultipleScattering", "cs_5_0", multiCs, error)) {
+        return false;
+    }
+    if (!CompileShader(m_shaderDir / "atmosphere_lut.hlsl", "CSGenerateAerialPerspective", "cs_5_0", aerialCs, error)) {
         return false;
     }
 
@@ -1006,6 +1173,36 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
 
+    D3D12_COMPUTE_PIPELINE_STATE_DESC csDesc{};
+    csDesc.pRootSignature = m_computeRootSignature.Get();
+    csDesc.CS = {transCs->GetBufferPointer(), transCs->GetBufferSize()};
+    hr = m_device->CreateComputePipelineState(&csDesc, IID_PPV_ARGS(m_transmittanceLutPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateComputePipelineState(transmittance) failed", hr);
+        return false;
+    }
+
+    csDesc.CS = {skyViewCs->GetBufferPointer(), skyViewCs->GetBufferSize()};
+    hr = m_device->CreateComputePipelineState(&csDesc, IID_PPV_ARGS(m_skyViewLutPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateComputePipelineState(sky view) failed", hr);
+        return false;
+    }
+
+    csDesc.CS = {multiCs->GetBufferPointer(), multiCs->GetBufferSize()};
+    hr = m_device->CreateComputePipelineState(&csDesc, IID_PPV_ARGS(m_multiScatteringLutPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateComputePipelineState(multiple scattering) failed", hr);
+        return false;
+    }
+
+    csDesc.CS = {aerialCs->GetBufferPointer(), aerialCs->GetBufferSize()};
+    hr = m_device->CreateComputePipelineState(&csDesc, IID_PPV_ARGS(m_aerialPerspectiveLutPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateComputePipelineState(aerial perspective) failed", hr);
+        return false;
+    }
+
     return true;
 }
 
@@ -1068,6 +1265,178 @@ bool D3D12Renderer::CreateConstantBuffers(std::string& error) {
     }
 
     return true;
+}
+
+bool D3D12Renderer::CreateAtmosphereResources(std::string& error) {
+    constexpr DXGI_FORMAT kLutFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    constexpr UINT kTransW = 256;
+    constexpr UINT kTransH = 64;
+    constexpr UINT kSkyW = 256;
+    constexpr UINT kSkyH = 128;
+    constexpr UINT kMsW = 32;
+    constexpr UINT kMsH = 32;
+    constexpr UINT kAerialW = 32;
+    constexpr UINT kAerialH = 32;
+    constexpr UINT kAerialD = 32;
+    constexpr D3D12_RESOURCE_STATES kInitialLutState =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    auto createLut2d = [&](UINT width, UINT height, Microsoft::WRL::ComPtr<ID3D12Resource>& outResource, const char* label) -> bool {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = kLutFormat;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        const HRESULT hr = m_device->CreateCommittedResource(
+            &defaultHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            kInitialLutState,
+            nullptr,
+            IID_PPV_ARGS(outResource.ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage(label, hr);
+            return false;
+        }
+        return true;
+    };
+
+    if (!createLut2d(kTransW, kTransH, m_transmittanceLut, "CreateCommittedResource(transmittance LUT) failed")) {
+        return false;
+    }
+    if (!createLut2d(kSkyW, kSkyH, m_skyViewLut, "CreateCommittedResource(sky-view LUT) failed")) {
+        return false;
+    }
+    if (!createLut2d(kMsW, kMsH, m_multipleScatteringLut, "CreateCommittedResource(multi-scattering LUT) failed")) {
+        return false;
+    }
+
+    {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        desc.Width = kAerialW;
+        desc.Height = kAerialH;
+        desc.DepthOrArraySize = static_cast<UINT16>(kAerialD);
+        desc.MipLevels = 1;
+        desc.Format = kLutFormat;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        const HRESULT hr = m_device->CreateCommittedResource(
+            &defaultHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            kInitialLutState,
+            nullptr,
+            IID_PPV_ARGS(m_aerialPerspectiveLut.ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage("CreateCommittedResource(aerial perspective LUT) failed", hr);
+            return false;
+        }
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv2d{};
+    srv2d.Format = kLutFormat;
+    srv2d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv2d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv2d.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_transmittanceLut.Get(), &srv2d, CpuSrv(kTransmittanceSrvIndex));
+    m_device->CreateShaderResourceView(m_skyViewLut.Get(), &srv2d, CpuSrv(kSkyViewSrvIndex));
+    m_device->CreateShaderResourceView(m_multipleScatteringLut.Get(), &srv2d, CpuSrv(kMultipleScatteringSrvIndex));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv3d{};
+    srv3d.Format = kLutFormat;
+    srv3d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srv3d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv3d.Texture3D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_aerialPerspectiveLut.Get(), &srv3d, CpuSrv(kAerialPerspectiveSrvIndex));
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav2d{};
+    uav2d.Format = kLutFormat;
+    uav2d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    m_device->CreateUnorderedAccessView(m_transmittanceLut.Get(), nullptr, &uav2d, CpuSrv(kTransmittanceUavIndex));
+    m_device->CreateUnorderedAccessView(m_skyViewLut.Get(), nullptr, &uav2d, CpuSrv(kSkyViewUavIndex));
+    m_device->CreateUnorderedAccessView(m_multipleScatteringLut.Get(), nullptr, &uav2d, CpuSrv(kMultipleScatteringUavIndex));
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav3d{};
+    uav3d.Format = kLutFormat;
+    uav3d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    uav3d.Texture3D.WSize = kAerialD;
+    m_device->CreateUnorderedAccessView(m_aerialPerspectiveLut.Get(), nullptr, &uav3d, CpuSrv(kAerialPerspectiveUavIndex));
+
+    return true;
+}
+
+void D3D12Renderer::DispatchAtmosphereLuts(ID3D12GraphicsCommandList* commandList, const SceneConstants& sceneCb) {
+    (void)sceneCb;
+    if (!m_atmosphereEnabled) {
+        return;
+    }
+    if (!m_computeRootSignature || !m_transmittanceLutPso || !m_skyViewLutPso || !m_multiScatteringLutPso || !m_aerialPerspectiveLutPso) {
+        return;
+    }
+    if (!m_transmittanceLut || !m_skyViewLut || !m_multipleScatteringLut || !m_aerialPerspectiveLut) {
+        return;
+    }
+
+    auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        commandList->ResourceBarrier(1, &barrier);
+    };
+    auto uavBarrier = [&](ID3D12Resource* resource) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = resource;
+        commandList->ResourceBarrier(1, &barrier);
+    };
+
+    constexpr D3D12_RESOURCE_STATES kSrvState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    transition(m_transmittanceLut.Get(), kSrvState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(m_skyViewLut.Get(), kSrvState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(m_multipleScatteringLut.Get(), kSrvState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(m_aerialPerspectiveLut.Get(), kSrvState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    commandList->SetComputeRootSignature(m_computeRootSignature.Get());
+    commandList->SetComputeRootConstantBufferView(0, m_sceneCb[m_frameIndex]->GetGPUVirtualAddress());
+    commandList->SetComputeRootDescriptorTable(1, GpuSrv(kSrvTableStartIndex));
+    commandList->SetComputeRootDescriptorTable(2, GpuSrv(kUavTableStartIndex));
+
+    commandList->SetPipelineState(m_transmittanceLutPso.Get());
+    commandList->Dispatch((256 + 7) / 8, (64 + 7) / 8, 1);
+    uavBarrier(m_transmittanceLut.Get());
+
+    commandList->SetPipelineState(m_multiScatteringLutPso.Get());
+    commandList->Dispatch((32 + 7) / 8, (32 + 7) / 8, 1);
+    uavBarrier(m_multipleScatteringLut.Get());
+
+    commandList->SetPipelineState(m_skyViewLutPso.Get());
+    commandList->Dispatch((256 + 7) / 8, (128 + 7) / 8, 1);
+    uavBarrier(m_skyViewLut.Get());
+
+    commandList->SetPipelineState(m_aerialPerspectiveLutPso.Get());
+    commandList->Dispatch((32 + 3) / 4, (32 + 3) / 4, (32 + 3) / 4);
+    uavBarrier(m_aerialPerspectiveLut.Get());
+
+    transition(m_transmittanceLut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSrvState);
+    transition(m_skyViewLut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSrvState);
+    transition(m_multipleScatteringLut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSrvState);
+    transition(m_aerialPerspectiveLut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSrvState);
 }
 
 bool D3D12Renderer::LoadLandmaskPixels(

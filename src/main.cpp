@@ -310,6 +310,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Text("Tile loaded: %s", tileLoadedAtPlane ? "yes" : "no");
         ImGui::Text("Cache: %zu / %zu", terrainSystem.LoadedTileCount(), terrainSystem.CacheCapacity());
 
+        bool atmosphereEnabled = renderer.IsAtmosphereEnabled();
+        if (ImGui::Checkbox("Atmosphere Enabled", &atmosphereEnabled)) {
+            renderer.SetAtmosphereEnabled(atmosphereEnabled);
+        }
+
+        bool multipleScatteringEnabled = renderer.IsMultipleScatteringEnabled();
+        if (ImGui::Checkbox("Multiple Scattering", &multipleScatteringEnabled)) {
+            renderer.SetMultipleScatteringEnabled(multipleScatteringEnabled);
+        }
+
+        float atmosphereExposure = renderer.AtmosphereExposure();
+        if (ImGui::SliderFloat("Atmosphere Exposure", &atmosphereExposure, 0.25f, 3.0f, "%.2f")) {
+            renderer.SetAtmosphereExposure(atmosphereExposure);
+        }
+
         if (ImGui::Checkbox("Render old Earth sphere", &renderOldEarthSphere)) {
             renderer.SetRenderOldEarthSphere(renderOldEarthSphere);
         }
