@@ -334,12 +334,18 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     const Double3 forwardEcef = Normalize(sim.ForwardEcef());
     const Double3 upEcef = Normalize(sim.UpEcef());
 
-    const Double3 cameraEcef = planeEcef - forwardEcef * 900.0 + upEcef * 280.0;
+    // Default third-person chase camera tuned for a much closer plane view.
+    constexpr double kCameraFollowDistance = 250.0;
+    constexpr double kCameraHeight = 80.0;
+    constexpr double kCameraLookAhead = 90.0;
+    constexpr float kCameraFovDegrees = 50.0f;
+
+    const Double3 cameraEcef = planeEcef - forwardEcef * kCameraFollowDistance + upEcef * kCameraHeight;
     const Double3 anchor = cameraEcef;
 
     const Double3 planeLocalD = planeEcef - anchor;
     const Double3 earthCenterLocalD = Double3{-anchor.x, -anchor.y, -anchor.z};
-    const Double3 cameraTarget = planeLocalD + forwardEcef * 150.0;
+    const Double3 cameraTarget = planeLocalD + forwardEcef * kCameraLookAhead;
 
     const DirectX::XMVECTOR eye = DirectX::XMVectorZero();
     const DirectX::XMVECTOR at = DirectX::XMVectorSet(
@@ -355,7 +361,11 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
 
     const DirectX::XMMATRIX view = DirectX::XMMatrixLookAtLH(eye, at, up);
     const float aspect = static_cast<float>(m_width) / static_cast<float>(std::max(m_height, 1u));
-    const DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(DirectX::XMConvertToRadians(60.0f), aspect, 10.0f, 50000000.0f);
+    const DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(
+        DirectX::XMConvertToRadians(kCameraFovDegrees),
+        aspect,
+        10.0f,
+        50000000.0f);
     const DirectX::XMMATRIX viewProj = view * proj;
 
     SceneConstants sceneCb{};

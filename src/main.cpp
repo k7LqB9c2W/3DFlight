@@ -105,8 +105,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     MeshData planeMesh;
     std::string meshError;
     const std::filesystem::path modelPath = std::filesystem::path("assets") / "models" / "Airplane.glb";
-    if (!flight::LoadGlbMesh(modelPath, planeMesh, meshError)) {
+    const bool glbLoaded = flight::LoadGlbMesh(modelPath, planeMesh, meshError);
+    if (!glbLoaded) {
         planeMesh = flight::CreatePlaceholderPlane();
+    } else {
+        // Align this GLB's local facing with the simulation forward direction.
+        for (auto& v : planeMesh.vertices) {
+            v.position.x = -v.position.x;
+            v.position.z = -v.position.z;
+            v.normal.x = -v.normal.x;
+            v.normal.z = -v.normal.z;
+        }
     }
 
     std::string uploadError;
