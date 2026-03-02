@@ -130,6 +130,7 @@ void FlightSim::Update(double dtSeconds, const InputState& input, double timeSca
     constexpr double kYawRate = 0.70;
     constexpr double kThrottleAccel = 40.0;
     constexpr double kManualClimbRate = 120.0;
+    constexpr double kGravity = 9.80665;
 
     m_pitchRad += pitchInput * kPitchRate * dt;
     m_rollRad += rollInput * kRollRate * dt;
@@ -142,6 +143,13 @@ void FlightSim::Update(double dtSeconds, const InputState& input, double timeSca
     m_speedMps = std::clamp(m_speedMps, 60.0, 650.0);
 
     const double horizontalSpeed = m_speedMps * std::cos(m_pitchRad);
+    // Coordinated-turn approximation: bank angle induces heading change.
+    const double speedForTurn = std::max(45.0, std::abs(horizontalSpeed));
+    double bankTurnRate = (kGravity * std::tan(m_rollRad)) / speedForTurn;
+    bankTurnRate = std::clamp(bankTurnRate, DegToRad(-30.0), DegToRad(30.0));
+    m_headingRad += bankTurnRate * dt;
+    WrapLongitude(m_headingRad);
+
     const double verticalFromPitch = m_speedMps * std::sin(m_pitchRad);
 
     const double dNorth = std::cos(m_headingRad) * horizontalSpeed * dt;
