@@ -1,7 +1,0 @@
-C:\Users\Jacob\Documents\code\3DFlight\src\main.cpp;C:\Users\Jacob\Documents\code\3DFlight\build\d3d12_flight.dir\Debug\main.obj
-C:\Users\Jacob\Documents\code\3DFlight\src\d3d12_renderer.cpp;C:\Users\Jacob\Documents\code\3DFlight\build\d3d12_flight.dir\Debug\d3d12_renderer.obj
-C:\Users\Jacob\Documents\code\3DFlight\src\mesh.cpp;C:\Users\Jacob\Documents\code\3DFlight\build\d3d12_flight.dir\Debug\mesh.obj
-C:\Users\Jacob\Documents\code\3DFlight\src\gltf_loader.cpp;C:\Users\Jacob\Documents\code\3DFlight\build\d3d12_flight.dir\Debug\gltf_loader.obj
-C:\Users\Jacob\Documents\code\3DFlight\src\earth.cpp;C:\Users\Jacob\Documents\code\3DFlight\build\d3d12_flight.dir\Debug\earth.obj
-C:\Users\Jacob\Documents\code\3DFlight\src\sim.cpp;C:\Users\Jacob\Documents\code\3DFlight\build\d3d12_flight.dir\Debug\sim.obj
-C:\Users\Jacob\Documents\code\3DFlight\third_party\cgltf\cgltf.c;C:\Users\Jacob\Documents\code\3DFlight\build\d3d12_flight.dir\Debug\cgltf.obj

@@ -1,0 +1,48 @@
+# Build outputs
+/build/
+/out/
+/bin/
+/lib/
+cmake-build-*/
+
+# CMake generated files (if generated in source tree)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+DartConfiguration.tcl
+CMakeScripts/
+
+# Visual Studio
+.vs/
+*.VC.db
+*.VC.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# MSVC / linker outputs
+*.obj
+*.pch
+*.ilk
+*.pdb
+*.ipdb
+*.iobj
+*.idb
+*.exp
+*.lib
+*.dll
+*.exe
+
+# Test/log/temp artifacts
+*.log
+*.tmp
+*.temp
+*.cache
+imgui.ini
+
+# vcpkg artifacts (manifest mode in build tree)
+/build/vcpkg_installed/
+/build/vcpkg-manifest-install.log
