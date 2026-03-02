@@ -23,6 +23,19 @@ namespace flight {
 
 class D3D12Renderer {
 public:
+    struct TerrainVisualSettings {
+        float colorHeightMaxMeters = 6000.0f;
+        float lodTransitionWidthMeters = 5000.0f;
+        float midRingMultiplier = 2.6f;
+        float farRingMultiplier = 2.6f;
+        float hazeStrength = 0.40f;
+        float hazeAltitudeRangeMeters = 16000.0f;
+        float colorContrast = 1.0f;
+        float slopeShadingStrength = 0.35f;
+        float specularStrength = 0.14f;
+        float lodSeamBlendStrength = 0.45f;
+    };
+
     bool Initialize(
         HWND hwnd,
         uint32_t width,
@@ -40,6 +53,10 @@ public:
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
     bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, const DirectX::XMFLOAT4& renderParams, std::string& error);
+    void SetTerrainVisualSettings(const TerrainVisualSettings& settings);
+    [[nodiscard]] const TerrainVisualSettings& GetTerrainVisualSettings() const { return m_terrainVisualSettings; }
+    void SetAerialPerspectiveDepthMeters(float depthMeters);
+    [[nodiscard]] float AerialPerspectiveDepthMeters() const { return m_aerialPerspectiveDepthMeters; }
     void SetSunDirection(const Double3& dir);
     [[nodiscard]] Double3 SunDirection() const { return m_sunDirection; }
     void SetRenderOldEarthSphere(bool enabled) { m_renderOldEarthSphere = enabled; }
@@ -110,6 +127,8 @@ private:
     struct alignas(256) ObjectConstants {
         DirectX::XMFLOAT4X4 model{};
         DirectX::XMFLOAT4 colorAndFlags{};
+        DirectX::XMFLOAT4 tuning0{};
+        DirectX::XMFLOAT4 tuning1{};
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -206,6 +225,7 @@ private:
     GpuMesh m_terrainMesh;
     Double3 m_terrainAnchorEcef{};
     DirectX::XMFLOAT4 m_terrainRenderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
+    TerrainVisualSettings m_terrainVisualSettings{};
     bool m_hasTerrainMesh = false;
     bool m_renderOldEarthSphere = true;
 

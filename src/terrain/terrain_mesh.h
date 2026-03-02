@@ -11,6 +11,12 @@ namespace flight::terrain {
 struct TerrainPatchSettings {
     double patchSizeKm = 80.0;
     int gridResolution = 257;
+    double lodDistanceScale = 1.0;
+    double lodResolutionScale = 1.0;
+    double nearToMidMultiplier = 2.6;
+    double midToFarMultiplier = 2.6;
+    double farFieldRadiusKm = 1200.0;
+    double verticalExaggeration = 1.0;
 };
 
 struct TerrainPatchBuildResult {

@@ -4,10 +4,13 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <system_error>
 
 #include <imgui.h>
 #include <imgui_impl_win32.h>
+#include <nlohmann/json.hpp>
 
 #include "d3d12_renderer.h"
 #include "gltf_loader.h"
@@ -151,6 +154,217 @@ flight::Double3 ComputeSunDirectionFromLocalSolarTime(
     return flight::Normalize(eastAxis * east + northAxis * north + upAxis * up);
 }
 
+struct GraphicsTuningConfig {
+    float patchSizeKm = 80.0f;
+    int gridResolution = 257;
+    float lodDistanceScale = 1.0f;
+    float lodResolutionScale = 1.0f;
+    float nearToMidMultiplier = 2.6f;
+    float midToFarMultiplier = 2.6f;
+    float farFieldRadiusKm = 1200.0f;
+    float verticalExaggeration = 1.0f;
+
+    float colorHeightMaxMeters = 6000.0f;
+    float lodTransitionWidthMeters = 5000.0f;
+    float hazeStrength = 0.40f;
+    float hazeAltitudeRangeMeters = 16000.0f;
+    float colorContrast = 1.0f;
+    float slopeShadingStrength = 0.35f;
+    float specularStrength = 0.14f;
+    float lodSeamBlendStrength = 0.45f;
+    float aerialPerspectiveDepthMeters = 32000.0f;
+};
+
+void SanitizeGraphicsTuning(GraphicsTuningConfig& cfg) {
+    cfg.patchSizeKm = std::clamp(cfg.patchSizeKm, 20.0f, 250.0f);
+    cfg.gridResolution = std::clamp(cfg.gridResolution, 65, 513);
+    if ((cfg.gridResolution % 2) == 0) {
+        cfg.gridResolution += 1;
+    }
+    cfg.lodDistanceScale = std::clamp(cfg.lodDistanceScale, 0.35f, 4.0f);
+    cfg.lodResolutionScale = std::clamp(cfg.lodResolutionScale, 0.35f, 2.5f);
+    cfg.nearToMidMultiplier = std::clamp(cfg.nearToMidMultiplier, 1.4f, 4.5f);
+    cfg.midToFarMultiplier = std::clamp(cfg.midToFarMultiplier, 1.4f, 4.5f);
+    cfg.farFieldRadiusKm = std::clamp(cfg.farFieldRadiusKm, 120.0f, 4000.0f);
+    cfg.verticalExaggeration = std::clamp(cfg.verticalExaggeration, 0.5f, 3.0f);
+
+    cfg.colorHeightMaxMeters = std::clamp(cfg.colorHeightMaxMeters, 1000.0f, 20000.0f);
+    cfg.lodTransitionWidthMeters = std::clamp(cfg.lodTransitionWidthMeters, 250.0f, 50000.0f);
+    cfg.hazeStrength = std::clamp(cfg.hazeStrength, 0.0f, 2.0f);
+    cfg.hazeAltitudeRangeMeters = std::clamp(cfg.hazeAltitudeRangeMeters, 1000.0f, 80000.0f);
+    cfg.colorContrast = std::clamp(cfg.colorContrast, 0.2f, 3.0f);
+    cfg.slopeShadingStrength = std::clamp(cfg.slopeShadingStrength, 0.0f, 2.0f);
+    cfg.specularStrength = std::clamp(cfg.specularStrength, 0.0f, 1.0f);
+    cfg.lodSeamBlendStrength = std::clamp(cfg.lodSeamBlendStrength, 0.0f, 2.0f);
+    cfg.aerialPerspectiveDepthMeters = std::clamp(cfg.aerialPerspectiveDepthMeters, 5000.0f, 1000000.0f);
+}
+
+GraphicsTuningConfig MakeRealisticTuningPreset() {
+    GraphicsTuningConfig cfg;
+    cfg.patchSizeKm = 100.0f;
+    cfg.gridResolution = 289;
+    cfg.lodDistanceScale = 1.2f;
+    cfg.lodResolutionScale = 1.2f;
+    cfg.nearToMidMultiplier = 2.25f;
+    cfg.midToFarMultiplier = 2.15f;
+    cfg.farFieldRadiusKm = 1800.0f;
+    cfg.verticalExaggeration = 1.0f;
+    cfg.colorHeightMaxMeters = 7200.0f;
+    cfg.lodTransitionWidthMeters = 7000.0f;
+    cfg.hazeStrength = 0.30f;
+    cfg.hazeAltitudeRangeMeters = 18000.0f;
+    cfg.colorContrast = 1.10f;
+    cfg.slopeShadingStrength = 0.42f;
+    cfg.specularStrength = 0.10f;
+    cfg.lodSeamBlendStrength = 0.42f;
+    cfg.aerialPerspectiveDepthMeters = 65000.0f;
+    SanitizeGraphicsTuning(cfg);
+    return cfg;
+}
+
+GraphicsTuningConfig MakeCinematicTuningPreset() {
+    GraphicsTuningConfig cfg = MakeRealisticTuningPreset();
+    cfg.verticalExaggeration = 1.15f;
+    cfg.colorContrast = 1.25f;
+    cfg.hazeStrength = 0.42f;
+    cfg.hazeAltitudeRangeMeters = 14000.0f;
+    cfg.specularStrength = 0.18f;
+    cfg.aerialPerspectiveDepthMeters = 55000.0f;
+    SanitizeGraphicsTuning(cfg);
+    return cfg;
+}
+
+GraphicsTuningConfig MakeCrispTerrainTuningPreset() {
+    GraphicsTuningConfig cfg = MakeRealisticTuningPreset();
+    cfg.lodDistanceScale = 1.35f;
+    cfg.lodResolutionScale = 1.45f;
+    cfg.verticalExaggeration = 1.18f;
+    cfg.nearToMidMultiplier = 2.05f;
+    cfg.midToFarMultiplier = 1.95f;
+    cfg.hazeStrength = 0.16f;
+    cfg.colorContrast = 1.35f;
+    cfg.slopeShadingStrength = 0.58f;
+    cfg.aerialPerspectiveDepthMeters = 90000.0f;
+    SanitizeGraphicsTuning(cfg);
+    return cfg;
+}
+
+void ApplyGraphicsTuning(
+    const GraphicsTuningConfig& cfg,
+    TerrainPatchSettings& patchSettings,
+    D3D12Renderer& renderer) {
+    patchSettings.patchSizeKm = static_cast<double>(cfg.patchSizeKm);
+    patchSettings.gridResolution = cfg.gridResolution;
+    patchSettings.lodDistanceScale = static_cast<double>(cfg.lodDistanceScale);
+    patchSettings.lodResolutionScale = static_cast<double>(cfg.lodResolutionScale);
+    patchSettings.nearToMidMultiplier = static_cast<double>(cfg.nearToMidMultiplier);
+    patchSettings.midToFarMultiplier = static_cast<double>(cfg.midToFarMultiplier);
+    patchSettings.farFieldRadiusKm = static_cast<double>(cfg.farFieldRadiusKm);
+    patchSettings.verticalExaggeration = static_cast<double>(cfg.verticalExaggeration);
+
+    D3D12Renderer::TerrainVisualSettings visual{};
+    visual.colorHeightMaxMeters = cfg.colorHeightMaxMeters;
+    visual.lodTransitionWidthMeters = cfg.lodTransitionWidthMeters;
+    visual.midRingMultiplier = cfg.nearToMidMultiplier;
+    visual.farRingMultiplier = cfg.midToFarMultiplier;
+    visual.hazeStrength = cfg.hazeStrength;
+    visual.hazeAltitudeRangeMeters = cfg.hazeAltitudeRangeMeters;
+    visual.colorContrast = cfg.colorContrast;
+    visual.slopeShadingStrength = cfg.slopeShadingStrength;
+    visual.specularStrength = cfg.specularStrength;
+    visual.lodSeamBlendStrength = cfg.lodSeamBlendStrength;
+    renderer.SetTerrainVisualSettings(visual);
+    renderer.SetAerialPerspectiveDepthMeters(cfg.aerialPerspectiveDepthMeters);
+}
+
+bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningConfig& outCfg, std::string& error) {
+    error.clear();
+    std::ifstream in(path);
+    if (!in) {
+        error = "Failed to open tuning file: " + path.string();
+        return false;
+    }
+
+    nlohmann::json j;
+    try {
+        in >> j;
+    } catch (const std::exception& ex) {
+        error = "Failed to parse tuning JSON: " + std::string(ex.what());
+        return false;
+    }
+
+    auto readFloat = [&j](const char* key, float& value) {
+        if (j.contains(key) && j[key].is_number()) {
+            value = j[key].get<float>();
+        }
+    };
+    auto readInt = [&j](const char* key, int& value) {
+        if (j.contains(key) && j[key].is_number_integer()) {
+            value = j[key].get<int>();
+        }
+    };
+
+    readFloat("patch_size_km", outCfg.patchSizeKm);
+    readInt("grid_resolution", outCfg.gridResolution);
+    readFloat("lod_distance_scale", outCfg.lodDistanceScale);
+    readFloat("lod_resolution_scale", outCfg.lodResolutionScale);
+    readFloat("near_to_mid_multiplier", outCfg.nearToMidMultiplier);
+    readFloat("mid_to_far_multiplier", outCfg.midToFarMultiplier);
+    readFloat("far_field_radius_km", outCfg.farFieldRadiusKm);
+    readFloat("vertical_exaggeration", outCfg.verticalExaggeration);
+
+    readFloat("color_height_max_m", outCfg.colorHeightMaxMeters);
+    readFloat("lod_transition_width_m", outCfg.lodTransitionWidthMeters);
+    readFloat("haze_strength", outCfg.hazeStrength);
+    readFloat("haze_altitude_range_m", outCfg.hazeAltitudeRangeMeters);
+    readFloat("color_contrast", outCfg.colorContrast);
+    readFloat("slope_shading_strength", outCfg.slopeShadingStrength);
+    readFloat("specular_strength", outCfg.specularStrength);
+    readFloat("lod_seam_blend_strength", outCfg.lodSeamBlendStrength);
+    readFloat("aerial_perspective_depth_m", outCfg.aerialPerspectiveDepthMeters);
+
+    SanitizeGraphicsTuning(outCfg);
+    return true;
+}
+
+bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsTuningConfig& cfg, std::string& error) {
+    error.clear();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        error = "Failed to create config directory: " + ec.message();
+        return false;
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) {
+        error = "Failed to write tuning file: " + path.string();
+        return false;
+    }
+
+    nlohmann::json j;
+    j["patch_size_km"] = cfg.patchSizeKm;
+    j["grid_resolution"] = cfg.gridResolution;
+    j["lod_distance_scale"] = cfg.lodDistanceScale;
+    j["lod_resolution_scale"] = cfg.lodResolutionScale;
+    j["near_to_mid_multiplier"] = cfg.nearToMidMultiplier;
+    j["mid_to_far_multiplier"] = cfg.midToFarMultiplier;
+    j["far_field_radius_km"] = cfg.farFieldRadiusKm;
+    j["vertical_exaggeration"] = cfg.verticalExaggeration;
+    j["color_height_max_m"] = cfg.colorHeightMaxMeters;
+    j["lod_transition_width_m"] = cfg.lodTransitionWidthMeters;
+    j["haze_strength"] = cfg.hazeStrength;
+    j["haze_altitude_range_m"] = cfg.hazeAltitudeRangeMeters;
+    j["color_contrast"] = cfg.colorContrast;
+    j["slope_shading_strength"] = cfg.slopeShadingStrength;
+    j["specular_strength"] = cfg.specularStrength;
+    j["lod_seam_blend_strength"] = cfg.lodSeamBlendStrength;
+    j["aerial_perspective_depth_m"] = cfg.aerialPerspectiveDepthMeters;
+
+    out << j.dump(2) << "\n";
+    return true;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
@@ -242,6 +456,42 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     }
 
     TerrainPatchSettings patchSettings{};
+    GraphicsTuningConfig graphicsTuning = MakeRealisticTuningPreset();
+    const std::filesystem::path graphicsConfigPath = std::filesystem::path("config") / "graphics_tuning.json";
+    std::string graphicsConfigStatus;
+    {
+        std::error_code existsEc;
+        const bool configExists = std::filesystem::exists(graphicsConfigPath, existsEc) && !existsEc;
+        if (configExists) {
+            std::string loadError;
+            if (LoadGraphicsTuningConfig(graphicsConfigPath, graphicsTuning, loadError)) {
+                graphicsConfigStatus = "Loaded " + graphicsConfigPath.string();
+            } else {
+                graphicsConfigStatus = "Config load failed: " + loadError;
+            }
+        } else {
+            std::string saveError;
+            SanitizeGraphicsTuning(graphicsTuning);
+            if (SaveGraphicsTuningConfig(graphicsConfigPath, graphicsTuning, saveError)) {
+                graphicsConfigStatus = "Created default " + graphicsConfigPath.string();
+            } else {
+                graphicsConfigStatus = "Config create failed: " + saveError;
+            }
+        }
+    }
+    ApplyGraphicsTuning(graphicsTuning, patchSettings, renderer);
+    std::filesystem::file_time_type graphicsConfigWriteTime{};
+    bool hasGraphicsConfigWriteTime = false;
+    {
+        std::error_code timeEc;
+        const auto t = std::filesystem::last_write_time(graphicsConfigPath, timeEc);
+        if (!timeEc) {
+            graphicsConfigWriteTime = t;
+            hasGraphicsConfigWriteTime = true;
+        }
+    }
+    double graphicsHotReloadAccumulator = 0.0;
+
     bool regenerateTerrainRequested = true;
     bool havePatchCenter = false;
     double patchCenterLatDeg = 0.0;
@@ -284,6 +534,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         double dt = std::chrono::duration<double>(now - lastTime).count();
         lastTime = now;
         dt = std::clamp(dt, 0.0, 0.1);
+
+        graphicsHotReloadAccumulator += dt;
+        if (graphicsHotReloadAccumulator >= 1.0) {
+            graphicsHotReloadAccumulator = 0.0;
+            std::error_code timeEc;
+            const auto t = std::filesystem::last_write_time(graphicsConfigPath, timeEc);
+            if (!timeEc) {
+                const bool changed = !hasGraphicsConfigWriteTime || (t != graphicsConfigWriteTime);
+                if (changed) {
+                    GraphicsTuningConfig reloaded = graphicsTuning;
+                    std::string loadError;
+                    if (LoadGraphicsTuningConfig(graphicsConfigPath, reloaded, loadError)) {
+                        graphicsTuning = reloaded;
+                        ApplyGraphicsTuning(graphicsTuning, patchSettings, renderer);
+                        regenerateTerrainRequested = true;
+                        graphicsConfigStatus = "Hot reloaded " + graphicsConfigPath.string();
+                    } else {
+                        graphicsConfigStatus = "Hot reload failed: " + loadError;
+                    }
+                    graphicsConfigWriteTime = t;
+                    hasGraphicsConfigWriteTime = true;
+                }
+            }
+        }
 
         InputState input{};
         input.pitchUp = IsKeyDown('W');
@@ -432,23 +706,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (ImGui::Checkbox("Render old Earth sphere", &renderOldEarthSphere)) {
             renderer.SetRenderOldEarthSphere(renderOldEarthSphere);
         }
-
-        float patchSizeKm = static_cast<float>(patchSettings.patchSizeKm);
-        if (ImGui::SliderFloat("Patch Size (km)", &patchSizeKm, 20.0f, 200.0f, "%.1f")) {
-            patchSettings.patchSizeKm = static_cast<double>(patchSizeKm);
-        }
-
-        int gridRes = patchSettings.gridResolution;
-        if (ImGui::SliderInt("Grid Resolution", &gridRes, 65, 513)) {
-            if ((gridRes % 2) == 0) {
-                gridRes += 1;
-            }
-            patchSettings.gridResolution = std::clamp(gridRes, 65, 513);
-        }
-
-        if (ImGui::Button("Regenerate Terrain")) {
-            regenerateTerrainRequested = true;
-        }
+        ImGui::TextUnformatted("Use Graphics Tuning panel for LOD/fog/detail tuning.");
 
         if (!terrainInitError.empty()) {
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", terrainInitError.c_str());
@@ -476,6 +734,143 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Text("Throttle Up/Down arrows");
         ImGui::Text("Altitude R/F, Reset Backspace");
         ImGui::Text("Landmask: %s", renderer.HasLandmask() ? "loaded" : "fallback");
+        ImGui::End();
+
+        ImGui::Begin("Graphics Tuning");
+        bool meshTuningChanged = false;
+        bool visualTuningChanged = false;
+
+        if (ImGui::SliderFloat("Patch Size (km)", &graphicsTuning.patchSizeKm, 20.0f, 250.0f, "%.1f")) {
+            meshTuningChanged = true;
+        }
+        if (ImGui::SliderInt("Grid Resolution", &graphicsTuning.gridResolution, 65, 513)) {
+            if ((graphicsTuning.gridResolution % 2) == 0) {
+                graphicsTuning.gridResolution += 1;
+            }
+            meshTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("LOD Distance Scale", &graphicsTuning.lodDistanceScale, 0.35f, 4.0f, "%.2f")) {
+            meshTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("LOD Resolution Scale", &graphicsTuning.lodResolutionScale, 0.35f, 2.5f, "%.2f")) {
+            meshTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Near->Mid Mult", &graphicsTuning.nearToMidMultiplier, 1.4f, 4.5f, "%.2f")) {
+            meshTuningChanged = true;
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Mid->Far Mult", &graphicsTuning.midToFarMultiplier, 1.4f, 4.5f, "%.2f")) {
+            meshTuningChanged = true;
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Far Field Radius (km)", &graphicsTuning.farFieldRadiusKm, 120.0f, 4000.0f, "%.0f")) {
+            meshTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Vertical Exaggeration", &graphicsTuning.verticalExaggeration, 0.5f, 3.0f, "%.2f")) {
+            meshTuningChanged = true;
+        }
+
+        ImGui::Separator();
+        if (ImGui::SliderFloat("Color Height Max (m)", &graphicsTuning.colorHeightMaxMeters, 1000.0f, 20000.0f, "%.0f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("LOD Transition Width (m)", &graphicsTuning.lodTransitionWidthMeters, 250.0f, 50000.0f, "%.0f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Haze Strength", &graphicsTuning.hazeStrength, 0.0f, 2.0f, "%.2f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Haze Altitude Range (m)", &graphicsTuning.hazeAltitudeRangeMeters, 1000.0f, 80000.0f, "%.0f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Color Contrast", &graphicsTuning.colorContrast, 0.2f, 3.0f, "%.2f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Slope Shading", &graphicsTuning.slopeShadingStrength, 0.0f, 2.0f, "%.2f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Specular Strength", &graphicsTuning.specularStrength, 0.0f, 1.0f, "%.2f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("LOD Seam Blend", &graphicsTuning.lodSeamBlendStrength, 0.0f, 2.0f, "%.2f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Aerial Depth (m)", &graphicsTuning.aerialPerspectiveDepthMeters, 5000.0f, 1000000.0f, "%.0f")) {
+            visualTuningChanged = true;
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("Preset: Realistic")) {
+            graphicsTuning = MakeRealisticTuningPreset();
+            meshTuningChanged = true;
+            visualTuningChanged = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Preset: Cinematic")) {
+            graphicsTuning = MakeCinematicTuningPreset();
+            meshTuningChanged = true;
+            visualTuningChanged = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Preset: Crisp")) {
+            graphicsTuning = MakeCrispTerrainTuningPreset();
+            meshTuningChanged = true;
+            visualTuningChanged = true;
+        }
+
+        if (ImGui::Button("Regenerate Terrain")) {
+            regenerateTerrainRequested = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save Tuning")) {
+            SanitizeGraphicsTuning(graphicsTuning);
+            std::string saveError;
+            if (SaveGraphicsTuningConfig(graphicsConfigPath, graphicsTuning, saveError)) {
+                graphicsConfigStatus = "Saved " + graphicsConfigPath.string();
+                std::error_code timeEc;
+                const auto t = std::filesystem::last_write_time(graphicsConfigPath, timeEc);
+                if (!timeEc) {
+                    graphicsConfigWriteTime = t;
+                    hasGraphicsConfigWriteTime = true;
+                }
+            } else {
+                graphicsConfigStatus = "Save failed: " + saveError;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reload Tuning")) {
+            GraphicsTuningConfig loaded = graphicsTuning;
+            std::string loadError;
+            if (LoadGraphicsTuningConfig(graphicsConfigPath, loaded, loadError)) {
+                graphicsTuning = loaded;
+                meshTuningChanged = true;
+                visualTuningChanged = true;
+                graphicsConfigStatus = "Reloaded " + graphicsConfigPath.string();
+                std::error_code timeEc;
+                const auto t = std::filesystem::last_write_time(graphicsConfigPath, timeEc);
+                if (!timeEc) {
+                    graphicsConfigWriteTime = t;
+                    hasGraphicsConfigWriteTime = true;
+                }
+            } else {
+                graphicsConfigStatus = "Reload failed: " + loadError;
+            }
+        }
+
+        if (meshTuningChanged || visualTuningChanged) {
+            SanitizeGraphicsTuning(graphicsTuning);
+            ApplyGraphicsTuning(graphicsTuning, patchSettings, renderer);
+            if (meshTuningChanged) {
+                regenerateTerrainRequested = true;
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Config: %s", graphicsConfigPath.string().c_str());
+        if (!graphicsConfigStatus.empty()) {
+            ImGui::TextWrapped("%s", graphicsConfigStatus.c_str());
+        }
+        ImGui::TextUnformatted("Mesh sliders trigger terrain regeneration. Visual sliders apply live.");
         ImGui::End();
 
         ImGui::Begin("Terrain Probe");

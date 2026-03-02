@@ -14,6 +14,8 @@ cbuffer ObjectCB : register(b1)
 {
     float4x4 gModel;
     float4 gColorAndFlags;
+    float4 gTuning0; // x midRingMul, y farRingMul, z hazeStrength, w hazeAltitudeRangeMeters
+    float4 gTuning1; // x contrast, y slopeBoost, z specularStrength, w lodSeamBlendStrength
 };
 
 struct VSInput
@@ -76,17 +78,21 @@ float4 PSMain(VSOutput input) : SV_Target
     float ambient = lerp(0.09, 0.25, hemi);
     float diffuse = 0.80 * ndl;
     float3 H = normalize(V + L);
-    float spec = pow(saturate(dot(N, H)), 48.0) * 0.14;
+    float spec = pow(saturate(dot(N, H)), 48.0) * gTuning1.z;
 
     float3 baseColor = TerrainColor(clampedHeight);
+    const float slopeTerm = saturate(1.0 - abs(dot(N, normalize(gCameraUpAndTime.xyz))));
+    const float slopeBoost = 1.0 + slopeTerm * gTuning1.y;
+    baseColor *= slopeBoost;
     float3 color = baseColor * (ambient + diffuse) + spec.xxx;
+    color = pow(max(color, 1e-4), 1.0 / max(gTuning1.x, 0.05));
 
     const float distMeters = length(input.worldPos);
     const float nearLodRadius = max(gColorAndFlags.x, 1000.0);
     const float transitionWidth = max(gColorAndFlags.z, 500.0);
     const float boundary0 = nearLodRadius;
-    const float boundary1 = nearLodRadius * 2.6;
-    const float boundary2 = nearLodRadius * 2.6 * 2.6;
+    const float boundary1 = nearLodRadius * max(gTuning0.x, 1.1);
+    const float boundary2 = boundary1 * max(gTuning0.y, 1.1);
 
     const float frameId = floor(gCameraUpAndTime.w * 10.0);
     const float dither = InterleavedGradientNoise(floor(input.position.xy), frameId) - 0.5;
@@ -104,14 +110,15 @@ float4 PSMain(VSOutput input) : SV_Target
 
     // Dithered LOD transition softening to hide ring swaps.
     const float lodBlend = saturate((blend0 + blend1 + blend2) / 3.0);
-    color = lerp(color, color * 0.93 + skyColor * 0.07, saturate(seamMask * 0.45 + lodBlend * 0.12));
+    const float seamBlend = saturate(seamMask * gTuning1.w + lodBlend * 0.12);
+    color = lerp(color, color * 0.93 + skyColor * 0.07, seamBlend);
 
     // Altitude-dependent distance haze (stronger close to sea level).
     const float cameraAltitude = max(0.0, length(CameraPosition() - PlanetCenter()) - GroundRadiusMeters());
-    const float lowAltitudeFactor = saturate(1.0 - cameraAltitude / 16000.0);
+    const float lowAltitudeFactor = saturate(1.0 - cameraAltitude / max(gTuning0.w, 1000.0));
     const float farFieldFactor = saturate(distMeters / max(gColorAndFlags.w, 1.0));
     const float extraHaze = lowAltitudeFactor * farFieldFactor * farFieldFactor;
-    color = lerp(color, skyColor, extraHaze * 0.40);
+    color = lerp(color, skyColor, extraHaze * gTuning0.z);
 
     color = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), color);
     color = 1.0 - exp(-color * max(gAtmosphereFlags.z, 0.01));

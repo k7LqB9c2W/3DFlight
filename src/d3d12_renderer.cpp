@@ -398,6 +398,25 @@ bool D3D12Renderer::SetTerrainMesh(
     return true;
 }
 
+void D3D12Renderer::SetTerrainVisualSettings(const TerrainVisualSettings& settings) {
+    TerrainVisualSettings clamped = settings;
+    clamped.colorHeightMaxMeters = std::clamp(clamped.colorHeightMaxMeters, 1000.0f, 20000.0f);
+    clamped.lodTransitionWidthMeters = std::clamp(clamped.lodTransitionWidthMeters, 250.0f, 50000.0f);
+    clamped.midRingMultiplier = std::clamp(clamped.midRingMultiplier, 1.1f, 5.0f);
+    clamped.farRingMultiplier = std::clamp(clamped.farRingMultiplier, 1.1f, 5.0f);
+    clamped.hazeStrength = std::clamp(clamped.hazeStrength, 0.0f, 2.0f);
+    clamped.hazeAltitudeRangeMeters = std::clamp(clamped.hazeAltitudeRangeMeters, 1000.0f, 80000.0f);
+    clamped.colorContrast = std::clamp(clamped.colorContrast, 0.2f, 3.0f);
+    clamped.slopeShadingStrength = std::clamp(clamped.slopeShadingStrength, 0.0f, 2.0f);
+    clamped.specularStrength = std::clamp(clamped.specularStrength, 0.0f, 1.0f);
+    clamped.lodSeamBlendStrength = std::clamp(clamped.lodSeamBlendStrength, 0.0f, 2.0f);
+    m_terrainVisualSettings = clamped;
+}
+
+void D3D12Renderer::SetAerialPerspectiveDepthMeters(float depthMeters) {
+    m_aerialPerspectiveDepthMeters = std::clamp(depthMeters, 5000.0f, 1000000.0f);
+}
+
 void D3D12Renderer::SetSunDirection(const Double3& dir) {
     const Double3 normalized = Normalize(dir);
     if (Length(normalized) < 1e-8) {
@@ -576,6 +595,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         const DirectX::XMMATRIX model = DirectX::XMMatrixScaling(30000000.0f, 30000000.0f, 30000000.0f);
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
         obj.colorAndFlags = {1.0f, 1.0f, 1.0f, 0.0f};
+        obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 0), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 0);
@@ -592,6 +613,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(earthCenterLocalD.z));
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
         obj.colorAndFlags = {0.25f, 0.60f, 0.22f, m_hasLandmaskTexture ? 1.0f : 0.0f};
+        obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 1), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 1);
@@ -608,7 +631,22 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(terrainOffsetD.y),
             static_cast<float>(terrainOffsetD.z));
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
-        obj.colorAndFlags = m_terrainRenderParams;
+        DirectX::XMFLOAT4 params = m_terrainRenderParams;
+        params.y = m_terrainVisualSettings.colorHeightMaxMeters;
+        params.z = m_terrainVisualSettings.lodTransitionWidthMeters;
+        obj.colorAndFlags = params;
+        obj.tuning0 = {
+            m_terrainVisualSettings.midRingMultiplier,
+            m_terrainVisualSettings.farRingMultiplier,
+            m_terrainVisualSettings.hazeStrength,
+            m_terrainVisualSettings.hazeAltitudeRangeMeters,
+        };
+        obj.tuning1 = {
+            m_terrainVisualSettings.colorContrast,
+            m_terrainVisualSettings.slopeShadingStrength,
+            m_terrainVisualSettings.specularStrength,
+            m_terrainVisualSettings.lodSeamBlendStrength,
+        };
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
@@ -640,6 +678,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         ObjectConstants obj{};
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
         obj.colorAndFlags = {0.92f, 0.93f, 0.95f, 0.0f};
+        obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);

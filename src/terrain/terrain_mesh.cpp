@@ -76,6 +76,7 @@ TmpVertex SampleTerrainVertex(
     double thetaRad,
     double radiusMeters,
     double skirtDepthMeters,
+    double verticalExaggeration,
     const Double3& anchorEcef) {
     const double eastMeters = std::cos(thetaRad) * radiusMeters;
     const double northMeters = std::sin(thetaRad) * radiusMeters;
@@ -85,13 +86,14 @@ TmpVertex SampleTerrainVertex(
     OffsetLatLonGreatCircle(centerLatDeg, centerLonDeg, northMeters, eastMeters, latDeg, lonDeg);
 
     const double rawHeight = terrainSystem.SampleHeightMeters(latDeg, lonDeg);
-    const double clampedHeight = std::max(rawHeight, 0.0) - skirtDepthMeters;
-    const Double3 ecef = GeodeticToEcef(DegToRad(latDeg), DegToRad(lonDeg), clampedHeight);
+    const double clampedHeightMeters = std::max(rawHeight, 0.0);
+    const double visualHeight = clampedHeightMeters * std::max(verticalExaggeration, 0.01) - skirtDepthMeters;
+    const Double3 ecef = GeodeticToEcef(DegToRad(latDeg), DegToRad(lonDeg), visualHeight);
 
     TmpVertex v{};
     v.local = ecef - anchorEcef;
     v.normal = Normalize(ecef);
-    v.clampedHeight = clampedHeight;
+    v.clampedHeight = clampedHeightMeters;
     v.rawHeight = rawHeight;
     return v;
 }
@@ -106,6 +108,7 @@ void AppendRingMesh(
     int radialSegments,
     int angularSegments,
     double skirtDepthMeters,
+    double verticalExaggeration,
     bool includeInnerSkirt,
     bool includeOuterSkirt,
     MeshData& mesh,
@@ -148,6 +151,7 @@ void AppendRingMesh(
                 theta,
                 row.radius,
                 row.skirtDepth,
+                verticalExaggeration,
                 anchorEcef);
 
             Vertex v{};
@@ -197,18 +201,26 @@ bool BuildTerrainPatch(
     outResult = {};
 
     const int baseGrid = std::clamp(settings.gridResolution, 65, 513);
-    const double nearRadiusMeters = std::clamp(settings.patchSizeKm * 500.0, 15000.0, 120000.0);
-    const double ring1RadiusMeters = nearRadiusMeters * 2.6;
-    const double ring2RadiusMeters = ring1RadiusMeters * 2.6;
-    const double farRadiusMeters = std::max(ring2RadiusMeters * 3.5, 1200000.0);
+    const double lodDistanceScale = std::clamp(settings.lodDistanceScale, 0.35, 4.0);
+    const double lodResolutionScale = std::clamp(settings.lodResolutionScale, 0.35, 2.5);
+    const double nearToMidMultiplier = std::clamp(settings.nearToMidMultiplier, 1.4, 4.5);
+    const double midToFarMultiplier = std::clamp(settings.midToFarMultiplier, 1.4, 4.5);
+    const double verticalExaggeration = std::clamp(settings.verticalExaggeration, 0.25, 4.0);
+
+    const double nearRadiusMeters = std::clamp(settings.patchSizeKm * 500.0 * lodDistanceScale, 12000.0, 220000.0);
+    const double ring1RadiusMeters = nearRadiusMeters * nearToMidMultiplier;
+    const double ring2RadiusMeters = ring1RadiusMeters * midToFarMultiplier;
+    const double requestedFarRadiusMeters = std::max(settings.farFieldRadiusKm * 1000.0 * lodDistanceScale, ring2RadiusMeters * 1.6);
+    const double farRadiusMeters = std::clamp(requestedFarRadiusMeters, ring2RadiusMeters * 1.2, 3000000.0);
     const double lodTransitionMeters = std::clamp(nearRadiusMeters * 0.12, 2000.0, 14000.0);
     const double skirtDepthMeters = std::clamp(nearRadiusMeters * 0.025, 120.0, 2200.0);
 
-    const int angularSegments = std::clamp((baseGrid / 2) * 2, 64, 384);
-    const int radial0 = std::clamp(baseGrid / 3, 24, 170);
-    const int radial1 = std::clamp(baseGrid / 5, 18, 96);
-    const int radial2 = std::clamp(baseGrid / 7, 14, 72);
-    const int radial3 = std::clamp(baseGrid / 9, 10, 48);
+    const int scaledGrid = static_cast<int>(std::round(static_cast<double>(baseGrid) * lodResolutionScale));
+    const int angularSegments = std::clamp(((scaledGrid / 2) * 2), 64, 640);
+    const int radial0 = std::clamp(scaledGrid / 3, 20, 220);
+    const int radial1 = std::clamp(scaledGrid / 5, 14, 140);
+    const int radial2 = std::clamp(scaledGrid / 7, 10, 96);
+    const int radial3 = std::clamp(scaledGrid / 10, 8, 72);
 
     MeshData mesh;
     mesh.vertices.reserve(150000);
@@ -227,6 +239,7 @@ bool BuildTerrainPatch(
         radial0,
         angularSegments,
         skirtDepthMeters,
+        verticalExaggeration,
         false,
         true,
         mesh,
@@ -243,6 +256,7 @@ bool BuildTerrainPatch(
         radial1,
         angularSegments,
         skirtDepthMeters,
+        verticalExaggeration,
         true,
         true,
         mesh,
@@ -259,6 +273,7 @@ bool BuildTerrainPatch(
         radial2,
         angularSegments,
         skirtDepthMeters,
+        verticalExaggeration,
         true,
         true,
         mesh,
@@ -276,6 +291,7 @@ bool BuildTerrainPatch(
         radial3,
         angularSegments,
         skirtDepthMeters * 1.5,
+        verticalExaggeration,
         true,
         true,
         mesh,
