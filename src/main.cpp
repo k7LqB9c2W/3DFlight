@@ -172,6 +172,26 @@ double ToDisplaySpeed(double metersPerSecond, bool useImperialUnits) {
     return useImperialUnits ? (metersPerSecond * kMetersPerSecondToMph) : metersPerSecond;
 }
 
+const char* kCityPresetItems = "San Diego\0San Francisco\0Los Angeles\0";
+
+void CityPresetLatLon(int index, double& outLatDeg, double& outLonDeg) {
+    switch (index) {
+        case 0: // San Diego
+            outLatDeg = 32.7157;
+            outLonDeg = -117.1611;
+            break;
+        case 1: // San Francisco
+            outLatDeg = 37.7749;
+            outLonDeg = -122.4194;
+            break;
+        case 2: // Los Angeles
+        default:
+            outLatDeg = 34.0522;
+            outLonDeg = -118.2437;
+            break;
+    }
+}
+
 enum class VehicleMode {
     Plane = 0,
     Missile = 1,
@@ -667,13 +687,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
         missileMeshStatus = "Missile model load failed, using placeholder: " + missileLoadError;
     } else {
-        // Align missile model orientation and scale down from loader's default 60m normalization.
+        // Scale down from loader's default 60m normalization.
+        // Missile GLB is already oriented opposite to airplane asset; keep X/Z signs so chase cam sees rear aspect.
         for (auto& v : missileMesh.vertices) {
-            v.position.x = -v.position.x * 0.08f;
+            v.position.x = v.position.x * 0.08f;
             v.position.y = v.position.y * 0.08f;
-            v.position.z = -v.position.z * 0.08f;
-            v.normal.x = -v.normal.x;
-            v.normal.z = -v.normal.z;
+            v.position.z = v.position.z * 0.08f;
         }
         missileMeshStatus = "Missile model loaded: " + missilePath.string();
     }
@@ -696,6 +715,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     missileState.targetLonDeg = WrapLonDeg(editableStart.longitudeDeg + 0.55);
     missileState.targetAltMeters = std::max(0.0, editableStart.altitudeMeters * 0.25);
     PrepareMissileAtLaunch(missileState);
+    int launchCityPresetIndex = 1;
+    int targetCityPresetIndex = 2;
     float simTimeScale = 1.0f;
     bool useImperialUnits = false;
     float localSolarTimeHours = 14.0f;
@@ -1118,6 +1139,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
 
             ImGui::Text("Launch Coordinates");
+            ImGui::SetNextItemWidth(190.0f);
+            ImGui::Combo("Launch Preset", &launchCityPresetIndex, kCityPresetItems);
+            ImGui::SameLine();
+            if (ImGui::Button("Apply Launch Preset")) {
+                CityPresetLatLon(launchCityPresetIndex, missileState.launchLatDeg, missileState.launchLonDeg);
+                missileState.launchLonDeg = WrapLonDeg(missileState.launchLonDeg);
+                missileState.impacted = false;
+                if (!missileState.launched) {
+                    PrepareMissileAtLaunch(missileState);
+                }
+                regenerateTerrainRequested = true;
+                havePatchCenter = false;
+            }
             ImGui::InputDouble("Launch Lat", &missileState.launchLatDeg, 0.1, 1.0, "%.6f");
             ImGui::InputDouble("Launch Lon", &missileState.launchLonDeg, 0.1, 1.0, "%.6f");
             if (useImperialUnits) {
@@ -1130,6 +1164,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
 
             ImGui::Text("Ending Coordinates");
+            ImGui::SetNextItemWidth(190.0f);
+            ImGui::Combo("Target Preset", &targetCityPresetIndex, kCityPresetItems);
+            ImGui::SameLine();
+            if (ImGui::Button("Apply Target Preset")) {
+                CityPresetLatLon(targetCityPresetIndex, missileState.targetLatDeg, missileState.targetLonDeg);
+                missileState.targetLonDeg = WrapLonDeg(missileState.targetLonDeg);
+                missileState.impacted = false;
+                if (!missileState.launched) {
+                    PrepareMissileAtLaunch(missileState);
+                }
+                regenerateTerrainRequested = true;
+                havePatchCenter = false;
+            }
             ImGui::InputDouble("Target Lat", &missileState.targetLatDeg, 0.1, 1.0, "%.6f");
             ImGui::InputDouble("Target Lon", &missileState.targetLonDeg, 0.1, 1.0, "%.6f");
             if (useImperialUnits) {
