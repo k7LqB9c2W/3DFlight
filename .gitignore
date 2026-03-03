@@ -41,7 +41,6 @@ CMakeScripts/
 *.tmp
 *.temp
 *.cache
-/NE_Shaded/
 imgui.ini
 
 # vcpkg artifacts (manifest mode in build tree)
@@ -49,6 +48,5 @@ imgui.ini
 /build/vcpkg-manifest-install.log
 
 # Large map files
-NE1_HR_LC_SR.tif
 world.200406.3x21600x21600.A1_geo.tif
 assets/textures/satellite/world.200406.3x21600x21600.A1_geo.tif

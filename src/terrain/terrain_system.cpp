@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <vector>
 
 #include "sim.h"
@@ -32,6 +33,68 @@ int NormalizeTileLon(int lonDeg) {
 
 int ClampTileLatNorthKey(int latKeyDeg) {
     return std::clamp(latKeyDeg, -75, 90);
+}
+
+bool IsAsciiDigit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+char ToUpperAscii(char c) {
+    return static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+}
+
+std::string ToUpperAscii(std::string s) {
+    for (char& c : s) {
+        c = ToUpperAscii(c);
+    }
+    return s;
+}
+
+bool TryParseEtopoTileFilename(const std::string& filename, TileKey& outKey) {
+    // Expected canonical form:
+    // ETOPO_2022_v1_15s_N45W135_surface.tif
+    // Key stored in code uses north-edge latitude label (N45 above).
+    const std::string upper = ToUpperAscii(filename);
+    constexpr const char* kPrefix = "ETOPO_2022_V1_15S_";
+    constexpr const char* kMid = "_SURFACE";
+    if (upper.rfind(kPrefix, 0) != 0) {
+        return false;
+    }
+
+    const std::size_t keyStart = std::char_traits<char>::length(kPrefix);
+    const std::size_t midPos = upper.find(kMid, keyStart);
+    if (midPos == std::string::npos || midPos <= keyStart) {
+        return false;
+    }
+
+    const std::string compact = upper.substr(keyStart, midPos - keyStart);
+    if (compact.size() != 7) {
+        return false;
+    }
+
+    const char latHem = compact[0];
+    const char lonHem = compact[3];
+    if ((latHem != 'N' && latHem != 'S') || (lonHem != 'E' && lonHem != 'W')) {
+        return false;
+    }
+    if (!IsAsciiDigit(compact[1]) || !IsAsciiDigit(compact[2]) ||
+        !IsAsciiDigit(compact[4]) || !IsAsciiDigit(compact[5]) || !IsAsciiDigit(compact[6])) {
+        return false;
+    }
+
+    const int latAbs = (compact[1] - '0') * 10 + (compact[2] - '0');
+    const int lonAbs = (compact[4] - '0') * 100 + (compact[5] - '0') * 10 + (compact[6] - '0');
+    int latKey = (latHem == 'S') ? -latAbs : latAbs;
+    int lonKey = (lonHem == 'W') ? -lonAbs : lonAbs;
+    lonKey = NormalizeTileLon(lonKey);
+    latKey = ClampTileLatNorthKey(latKey);
+
+    if (latAbs > 90 || lonAbs > 180) {
+        return false;
+    }
+
+    outKey = TileKey{latKey, lonKey};
+    return true;
 }
 
 void OffsetLatLonByHeading(double latDeg, double lonDeg, double headingDeg, double distanceMeters, double& outLatDeg, double& outLonDeg) {
@@ -93,12 +156,17 @@ bool TerrainSystem::Initialize(const std::filesystem::path& tilesDirectory, std:
         m_tilesDirectory = tilesDirectory;
         // Keep at least 5x5 terrain tile residency.
         m_cacheCapacity = std::max<std::size_t>(cacheCapacity, 25);
+        m_tileIndex.clear();
         m_cache.clear();
         m_lru.clear();
         m_lruLookup.clear();
         m_prefetchQueue.clear();
         m_prefetchQueuedSet.clear();
         m_prefetchStop = false;
+    }
+
+    if (!BuildTileIndex(error)) {
+        return false;
     }
 
     StartWorker();
@@ -108,11 +176,57 @@ bool TerrainSystem::Initialize(const std::filesystem::path& tilesDirectory, std:
 void TerrainSystem::Shutdown() {
     StopWorker();
     std::scoped_lock<std::mutex> lock(m_mutex);
+    m_tileIndex.clear();
     m_cache.clear();
     m_lru.clear();
     m_lruLookup.clear();
     m_prefetchQueue.clear();
     m_prefetchQueuedSet.clear();
+}
+
+bool TerrainSystem::BuildTileIndex(std::string& error) {
+    std::unordered_map<TileKey, std::filesystem::path, TileKeyHasher> discovered;
+    std::error_code ec;
+    const std::filesystem::recursive_directory_iterator end;
+    for (std::filesystem::recursive_directory_iterator it(m_tilesDirectory, ec); it != end && !ec; it.increment(ec)) {
+        if (ec) {
+            break;
+        }
+        if (!it->is_regular_file(ec) || ec) {
+            continue;
+        }
+
+        const std::filesystem::path p = it->path();
+        std::string ext = ToUpperAscii(p.extension().string());
+        if (ext != ".TIF" && ext != ".TIFF") {
+            continue;
+        }
+
+        TileKey key{};
+        if (!TryParseEtopoTileFilename(p.filename().string(), key)) {
+            continue;
+        }
+
+        const std::filesystem::path canonical = m_tilesDirectory / key.ToFilename();
+        const bool isCanonicalName = (ToUpperAscii(p.filename().string()) == ToUpperAscii(canonical.filename().string()));
+        const auto found = discovered.find(key);
+        if (found == discovered.end()) {
+            discovered.emplace(key, p);
+        } else if (isCanonicalName) {
+            found->second = p;
+        }
+    }
+
+    if (ec) {
+        error = "Failed while indexing ETOPO tiles: " + ec.message();
+        return false;
+    }
+
+    {
+        std::scoped_lock<std::mutex> lock(m_mutex);
+        m_tileIndex = std::move(discovered);
+    }
+    return true;
 }
 
 void TerrainSystem::StartWorker() {
@@ -375,18 +489,10 @@ void TerrainSystem::EvictIfNeeded() {
 }
 
 std::filesystem::path TerrainSystem::ResolveTilePath(const TileKey& key) const {
-    const std::filesystem::path preferred = m_tilesDirectory / key.ToFilename();
-    if (std::filesystem::exists(preferred)) {
-        return preferred;
-    }
-
-    for (const auto& entry : std::filesystem::directory_iterator(m_tilesDirectory)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        if (entry.path().filename().string() == key.ToFilename()) {
-            return entry.path();
-        }
+    std::scoped_lock<std::mutex> lock(m_mutex);
+    const auto found = m_tileIndex.find(key);
+    if (found != m_tileIndex.end()) {
+        return found->second;
     }
     return {};
 }

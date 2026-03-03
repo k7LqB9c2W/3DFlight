@@ -74,6 +74,7 @@ public:
 private:
     using TilePtr = std::shared_ptr<EtopoTile>;
 
+    bool BuildTileIndex(std::string& error);
     void StartWorker();
     void StopWorker();
     void WorkerLoop();
@@ -86,6 +87,7 @@ private:
 
     std::filesystem::path m_tilesDirectory;
     std::size_t m_cacheCapacity = 9;
+    std::unordered_map<TileKey, std::filesystem::path, TileKeyHasher> m_tileIndex;
 
     std::unordered_map<TileKey, TilePtr, TileKeyHasher> m_cache;
     std::list<TileKey> m_lru;

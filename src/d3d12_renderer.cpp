@@ -2311,13 +2311,20 @@ bool D3D12Renderer::CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, 
 }
 
 bool D3D12Renderer::CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandList, std::string& error) {
-    // Optional global equirectangular albedo used for terrain coloring (Natural Earth shaded relief).
+    // Optional global equirectangular albedo used for terrain coloring (Blue Marble world.*_geo.tif).
     // Missing/failed loads fall back to a 1x1 neutral pixel so the game keeps running.
     error.clear();
 
     const std::filesystem::path blueMarbleRel = std::filesystem::path("textures") / "satellite" / "world.200406.3x21600x21600.A1_geo.tif";
-    const std::filesystem::path neRel = std::filesystem::path("NE_Shaded") / "NE1_HR_LC_SR.tif";
     std::filesystem::path found;
+    auto toLowerAscii = [](std::string s) {
+        for (char& c : s) {
+            if (c >= 'A' && c <= 'Z') {
+                c = static_cast<char>(c - 'A' + 'a');
+            }
+        }
+        return s;
+    };
 
     auto consider = [&](const std::filesystem::path& p) {
         if (!found.empty()) {
@@ -2329,17 +2336,43 @@ bool D3D12Renderer::CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandL
         }
     };
 
+    auto considerWorldGeoInDir = [&](const std::filesystem::path& dir) {
+        if (!found.empty()) {
+            return;
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(dir, ec) || ec) {
+            return;
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (ec) {
+                break;
+            }
+            if (!entry.is_regular_file(ec) || ec) {
+                continue;
+            }
+            const std::string nameLower = toLowerAscii(entry.path().filename().string());
+            const bool isWorldPrefix = nameLower.rfind("world.", 0) == 0;
+            const bool hasGeoSuffix =
+                (nameLower.size() >= 8 && nameLower.compare(nameLower.size() - 8, 8, "_geo.tif") == 0) ||
+                (nameLower.size() >= 9 && nameLower.compare(nameLower.size() - 9, 9, "_geo.tiff") == 0);
+            if (isWorldPrefix && hasGeoSuffix) {
+                found = entry.path();
+                return;
+            }
+        }
+    };
+
     // Prefer an assets-based canonical location.
     consider(m_assetDir / blueMarbleRel);
-    consider(m_assetDir / "textures" / "ne" / "NE1_HR_LC_SR.tif");
-    consider(m_assetDir / "textures" / "NE1_HR_LC_SR.tif");
-    consider(m_assetDir / neRel);
+    considerWorldGeoInDir(m_assetDir / "textures" / "satellite");
 
-    // Also search upwards from the working directory so running from build/Debug still finds repo-root NE_Shaded/.
+    // Also search upwards from the working directory so running from build/Debug still finds repo-root world.*_geo.tif.
     std::filesystem::path dir = std::filesystem::current_path();
     for (int i = 0; i < 8 && !dir.empty(); ++i) {
         consider(dir / blueMarbleRel);
-        consider(dir / neRel);
+        considerWorldGeoInDir(dir);
+        considerWorldGeoInDir(dir / "assets" / "textures" / "satellite");
         const std::filesystem::path parent = dir.parent_path();
         if (parent == dir) {
             break;
