@@ -52,6 +52,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 g_renderer->Resize(w, h);
             }
             return 0;
+        case WM_MOUSEWHEEL:
+            if (g_renderer != nullptr) {
+                const short wheelDelta = GET_WHEEL_DELTA_WPARAM(wparam);
+                const float wheelSteps = static_cast<float>(wheelDelta) / static_cast<float>(WHEEL_DELTA);
+                g_renderer->AddCameraZoomSteps(wheelSteps);
+            }
+            return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -940,6 +947,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("Speed: %.1f m/s", activeSim.SpeedMps());
         }
         ImGui::Text("Heading: %.2f deg", activeSim.HeadingDeg());
+        ImGui::Text("Camera distance: %.0f m (wheel up/down)", renderer.CameraFollowDistanceMeters());
         ImGui::Checkbox("Imperial Units (mph/ft)", &useImperialUnits);
 
         ImGui::Separator();

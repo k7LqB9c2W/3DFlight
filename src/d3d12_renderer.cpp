@@ -518,6 +518,18 @@ void D3D12Renderer::SetSunDirection(const Double3& dir) {
     m_sunDirection = normalized;
 }
 
+void D3D12Renderer::AddCameraZoomSteps(float wheelSteps) {
+    if (std::abs(wheelSteps) < 1e-5f) {
+        return;
+    }
+    constexpr float kZoomMetersPerStep = 30.0f;
+    constexpr float kMinDistance = 45.0f;
+    constexpr float kMaxDistance = 3000.0f;
+    // Wheel up should zoom in (reduce follow distance).
+    m_cameraFollowDistanceMeters -= wheelSteps * kZoomMetersPerStep;
+    m_cameraFollowDistanceMeters = std::clamp(m_cameraFollowDistanceMeters, kMinDistance, kMaxDistance);
+}
+
 void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     if (!m_swapChain) {
         return;
@@ -557,10 +569,10 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     const Double3 forwardEcef = Normalize(sim.ForwardEcef());
     const Double3 upEcef = Normalize(sim.UpEcef());
 
-    // Default third-person chase camera tuned for a much closer plane view.
-    constexpr double kCameraFollowDistance = 250.0;
-    constexpr double kCameraHeight = 80.0;
-    constexpr double kCameraLookAhead = 90.0;
+    // Third-person chase camera with wheel-controlled follow distance.
+    const double kCameraFollowDistance = static_cast<double>(m_cameraFollowDistanceMeters);
+    const double kCameraHeight = std::clamp(kCameraFollowDistance * 0.32, 18.0, 420.0);
+    const double kCameraLookAhead = std::clamp(kCameraFollowDistance * 0.35, 28.0, 540.0);
     constexpr float kCameraFovDegrees = 50.0f;
 
     const Double3 cameraEcef = planeEcef - forwardEcef * kCameraFollowDistance + upEcef * kCameraHeight;

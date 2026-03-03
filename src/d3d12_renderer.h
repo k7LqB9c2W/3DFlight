@@ -70,6 +70,8 @@ public:
     [[nodiscard]] bool IsMultipleScatteringEnabled() const { return m_multipleScatteringEnabled; }
     void SetAtmosphereExposure(float exposure) { m_atmosphereExposure = exposure; }
     [[nodiscard]] float AtmosphereExposure() const { return m_atmosphereExposure; }
+    void AddCameraZoomSteps(float wheelSteps);
+    [[nodiscard]] float CameraFollowDistanceMeters() const { return m_cameraFollowDistanceMeters; }
     [[nodiscard]] bool HasSatelliteSourceFile() const { return m_hasEarthAlbedoSourceFile; }
     [[nodiscard]] const std::filesystem::path& SatelliteSourcePath() const { return m_earthAlbedoSourcePath; }
     [[nodiscard]] DirectX::XMFLOAT4 SatelliteLonLatBounds() const { return m_earthAlbedoBoundsLonLat; }
@@ -269,6 +271,7 @@ private:
 
     D3D12_VIEWPORT m_viewport{};
     D3D12_RECT m_scissor{};
+    float m_cameraFollowDistanceMeters = 250.0f;
 
     AtmosphereSettings m_atmosphereSettings{};
     Double3 m_sunDirection{0.35, 0.82, 0.45};
