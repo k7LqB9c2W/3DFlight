@@ -182,6 +182,20 @@ double TerrainSystem::SampleHeightMeters(double latDeg, double lonDeg, bool* out
     return tile->SampleHeightMeters(latDeg, lonDeg);
 }
 
+double TerrainSystem::SampleHeightMetersCached(double latDeg, double lonDeg, bool* outTileLoaded) {
+    const TileKey key = KeyForLatLon(latDeg, lonDeg);
+
+    bool loaded = false;
+    TilePtr tile = GetLoadedTile(key, loaded);
+    if (outTileLoaded != nullptr) {
+        *outTileLoaded = loaded;
+    }
+    if (!tile) {
+        return 0.0;
+    }
+    return tile->SampleHeightMeters(latDeg, lonDeg);
+}
+
 double TerrainSystem::SampleHeightMetersDebug(double latDeg, double lonDeg, TerrainSampleDebug& debug) {
     debug = {};
     debug.latDeg = latDeg;
@@ -196,6 +210,29 @@ double TerrainSystem::SampleHeightMetersDebug(double latDeg, double lonDeg, Terr
     TilePtr tile = GetOrLoadTile(debug.key, loaded);
     debug.tileLoaded = loaded && (tile != nullptr);
     debug.tileLoadedThisCall = debug.tileLoaded && !debug.cacheHit;
+    if (!tile) {
+        debug.sampledHeightMeters = 0.0;
+        return 0.0;
+    }
+
+    debug.sampledHeightMeters = tile->SampleHeightMetersDebug(latDeg, lonDeg, debug.tileSample);
+    return debug.sampledHeightMeters;
+}
+
+double TerrainSystem::SampleHeightMetersDebugCached(double latDeg, double lonDeg, TerrainSampleDebug& debug) {
+    debug = {};
+    debug.latDeg = latDeg;
+    debug.lonDeg = lonDeg;
+    debug.key = KeyForLatLon(latDeg, lonDeg);
+    debug.expectedTilePath = m_tilesDirectory / debug.key.ToFilename();
+    debug.resolvedTilePath = ResolveTilePath(debug.key);
+    debug.tilePathFound = !debug.resolvedTilePath.empty();
+
+    bool loaded = false;
+    TilePtr tile = GetLoadedTile(debug.key, loaded);
+    debug.cacheHit = loaded;
+    debug.tileLoaded = loaded && (tile != nullptr);
+    debug.tileLoadedThisCall = false;
     if (!tile) {
         debug.sampledHeightMeters = 0.0;
         return 0.0;
@@ -259,14 +296,30 @@ std::size_t TerrainSystem::LoadedTileCount() const {
     return m_cache.size();
 }
 
-TerrainSystem::TilePtr TerrainSystem::GetOrLoadTileNoLock(const TileKey& key, bool& outLoaded) {
+TerrainSystem::TilePtr TerrainSystem::GetLoadedTile(const TileKey& key, bool& outLoaded) {
     outLoaded = false;
 
+    std::scoped_lock<std::mutex> lock(m_mutex);
     const auto found = m_cache.find(key);
-    if (found != m_cache.end()) {
-        TouchLru(key);
-        outLoaded = true;
-        return found->second;
+    if (found == m_cache.end()) {
+        return {};
+    }
+    TouchLru(key);
+    outLoaded = true;
+    return found->second;
+}
+
+TerrainSystem::TilePtr TerrainSystem::GetOrLoadTile(const TileKey& key, bool& outLoaded) {
+    outLoaded = false;
+
+    {
+        std::scoped_lock<std::mutex> lock(m_mutex);
+        const auto found = m_cache.find(key);
+        if (found != m_cache.end()) {
+            TouchLru(key);
+            outLoaded = true;
+            return found->second;
+        }
     }
 
     const std::filesystem::path tilePath = ResolveTilePath(key);
@@ -283,6 +336,14 @@ TerrainSystem::TilePtr TerrainSystem::GetOrLoadTileNoLock(const TileKey& key, bo
     // bounds are lat [tag-15, tag] and lon [tag, tag+15].
     tile->OverrideBoundsFromTileKey(key.latSouthDeg - 15, key.lonWestDeg, 15);
 
+    std::scoped_lock<std::mutex> lock(m_mutex);
+    const auto foundAfterLoad = m_cache.find(key);
+    if (foundAfterLoad != m_cache.end()) {
+        TouchLru(key);
+        outLoaded = true;
+        return foundAfterLoad->second;
+    }
+
     m_cache.emplace(key, tile);
     m_lru.push_front(key);
     m_lruLookup[key] = m_lru.begin();
@@ -290,11 +351,6 @@ TerrainSystem::TilePtr TerrainSystem::GetOrLoadTileNoLock(const TileKey& key, bo
 
     outLoaded = true;
     return tile;
-}
-
-TerrainSystem::TilePtr TerrainSystem::GetOrLoadTile(const TileKey& key, bool& outLoaded) {
-    std::scoped_lock<std::mutex> lock(m_mutex);
-    return GetOrLoadTileNoLock(key, outLoaded);
 }
 
 void TerrainSystem::TouchLru(const TileKey& key) {

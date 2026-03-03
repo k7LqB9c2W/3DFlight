@@ -883,11 +883,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         const double sunElevationDeg = flight::RadToDeg(std::asin(std::clamp(flight::Dot(sunDir, activeSim.UpEcef()), -1.0, 1.0)));
 
         if (terrainSystemReady) {
-            terrainSystem.PrefetchAround(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.HeadingDeg(), activeSim.SpeedMps(), 2);
+            const double terrainLookaheadSpeed = activeSim.SpeedMps() * std::clamp(static_cast<double>(simTimeScale), 1.0, 20.0);
+            const int prefetchRadius = (simTimeScale >= 12.0f) ? 3 : 2;
+            terrainSystem.PrefetchAround(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.HeadingDeg(), terrainLookaheadSpeed, prefetchRadius);
         }
 
         if (terrainSystemReady) {
-            groundHeightRaw = terrainSystem.SampleHeightMetersDebug(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), terrainSampleDebug);
+            groundHeightRaw = terrainSystem.SampleHeightMetersDebugCached(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), terrainSampleDebug);
             currentTileKey = terrainSampleDebug.key;
             tileLoadedAtPlane = terrainSampleDebug.tileLoaded;
         } else {
@@ -908,7 +910,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 const double northMeters = dLatRad * flight::kEarthRadiusMeters;
                 const double eastMeters = dLonRad * flight::kEarthRadiusMeters * std::max(0.01, std::cos(avgLatRad));
                 const double distMeters = std::sqrt(northMeters * northMeters + eastMeters * eastMeters);
-                const double threshold = std::clamp(patchSettings.patchSizeKm * 1000.0 * 0.20, 1000.0, 60000.0);
+                const double warp = std::clamp(static_cast<double>(simTimeScale), 1.0, 20.0);
+                double thresholdScale = std::clamp(1.0 + (warp - 1.0) * 0.10, 1.0, 3.0);
+                if (vehicleMode == VehicleMode::Missile) {
+                    thresholdScale = std::min(3.5, thresholdScale * 1.25);
+                }
+                const double threshold = std::clamp(patchSettings.patchSizeKm * 1000.0 * 0.20 * thresholdScale, 1000.0, 90000.0);
                 shouldRegenerate = (distMeters >= threshold);
             }
 
@@ -940,7 +947,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 const double requestLatDeg = activeSim.LatitudeDeg();
                 const double requestLonDeg = activeSim.LongitudeDeg();
                 const flight::Double3 requestAnchorEcef = activeSim.PlaneEcef();
-                const TerrainPatchSettings requestSettings = patchSettings;
+                TerrainPatchSettings requestSettings = patchSettings;
+                if (simTimeScale >= 10.0f) {
+                    requestSettings.lodResolutionScale = std::max(0.55, requestSettings.lodResolutionScale * 0.75);
+                    requestSettings.gridResolution = std::max(129, static_cast<int>(std::round(static_cast<double>(requestSettings.gridResolution) * 0.78)));
+                    if ((requestSettings.gridResolution % 2) == 0) {
+                        requestSettings.gridResolution += 1;
+                    }
+                }
                 terrainBuildInFlight = true;
                 regenerateTerrainRequested = false;
                 terrainBuildFuture = std::async(
@@ -1375,7 +1389,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                         static_cast<double>(col) * static_cast<double>(debugProbeStepKm) * 1000.0,
                         sampleLatDeg,
                         sampleLonDeg);
-                    rowSamples[col + 1] = terrainSystem.SampleHeightMeters(sampleLatDeg, sampleLonDeg);
+                    rowSamples[col + 1] = terrainSystem.SampleHeightMetersCached(sampleLatDeg, sampleLonDeg);
                 }
                 const double s0 = ToDisplayAltitude(rowSamples[0], useImperialUnits);
                 const double s1 = ToDisplayAltitude(rowSamples[1], useImperialUnits);

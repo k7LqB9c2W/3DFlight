@@ -62,6 +62,8 @@ public:
 
     double SampleHeightMeters(double latDeg, double lonDeg, bool* outTileLoaded = nullptr);
     double SampleHeightMetersDebug(double latDeg, double lonDeg, TerrainSampleDebug& debug);
+    double SampleHeightMetersCached(double latDeg, double lonDeg, bool* outTileLoaded = nullptr);
+    double SampleHeightMetersDebugCached(double latDeg, double lonDeg, TerrainSampleDebug& debug);
     void PrefetchAround(double latDeg, double lonDeg, double headingDeg, double speedMps, int radiusTiles = 2);
 
     [[nodiscard]] bool IsTileLoaded(const TileKey& key) const;
@@ -76,8 +78,8 @@ private:
     void StopWorker();
     void WorkerLoop();
     void QueuePrefetchKey(const TileKey& key);
-    TilePtr GetOrLoadTileNoLock(const TileKey& key, bool& outLoaded);
     TilePtr GetOrLoadTile(const TileKey& key, bool& outLoaded);
+    TilePtr GetLoadedTile(const TileKey& key, bool& outLoaded);
     void TouchLru(const TileKey& key);
     void EvictIfNeeded();
     [[nodiscard]] std::filesystem::path ResolveTilePath(const TileKey& key) const;
