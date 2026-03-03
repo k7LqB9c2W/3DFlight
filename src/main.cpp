@@ -5,6 +5,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <string>
 #include <system_error>
 
@@ -196,6 +197,12 @@ struct MissileAutopilotState {
     bool launched = false;
     bool reachedMach1 = false;
     bool impacted = false;
+};
+
+struct TerrainBuildAsyncResult {
+    TerrainPatchBuildResult patch{};
+    std::string error;
+    bool success = false;
 };
 
 double WrapRadiansPi(double angleRad) {
@@ -761,6 +768,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
     std::string terrainRuntimeError;
     std::string vehicleModeStatus;
+    bool terrainBuildInFlight = false;
+    std::future<TerrainBuildAsyncResult> terrainBuildFuture;
 
     bool previousBackspace = false;
     auto applyVehicleMesh = [&](VehicleMode mode) {
@@ -903,32 +912,55 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 shouldRegenerate = (distMeters >= threshold);
             }
 
-            if (shouldRegenerate) {
-                TerrainPatchBuildResult patch{};
-                std::string buildError;
-                if (flight::terrain::BuildTerrainPatch(
-                        terrainSystem,
-                        activeSim.LatitudeDeg(),
-                        activeSim.LongitudeDeg(),
-                        activeSim.PlaneEcef(),
-                        patchSettings,
-                        patch,
-                        buildError)) {
-                    std::string terrainUploadError;
-                    if (renderer.SetTerrainMesh(patch.mesh, patch.anchorEcef, patch.renderParams, terrainUploadError)) {
-                        patchCenterLatDeg = patch.centerLatDeg;
-                        patchCenterLonDeg = patch.centerLonDeg;
-                        terrainPatchMinRaw = patch.minHeightRaw;
-                        terrainPatchMaxRaw = patch.maxHeightRaw;
-                        havePatchCenter = true;
-                        regenerateTerrainRequested = false;
-                        terrainRuntimeError.clear();
+            if (terrainBuildInFlight) {
+                if (terrainBuildFuture.valid() &&
+                    terrainBuildFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    TerrainBuildAsyncResult asyncResult = terrainBuildFuture.get();
+                    terrainBuildInFlight = false;
+
+                    if (asyncResult.success) {
+                        std::string terrainUploadError;
+                        if (renderer.SetTerrainMesh(asyncResult.patch.mesh, asyncResult.patch.anchorEcef, asyncResult.patch.renderParams, terrainUploadError)) {
+                            patchCenterLatDeg = asyncResult.patch.centerLatDeg;
+                            patchCenterLonDeg = asyncResult.patch.centerLonDeg;
+                            terrainPatchMinRaw = asyncResult.patch.minHeightRaw;
+                            terrainPatchMaxRaw = asyncResult.patch.maxHeightRaw;
+                            havePatchCenter = true;
+                            terrainRuntimeError.clear();
+                        } else {
+                            terrainRuntimeError = "Terrain upload failed: " + terrainUploadError;
+                        }
                     } else {
-                        terrainRuntimeError = "Terrain upload failed: " + terrainUploadError;
+                        terrainRuntimeError = "Terrain build failed: " + asyncResult.error;
                     }
-                } else {
-                    terrainRuntimeError = "Terrain build failed: " + buildError;
                 }
+            }
+
+            if (shouldRegenerate && !terrainBuildInFlight) {
+                const double requestLatDeg = activeSim.LatitudeDeg();
+                const double requestLonDeg = activeSim.LongitudeDeg();
+                const flight::Double3 requestAnchorEcef = activeSim.PlaneEcef();
+                const TerrainPatchSettings requestSettings = patchSettings;
+                terrainBuildInFlight = true;
+                regenerateTerrainRequested = false;
+                terrainBuildFuture = std::async(
+                    std::launch::async,
+                    [&terrainSystem, requestLatDeg, requestLonDeg, requestAnchorEcef, requestSettings]() {
+                        TerrainBuildAsyncResult out{};
+                        std::string buildError;
+                        out.success = flight::terrain::BuildTerrainPatch(
+                            terrainSystem,
+                            requestLatDeg,
+                            requestLonDeg,
+                            requestAnchorEcef,
+                            requestSettings,
+                            out.patch,
+                            buildError);
+                        if (!out.success) {
+                            out.error = buildError;
+                        }
+                        return out;
+                    });
             }
         }
 
@@ -962,6 +994,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
         ImGui::Text("Tile loaded: %s", tileLoadedAtPlane ? "yes" : "no");
         ImGui::Text("Cache: %zu / %zu", terrainSystem.LoadedTileCount(), terrainSystem.CacheCapacity());
+        ImGui::Text("Terrain build: %s", terrainBuildInFlight ? "background in-flight" : "idle");
         const DirectX::XMFLOAT4 satBounds = renderer.SatelliteLonLatBounds();
         if (renderer.HasSatelliteSourceFile()) {
             const std::string satPath = renderer.SatelliteSourcePath().string();
@@ -1360,6 +1393,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         ImGui::Render();
         renderer.Render(activeSim, ImGui::GetDrawData());
+    }
+
+    if (terrainBuildInFlight && terrainBuildFuture.valid()) {
+        terrainBuildFuture.wait();
     }
 
     renderer.Shutdown();

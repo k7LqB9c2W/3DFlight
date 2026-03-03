@@ -372,6 +372,7 @@ void D3D12Renderer::WaitForGpu() {
     for (auto& frame : m_frames) {
         frame.fenceValue = signalValue;
     }
+    CleanupDeferredTerrainResources();
 }
 
 void D3D12Renderer::Resize(uint32_t width, uint32_t height) {
@@ -455,35 +456,47 @@ bool D3D12Renderer::SetTerrainMesh(
         return false;
     }
 
-    WaitForGpu();
-
-    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
-    FrameContext& frame = m_frames[m_frameIndex];
-    if (FAILED(frame.allocator->Reset())) {
-        error = "SetTerrainMesh allocator reset failed";
+    if (!m_uploadAllocator || !m_uploadCommandList || !m_fence) {
+        error = "SetTerrainMesh upload resources are not initialized";
         return false;
     }
-    if (FAILED(m_commandList->Reset(frame.allocator.Get(), nullptr))) {
-        error = "SetTerrainMesh command list reset failed";
+
+    CleanupDeferredTerrainResources();
+
+    if (FAILED(m_uploadAllocator->Reset())) {
+        error = "SetTerrainMesh upload allocator reset failed";
+        return false;
+    }
+    if (FAILED(m_uploadCommandList->Reset(m_uploadAllocator.Get(), nullptr))) {
+        error = "SetTerrainMesh upload command list reset failed";
         return false;
     }
 
     GpuMesh updated;
-    if (!updated.Upload(m_device.Get(), m_commandList.Get(), mesh, error)) {
+    if (!updated.Upload(m_device.Get(), m_uploadCommandList.Get(), mesh, error)) {
         return false;
     }
 
-    if (FAILED(m_commandList->Close())) {
-        error = "SetTerrainMesh command list close failed";
+    if (FAILED(m_uploadCommandList->Close())) {
+        error = "SetTerrainMesh upload command list close failed";
         return false;
     }
 
-    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    ID3D12CommandList* lists[] = {m_uploadCommandList.Get()};
     m_commandQueue->ExecuteCommandLists(1, lists);
-    WaitForGpu();
+    const UINT64 oldFenceSnapshot = m_fenceValue;
+    const UINT64 uploadFence = ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), uploadFence);
 
-    updated.ReleaseUploadBuffers();
+    if (m_hasTerrainMesh && m_terrainMesh.IsValid()) {
+        DeferredTerrainMesh retired{};
+        retired.mesh = std::move(m_terrainMesh);
+        retired.safeFenceValue = std::max(oldFenceSnapshot, m_terrainUploadFenceValue);
+        m_retiredTerrainMeshes.push_back(std::move(retired));
+    }
+
     m_terrainMesh = std::move(updated);
+    m_terrainUploadFenceValue = uploadFence;
     m_terrainAnchorEcef = anchorEcef;
     m_terrainRenderParams = renderParams;
     m_hasTerrainMesh = true;
@@ -537,6 +550,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
 
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
     WaitForFrame(m_frameIndex);
+    CleanupDeferredTerrainResources();
 
     FrameContext& frame = m_frames[m_frameIndex];
     frame.allocator->Reset();
@@ -904,6 +918,26 @@ bool D3D12Renderer::CreateDeviceResources(std::string& error) {
         return false;
     }
     m_commandList->Close();
+
+    hr = m_device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(m_uploadAllocator.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandAllocator(upload) failed", hr);
+        return false;
+    }
+
+    hr = m_device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        m_uploadAllocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(m_uploadCommandList.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandList(upload) failed", hr);
+        return false;
+    }
+    m_uploadCommandList->Close();
 
     hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_fence.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
@@ -2368,6 +2402,27 @@ void D3D12Renderer::WaitForFrame(UINT frameIndex) {
     if (m_fence->GetCompletedValue() < m_frames[frameIndex].fenceValue) {
         m_fence->SetEventOnCompletion(m_frames[frameIndex].fenceValue, m_fenceEvent);
         WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+}
+
+void D3D12Renderer::CleanupDeferredTerrainResources() {
+    if (!m_fence) {
+        return;
+    }
+    const UINT64 completed = m_fence->GetCompletedValue();
+
+    if (m_terrainUploadFenceValue != 0 && completed >= m_terrainUploadFenceValue) {
+        m_terrainMesh.ReleaseUploadBuffers();
+        m_terrainUploadFenceValue = 0;
+    }
+
+    auto it = m_retiredTerrainMeshes.begin();
+    while (it != m_retiredTerrainMeshes.end()) {
+        if (completed >= it->safeFenceValue) {
+            it = m_retiredTerrainMeshes.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 

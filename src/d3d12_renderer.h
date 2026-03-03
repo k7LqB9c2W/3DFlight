@@ -189,6 +189,7 @@ private:
         std::string& error);
 
     void WaitForFrame(UINT frameIndex);
+    void CleanupDeferredTerrainResources();
     void CreateRenderTargetViews();
     void ReleaseRenderTargets();
 
@@ -206,6 +207,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_commandQueue;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> m_swapChain;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_uploadAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_uploadCommandList;
 
     std::array<FrameContext, kFrameCount> m_frames;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_renderTargets;
@@ -238,6 +241,12 @@ private:
     GpuMesh m_planeMesh;
     GpuMesh m_skyboxMesh;
     GpuMesh m_terrainMesh;
+    struct DeferredTerrainMesh {
+        GpuMesh mesh;
+        UINT64 safeFenceValue = 0;
+    };
+    std::vector<DeferredTerrainMesh> m_retiredTerrainMeshes;
+    UINT64 m_terrainUploadFenceValue = 0;
     Double3 m_terrainAnchorEcef{};
     DirectX::XMFLOAT4 m_terrainRenderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
     TerrainVisualSettings m_terrainVisualSettings{};
