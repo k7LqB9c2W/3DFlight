@@ -5,6 +5,10 @@
 #include <cmath>
 #include <limits>
 
+#include <windows.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
 #include "cgltf.h"
 
 namespace flight {
@@ -93,10 +97,176 @@ void NormalizeScaleAndCenter(MeshData& mesh, float targetLengthMeters) {
     }
 }
 
+bool DecodeImageFromWicDecoder(
+    IWICBitmapDecoder* decoder,
+    std::vector<uint8_t>& outPixels,
+    uint32_t& outWidth,
+    uint32_t& outHeight) {
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0, frame.ReleaseAndGetAddressOf()))) {
+        return false;
+    }
+
+    UINT w = 0;
+    UINT h = 0;
+    frame->GetSize(&w, &h);
+    if (w == 0 || h == 0) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory;
+    if (FAILED(CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(wicFactory.ReleaseAndGetAddressOf())))) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+    if (FAILED(wicFactory->CreateFormatConverter(converter.ReleaseAndGetAddressOf()))) {
+        return false;
+    }
+
+    if (FAILED(converter->Initialize(
+            frame.Get(),
+            GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom))) {
+        return false;
+    }
+
+    const UINT stride = w * 4;
+    outPixels.resize(static_cast<size_t>(stride) * static_cast<size_t>(h));
+    if (FAILED(converter->CopyPixels(nullptr, stride, static_cast<UINT>(outPixels.size()), outPixels.data()))) {
+        return false;
+    }
+
+    outWidth = static_cast<uint32_t>(w);
+    outHeight = static_cast<uint32_t>(h);
+    return true;
+}
+
+bool DecodeImageFileToRgba(
+    const std::filesystem::path& path,
+    std::vector<uint8_t>& outPixels,
+    uint32_t& outWidth,
+    uint32_t& outHeight) {
+    Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory;
+    if (FAILED(CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(wicFactory.ReleaseAndGetAddressOf())))) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(wicFactory->CreateDecoderFromFilename(
+            path.wstring().c_str(),
+            nullptr,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+            decoder.ReleaseAndGetAddressOf()))) {
+        return false;
+    }
+
+    return DecodeImageFromWicDecoder(decoder.Get(), outPixels, outWidth, outHeight);
+}
+
+bool DecodeImageMemoryToRgba(
+    const uint8_t* data,
+    size_t sizeBytes,
+    std::vector<uint8_t>& outPixels,
+    uint32_t& outWidth,
+    uint32_t& outHeight) {
+    if (data == nullptr || sizeBytes == 0 || sizeBytes > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory;
+    if (FAILED(CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(wicFactory.ReleaseAndGetAddressOf())))) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IWICStream> stream;
+    if (FAILED(wicFactory->CreateStream(stream.ReleaseAndGetAddressOf()))) {
+        return false;
+    }
+
+    std::vector<uint8_t> temp(data, data + sizeBytes);
+    if (FAILED(stream->InitializeFromMemory(temp.data(), static_cast<UINT>(temp.size())))) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(wicFactory->CreateDecoderFromStream(
+            stream.Get(),
+            nullptr,
+            WICDecodeMetadataCacheOnLoad,
+            decoder.ReleaseAndGetAddressOf()))) {
+        return false;
+    }
+
+    return DecodeImageFromWicDecoder(decoder.Get(), outPixels, outWidth, outHeight);
+}
+
+bool LoadPrimitiveBaseColorTexture(
+    const cgltf_primitive* primitive,
+    const std::filesystem::path& glbPath,
+    GlbMaterialTexture& outTexture) {
+    outTexture = {};
+    if (primitive == nullptr || primitive->material == nullptr) {
+        return false;
+    }
+
+    const cgltf_material* mat = primitive->material;
+    const cgltf_texture* baseTex = mat->pbr_metallic_roughness.base_color_texture.texture;
+    if (baseTex == nullptr || baseTex->image == nullptr) {
+        return false;
+    }
+
+    const cgltf_image* image = baseTex->image;
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    if (image->buffer_view != nullptr && image->buffer_view->buffer != nullptr && image->buffer_view->buffer->data != nullptr) {
+        const cgltf_buffer_view* view = image->buffer_view;
+        const uint8_t* raw = static_cast<const uint8_t*>(view->buffer->data) + view->offset;
+        if (!DecodeImageMemoryToRgba(raw, static_cast<size_t>(view->size), pixels, width, height)) {
+            return false;
+        }
+    } else if (image->uri != nullptr && image->uri[0] != '\0') {
+        const std::filesystem::path uriPath = glbPath.parent_path() / image->uri;
+        if (!DecodeImageFileToRgba(uriPath, pixels, width, height)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    outTexture.rgbaPixels = std::move(pixels);
+    outTexture.width = width;
+    outTexture.height = height;
+    return outTexture.IsValid();
+}
+
 } // namespace
 
-bool LoadGlbMesh(const std::filesystem::path& glbPath, MeshData& outMesh, std::string& error) {
+bool LoadGlbMesh(
+    const std::filesystem::path& glbPath,
+    MeshData& outMesh,
+    GlbMaterialTexture& outBaseColorTexture,
+    std::string& error) {
     outMesh = {};
+    outBaseColorTexture = {};
 
     if (!std::filesystem::exists(glbPath)) {
         error = "GLB file not found: " + glbPath.string();
@@ -139,6 +309,9 @@ bool LoadGlbMesh(const std::filesystem::path& glbPath, MeshData& outMesh, std::s
         error = "Only triangle primitives are supported";
         return false;
     }
+
+    // Texture extraction is best-effort; mesh loading should still succeed if texture decode fails.
+    (void)LoadPrimitiveBaseColorTexture(primitive, glbPath, outBaseColorTexture);
 
     const cgltf_accessor* posAccessor = nullptr;
     const cgltf_accessor* normalAccessor = nullptr;
@@ -226,6 +399,11 @@ bool LoadGlbMesh(const std::filesystem::path& glbPath, MeshData& outMesh, std::s
     }
 
     return true;
+}
+
+bool LoadGlbMesh(const std::filesystem::path& glbPath, MeshData& outMesh, std::string& error) {
+    GlbMaterialTexture ignoredTexture;
+    return LoadGlbMesh(glbPath, outMesh, ignoredTexture, error);
 }
 
 } // namespace flight

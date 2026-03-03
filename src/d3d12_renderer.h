@@ -54,6 +54,7 @@ public:
     void Render(const FlightSim& sim, ImDrawData* imguiDrawData);
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
+    bool SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
     bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, const DirectX::XMFLOAT4& renderParams, std::string& error);
     void SetTerrainVisualSettings(const TerrainVisualSettings& settings);
     [[nodiscard]] const TerrainVisualSettings& GetTerrainVisualSettings() const { return m_terrainVisualSettings; }
@@ -70,8 +71,11 @@ public:
     [[nodiscard]] bool IsMultipleScatteringEnabled() const { return m_multipleScatteringEnabled; }
     void SetAtmosphereExposure(float exposure) { m_atmosphereExposure = exposure; }
     [[nodiscard]] float AtmosphereExposure() const { return m_atmosphereExposure; }
+    void SetCameraZoomRangeMeters(float minDistance, float maxDistance);
     void AddCameraZoomSteps(float wheelSteps);
     [[nodiscard]] float CameraFollowDistanceMeters() const { return m_cameraFollowDistanceMeters; }
+    [[nodiscard]] float CameraZoomMinDistanceMeters() const { return m_cameraMinFollowDistanceMeters; }
+    [[nodiscard]] float CameraZoomMaxDistanceMeters() const { return m_cameraMaxFollowDistanceMeters; }
     [[nodiscard]] bool HasSatelliteSourceFile() const { return m_hasEarthAlbedoSourceFile; }
     [[nodiscard]] const std::filesystem::path& SatelliteSourcePath() const { return m_earthAlbedoSourcePath; }
     [[nodiscard]] DirectX::XMFLOAT4 SatelliteLonLatBounds() const { return m_earthAlbedoBoundsLonLat; }
@@ -88,6 +92,7 @@ private:
     static constexpr UINT kMultipleScatteringSrvIndex = 5;
     static constexpr UINT kAerialPerspectiveSrvIndex = 6;
     static constexpr UINT kEarthAlbedoSrvIndex = 7;
+    static constexpr UINT kModelAlbedoSrvIndex = 8;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
@@ -154,6 +159,12 @@ private:
     bool CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
+    bool CreatePlaneTextureFromPixels(
+        ID3D12GraphicsCommandList* commandList,
+        const uint8_t* rgbaPixels,
+        uint32_t width,
+        uint32_t height,
+        std::string& error);
     bool CreateLandmaskTextureFromPixels(
         ID3D12GraphicsCommandList* commandList,
         const uint8_t* pixels,
@@ -267,6 +278,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxUpload;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_earthAlbedoTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_earthAlbedoUpload;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoUpload;
+    bool m_hasModelAlbedoTexture = false;
     std::filesystem::path m_earthAlbedoSourcePath;
     bool m_hasEarthAlbedoSourceFile = false;
     DirectX::XMFLOAT4 m_earthAlbedoBoundsLonLat = {-180.0f, 180.0f, -90.0f, 90.0f}; // lonW, lonE, latS, latN
@@ -281,6 +295,8 @@ private:
     D3D12_VIEWPORT m_viewport{};
     D3D12_RECT m_scissor{};
     float m_cameraFollowDistanceMeters = 250.0f;
+    float m_cameraMinFollowDistanceMeters = 45.0f;
+    float m_cameraMaxFollowDistanceMeters = 3000.0f;
 
     AtmosphereSettings m_atmosphereSettings{};
     Double3 m_sunDirection{0.35, 0.82, 0.45};

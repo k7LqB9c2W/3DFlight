@@ -248,6 +248,12 @@ bool D3D12Renderer::Initialize(
     if (!CreateEarthAlbedoTexture(m_commandList.Get(), error)) {
         return false;
     }
+    {
+        constexpr uint8_t kDefaultWhite[4] = {255, 255, 255, 255};
+        if (!CreatePlaneTextureFromPixels(m_commandList.Get(), kDefaultWhite, 1, 1, error)) {
+            return false;
+        }
+    }
 
     const HRESULT closeHr = m_commandList->Close();
     if (FAILED(closeHr)) {
@@ -265,6 +271,7 @@ bool D3D12Renderer::Initialize(
     m_landmaskUpload.Reset();
     m_skyboxUpload.Reset();
     m_earthAlbedoUpload.Reset();
+    m_modelAlbedoUpload.Reset();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -341,6 +348,11 @@ void D3D12Renderer::Shutdown() {
     m_landmaskUpload.Reset();
     m_skyboxTexture.Reset();
     m_skyboxUpload.Reset();
+    m_earthAlbedoTexture.Reset();
+    m_earthAlbedoUpload.Reset();
+    m_modelAlbedoTexture.Reset();
+    m_modelAlbedoUpload.Reset();
+    m_hasModelAlbedoTexture = false;
     m_transmittanceLut.Reset();
     m_skyViewLut.Reset();
     m_multipleScatteringLut.Reset();
@@ -446,6 +458,47 @@ bool D3D12Renderer::SetPlaneMesh(const MeshData& mesh, std::string& error) {
     return true;
 }
 
+bool D3D12Renderer::SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error) {
+    constexpr uint8_t kDefaultWhite[4] = {255, 255, 255, 255};
+    const uint8_t* srcPixels = rgbaPixels;
+    uint32_t srcWidth = width;
+    uint32_t srcHeight = height;
+    if (srcPixels == nullptr || srcWidth == 0 || srcHeight == 0) {
+        srcPixels = kDefaultWhite;
+        srcWidth = 1;
+        srcHeight = 1;
+    }
+
+    WaitForGpu();
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    FrameContext& frame = m_frames[m_frameIndex];
+    if (FAILED(frame.allocator->Reset())) {
+        error = "SetPlaneTexture allocator reset failed";
+        return false;
+    }
+    if (FAILED(m_commandList->Reset(frame.allocator.Get(), nullptr))) {
+        error = "SetPlaneTexture command list reset failed";
+        return false;
+    }
+
+    if (!CreatePlaneTextureFromPixels(m_commandList.Get(), srcPixels, srcWidth, srcHeight, error)) {
+        return false;
+    }
+
+    if (FAILED(m_commandList->Close())) {
+        error = "SetPlaneTexture command list close failed";
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+    m_modelAlbedoUpload.Reset();
+
+    return true;
+}
+
 bool D3D12Renderer::SetTerrainMesh(
     const MeshData& mesh,
     const Double3& anchorEcef,
@@ -531,16 +584,24 @@ void D3D12Renderer::SetSunDirection(const Double3& dir) {
     m_sunDirection = normalized;
 }
 
+void D3D12Renderer::SetCameraZoomRangeMeters(float minDistance, float maxDistance) {
+    const float clampedMin = std::clamp(minDistance, 2.0f, 10000.0f);
+    const float clampedMax = std::clamp(maxDistance, clampedMin + 1.0f, 50000.0f);
+    m_cameraMinFollowDistanceMeters = clampedMin;
+    m_cameraMaxFollowDistanceMeters = clampedMax;
+    m_cameraFollowDistanceMeters =
+        std::clamp(m_cameraFollowDistanceMeters, m_cameraMinFollowDistanceMeters, m_cameraMaxFollowDistanceMeters);
+}
+
 void D3D12Renderer::AddCameraZoomSteps(float wheelSteps) {
     if (std::abs(wheelSteps) < 1e-5f) {
         return;
     }
     constexpr float kZoomMetersPerStep = 30.0f;
-    constexpr float kMinDistance = 45.0f;
-    constexpr float kMaxDistance = 3000.0f;
     // Wheel up should zoom in (reduce follow distance).
     m_cameraFollowDistanceMeters -= wheelSteps * kZoomMetersPerStep;
-    m_cameraFollowDistanceMeters = std::clamp(m_cameraFollowDistanceMeters, kMinDistance, kMaxDistance);
+    m_cameraFollowDistanceMeters =
+        std::clamp(m_cameraFollowDistanceMeters, m_cameraMinFollowDistanceMeters, m_cameraMaxFollowDistanceMeters);
 }
 
 void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
@@ -805,7 +866,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
 
         ObjectConstants obj{};
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
-        obj.colorAndFlags = {0.92f, 0.93f, 0.95f, 0.0f};
+        obj.colorAndFlags = {1.0f, 1.0f, 1.0f, m_hasModelAlbedoTexture ? 1.0f : 0.0f};
         obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning2 = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1081,7 +1142,7 @@ bool D3D12Renderer::CompileShader(
 bool D3D12Renderer::CreatePipeline(std::string& error) {
     D3D12_DESCRIPTOR_RANGE graphicsSrvRange{};
     graphicsSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    graphicsSrvRange.NumDescriptors = 7; // t0..t6
+    graphicsSrvRange.NumDescriptors = 8; // t0..t7
     graphicsSrvRange.BaseShaderRegister = 0;
     graphicsSrvRange.RegisterSpace = 0;
     graphicsSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1159,7 +1220,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
 
     D3D12_DESCRIPTOR_RANGE computeSrvRange{};
     computeSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    computeSrvRange.NumDescriptors = 7; // t0..t6 (t6 unused by LUT compute, but present in shared SRV heap table)
+    computeSrvRange.NumDescriptors = 8; // t0..t7 (t6/t7 unused by LUT compute, but present in shared SRV heap table)
     computeSrvRange.BaseShaderRegister = 0;
     computeSrvRange.RegisterSpace = 0;
     computeSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1819,6 +1880,124 @@ bool D3D12Renderer::LoadColorPixels(
 
     outWidth = dstW;
     outHeight = dstH;
+    return true;
+}
+
+bool D3D12Renderer::CreatePlaneTextureFromPixels(
+    ID3D12GraphicsCommandList* commandList,
+    const uint8_t* rgbaPixels,
+    uint32_t width,
+    uint32_t height,
+    std::string& error) {
+    if (rgbaPixels == nullptr || width == 0 || height == 0) {
+        error = "CreatePlaneTextureFromPixels received invalid pixel data";
+        return false;
+    }
+
+    ComPtr<ID3D12Resource> texture;
+    ComPtr<ID3D12Resource> upload;
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC texDesc{};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    HRESULT hr = m_device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(texture.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(model albedo texture) failed", hr);
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT numRows = 0;
+    UINT64 rowBytes = 0;
+    UINT64 uploadBytes = 0;
+    m_device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowBytes, &uploadBytes);
+
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC uploadDesc{};
+    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDesc.Width = uploadBytes;
+    uploadDesc.Height = 1;
+    uploadDesc.DepthOrArraySize = 1;
+    uploadDesc.MipLevels = 1;
+    uploadDesc.SampleDesc.Count = 1;
+    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    hr = m_device->CreateCommittedResource(
+        &uploadHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(upload.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(model albedo upload) failed", hr);
+        return false;
+    }
+
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE readRange{};
+    hr = upload->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+    if (FAILED(hr) || mapped == nullptr) {
+        error = HrMessage("Map(model albedo upload) failed", hr);
+        return false;
+    }
+
+    const uint8_t* src = rgbaPixels;
+    uint8_t* dst = mapped + footprint.Offset;
+    const UINT srcStride = width * 4;
+    for (UINT row = 0; row < numRows; ++row) {
+        std::memcpy(dst + row * footprint.Footprint.RowPitch, src + static_cast<size_t>(row) * srcStride, srcStride);
+    }
+    upload->Unmap(0, nullptr);
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+    dstLoc.pResource = texture.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+    srcLoc.pResource = upload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint = footprint;
+
+    commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(texture.Get(), &srv, CpuSrv(kModelAlbedoSrvIndex));
+
+    m_modelAlbedoTexture = std::move(texture);
+    m_modelAlbedoUpload = std::move(upload);
+    m_hasModelAlbedoTexture = true;
     return true;
 }
 

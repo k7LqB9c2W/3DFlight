@@ -6,6 +6,8 @@ Texture2D<float4> gTransmittanceLut : register(t2);
 Texture2D<float4> gSkyViewLut : register(t3);
 Texture2D<float4> gMultipleScatteringLut : register(t4);
 Texture3D<float4> gAerialPerspectiveLut : register(t5);
+Texture2D<float4> gEarthAlbedo : register(t6);
+Texture2D<float4> gModelAlbedo : register(t7);
 
 SamplerState gWrapSampler : register(s0);
 SamplerState gClampSampler : register(s1);
@@ -59,6 +61,11 @@ float4 PSMain(VSOutput input) : SV_Target
     float diffuse = 0.85 * ndl;
 
     float3 baseColor = gColorAndFlags.rgb;
+    if (gColorAndFlags.w > 0.5)
+    {
+        float3 albedo = gModelAlbedo.Sample(gWrapSampler, input.uv).rgb;
+        baseColor *= albedo;
+    }
     float3 lit = baseColor * (ambient + diffuse) + spec.xxx + rim * float3(0.52, 0.62, 0.75);
 
     lit = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), lit);
