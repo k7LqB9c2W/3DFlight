@@ -6,6 +6,7 @@ Texture2D<float4> gTransmittanceLut : register(t2);
 Texture2D<float4> gSkyViewLut : register(t3);
 Texture2D<float4> gMultipleScatteringLut : register(t4);
 Texture3D<float4> gAerialPerspectiveLut : register(t5);
+Texture2D<float4> gEarthAlbedo : register(t6);
 
 SamplerState gWrapSampler : register(s0);
 SamplerState gClampSampler : register(s1);
@@ -16,6 +17,8 @@ cbuffer ObjectCB : register(b1)
     float4 gColorAndFlags;
     float4 gTuning0; // x midRingMul, y farRingMul, z hazeStrength, w hazeAltitudeRangeMeters
     float4 gTuning1; // x contrast, y slopeBoost, z specularStrength, w lodSeamBlendStrength
+    float4 gTuning2; // x satelliteEnabled, y satelliteBlend, z/w unused
+    float4 gTuning3; // x lonWest, y lonEast, z latSouth, w latNorth (degrees)
 };
 
 struct VSInput
@@ -81,6 +84,43 @@ float4 PSMain(VSOutput input) : SV_Target
     float spec = pow(saturate(dot(N, H)), 48.0) * gTuning1.z;
 
     float3 baseColor = TerrainColor(clampedHeight);
+    if (gTuning2.x > 0.5)
+    {
+        // Map world position to lat/lon using the vector from Earth center.
+        // This is translation-invariant under the floating-origin anchor: (p - anchor) - (center - anchor) = p - center.
+        float3 dir = normalize(input.worldPos - PlanetCenter());
+        float lat = asin(clamp(dir.y, -1.0, 1.0));
+        float lon = atan2(dir.z, dir.x);
+
+        // Prefer GeoTIFF bounds mapping if available. gTuning2.z indicates whether longitude wrapping is desired.
+        const float lonWest = gTuning3.x;
+        const float lonEast = gTuning3.y;
+        const float latSouth = gTuning3.z;
+        const float latNorth = gTuning3.w;
+        const float lonSpan = max(1e-6, lonEast - lonWest);
+        const float latSpan = max(1e-6, latNorth - latSouth);
+
+        float u = (lon * (180.0 / kPi) - lonWest) / lonSpan;
+        float v = (latNorth - lat * (180.0 / kPi)) / latSpan;
+
+        const bool wrapLon = (gTuning2.z > 0.5);
+        if (wrapLon)
+        {
+            u = frac(u);
+            v = saturate(v);
+            float3 albedo = gEarthAlbedo.Sample(gWrapSampler, float2(u, v)).rgb;
+            baseColor = lerp(baseColor, albedo, saturate(gTuning2.y));
+        }
+        else
+        {
+            // For regional datasets, avoid smearing edges by skipping samples outside the covered bounds.
+            if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0)
+            {
+                float3 albedo = gEarthAlbedo.Sample(gClampSampler, float2(u, v)).rgb;
+                baseColor = lerp(baseColor, albedo, saturate(gTuning2.y));
+            }
+        }
+    }
     const float slopeTerm = saturate(1.0 - abs(dot(N, normalize(gCameraUpAndTime.xyz))));
     const float slopeBoost = 1.0 + slopeTerm * gTuning1.y;
     baseColor *= slopeBoost;

@@ -59,6 +59,14 @@ public:
 
     void Respawn();
     void Update(double dtSeconds, const InputState& input, double timeScale);
+    void SetKinematicStateRadians(
+        double latitudeRad,
+        double longitudeRad,
+        double altitudeMeters,
+        double speedMps,
+        double headingRad,
+        double pitchRad,
+        double rollRad);
 
     [[nodiscard]] double LatitudeRad() const { return m_latitudeRad; }
     [[nodiscard]] double LongitudeRad() const { return m_longitudeRad; }

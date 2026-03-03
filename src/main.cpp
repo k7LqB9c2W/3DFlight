@@ -164,6 +164,165 @@ double ToDisplaySpeed(double metersPerSecond, bool useImperialUnits) {
     return useImperialUnits ? (metersPerSecond * kMetersPerSecondToMph) : metersPerSecond;
 }
 
+enum class VehicleMode {
+    Plane = 0,
+    Missile = 1,
+};
+
+struct MissileAutopilotState {
+    double launchLatDeg = 37.6188056;
+    double launchLonDeg = -122.3754167;
+    double launchAltMeters = 3000.0;
+    double targetLatDeg = 37.7000000;
+    double targetLonDeg = -122.0000000;
+    double targetAltMeters = 1000.0;
+
+    double latRad = flight::DegToRad(37.6188056);
+    double lonRad = flight::DegToRad(-122.3754167);
+    double altMeters = 3000.0;
+    double speedMps = 120.0;
+    double headingRad = flight::DegToRad(90.0);
+    double pitchRad = flight::DegToRad(10.0);
+    double rollRad = 0.0;
+
+    double distanceToTargetMeters = 0.0;
+    bool launched = false;
+    bool reachedMach1 = false;
+    bool impacted = false;
+};
+
+double WrapRadiansPi(double angleRad) {
+    while (angleRad > kPi) {
+        angleRad -= 2.0 * kPi;
+    }
+    while (angleRad < -kPi) {
+        angleRad += 2.0 * kPi;
+    }
+    return angleRad;
+}
+
+void PrepareMissileAtLaunch(MissileAutopilotState& missile) {
+    missile.launchLatDeg = std::clamp(missile.launchLatDeg, -89.9, 89.9);
+    missile.targetLatDeg = std::clamp(missile.targetLatDeg, -89.9, 89.9);
+    missile.launchLonDeg = WrapLonDeg(missile.launchLonDeg);
+    missile.targetLonDeg = WrapLonDeg(missile.targetLonDeg);
+    missile.launchAltMeters = std::max(0.0, missile.launchAltMeters);
+    missile.targetAltMeters = std::max(0.0, missile.targetAltMeters);
+
+    missile.latRad = flight::DegToRad(missile.launchLatDeg);
+    missile.lonRad = flight::DegToRad(missile.launchLonDeg);
+    missile.altMeters = missile.launchAltMeters;
+    missile.speedMps = 120.0;
+    missile.pitchRad = flight::DegToRad(14.0);
+    missile.rollRad = 0.0;
+    missile.distanceToTargetMeters = 0.0;
+    missile.reachedMach1 = false;
+    missile.impacted = false;
+
+    const double targetLatRad = flight::DegToRad(missile.targetLatDeg);
+    const double targetLonRad = flight::DegToRad(missile.targetLonDeg);
+    flight::Double3 east, north, up;
+    flight::BuildEnuBasis(missile.latRad, missile.lonRad, east, north, up);
+    const flight::Double3 launchEcef = flight::GeodeticToEcef(missile.latRad, missile.lonRad, missile.altMeters);
+    const flight::Double3 targetEcef = flight::GeodeticToEcef(targetLatRad, targetLonRad, missile.targetAltMeters);
+    const flight::Double3 toTarget = targetEcef - launchEcef;
+    const double toEast = flight::Dot(toTarget, east);
+    const double toNorth = flight::Dot(toTarget, north);
+    missile.headingRad = std::atan2(toEast, toNorth);
+}
+
+void LaunchMissile(MissileAutopilotState& missile) {
+    PrepareMissileAtLaunch(missile);
+    missile.launched = true;
+}
+
+void UpdateMissileAutopilot(MissileAutopilotState& missile, double dtSeconds, double timeScale) {
+    if (!missile.launched) {
+        return;
+    }
+
+    const double dt = dtSeconds * std::clamp(timeScale, 0.01, 100.0);
+    const double targetLatRad = flight::DegToRad(missile.targetLatDeg);
+    const double targetLonRad = flight::DegToRad(missile.targetLonDeg);
+
+    flight::Double3 east, north, up;
+    flight::BuildEnuBasis(missile.latRad, missile.lonRad, east, north, up);
+    const flight::Double3 posEcef = flight::GeodeticToEcef(missile.latRad, missile.lonRad, missile.altMeters);
+    const flight::Double3 targetEcef = flight::GeodeticToEcef(targetLatRad, targetLonRad, missile.targetAltMeters);
+    const flight::Double3 toTarget = targetEcef - posEcef;
+
+    const double toEast = flight::Dot(toTarget, east);
+    const double toNorth = flight::Dot(toTarget, north);
+    const double horizontalDist = std::sqrt(toEast * toEast + toNorth * toNorth);
+    missile.distanceToTargetMeters = flight::Length(toTarget);
+
+    if (missile.distanceToTargetMeters < 120.0 && std::abs(missile.altMeters - missile.targetAltMeters) < 100.0) {
+        missile.latRad = targetLatRad;
+        missile.lonRad = targetLonRad;
+        missile.altMeters = missile.targetAltMeters;
+        missile.speedMps = 0.0;
+        missile.pitchRad = 0.0;
+        missile.rollRad = 0.0;
+        missile.impacted = true;
+        missile.launched = false;
+        return;
+    }
+
+    constexpr double kMach1Mps = 343.0;
+    constexpr double kBoostAccel = 140.0;
+    constexpr double kSustainAccel = 25.0;
+
+    if (!missile.reachedMach1) {
+        missile.speedMps += kBoostAccel * dt;
+        if (missile.speedMps >= kMach1Mps) {
+            missile.speedMps = kMach1Mps;
+            missile.reachedMach1 = true;
+        }
+    } else {
+        missile.speedMps = std::min(460.0, missile.speedMps + kSustainAccel * dt);
+    }
+
+    const double desiredHeading = std::atan2(toEast, toNorth);
+    const double headingError = WrapRadiansPi(desiredHeading - missile.headingRad);
+    const double maxTurnRate = missile.reachedMach1 ? flight::DegToRad(55.0) : flight::DegToRad(32.0);
+    missile.headingRad += std::clamp(headingError, -maxTurnRate * dt, maxTurnRate * dt);
+    missile.headingRad = WrapRadiansPi(missile.headingRad);
+
+    const double climbCruiseAlt = std::max(missile.launchAltMeters + std::min(12000.0, horizontalDist * 0.09 + 2000.0), missile.targetAltMeters + 1800.0);
+    double desiredAlt = climbCruiseAlt;
+    if (missile.reachedMach1) {
+        desiredAlt = missile.targetAltMeters + std::min(3500.0, horizontalDist * 0.10);
+    }
+
+    double desiredPitch = std::atan2(desiredAlt - missile.altMeters, std::max(horizontalDist, 1.0));
+    if (!missile.reachedMach1) {
+        desiredPitch = std::clamp(desiredPitch, flight::DegToRad(6.0), flight::DegToRad(32.0));
+    } else {
+        desiredPitch = std::clamp(desiredPitch, flight::DegToRad(-45.0), flight::DegToRad(20.0));
+    }
+    const double pitchError = desiredPitch - missile.pitchRad;
+    const double maxPitchRate = flight::DegToRad(45.0);
+    missile.pitchRad += std::clamp(pitchError, -maxPitchRate * dt, maxPitchRate * dt);
+
+    const double desiredRoll = std::clamp(headingError * 1.35, flight::DegToRad(-60.0), flight::DegToRad(60.0));
+    const double rollError = desiredRoll - missile.rollRad;
+    const double maxRollRate = flight::DegToRad(140.0);
+    missile.rollRad += std::clamp(rollError, -maxRollRate * dt, maxRollRate * dt);
+
+    const double horizontalSpeed = missile.speedMps * std::cos(missile.pitchRad);
+    const double dNorth = std::cos(missile.headingRad) * horizontalSpeed * dt;
+    const double dEast = std::sin(missile.headingRad) * horizontalSpeed * dt;
+    const double dUp = (missile.speedMps * std::sin(missile.pitchRad)) * dt;
+
+    missile.altMeters = std::max(0.0, missile.altMeters + dUp);
+    const double r = flight::kEarthRadiusMeters + missile.altMeters;
+    missile.latRad += dNorth / r;
+    missile.latRad = std::clamp(missile.latRad, flight::DegToRad(-89.9), flight::DegToRad(89.9));
+    const double cosLat = std::max(0.01, std::cos(missile.latRad));
+    missile.lonRad += dEast / (r * cosLat);
+    missile.lonRad = WrapRadiansPi(missile.lonRad);
+}
+
 struct GraphicsTuningConfig {
     float patchSizeKm = 80.0f;
     int gridResolution = 257;
@@ -182,7 +341,10 @@ struct GraphicsTuningConfig {
     float slopeShadingStrength = 0.35f;
     float specularStrength = 0.14f;
     float lodSeamBlendStrength = 0.20f;
-    float aerialPerspectiveDepthMeters = 120000.0f;
+    float aerialPerspectiveDepthMeters = 180000.0f;
+
+    bool satelliteEnabled = true;
+    float satelliteBlend = 1.0f;
 };
 
 void SanitizeGraphicsTuning(GraphicsTuningConfig& cfg) {
@@ -207,27 +369,28 @@ void SanitizeGraphicsTuning(GraphicsTuningConfig& cfg) {
     cfg.specularStrength = std::clamp(cfg.specularStrength, 0.0f, 1.0f);
     cfg.lodSeamBlendStrength = std::clamp(cfg.lodSeamBlendStrength, 0.0f, 2.0f);
     cfg.aerialPerspectiveDepthMeters = std::clamp(cfg.aerialPerspectiveDepthMeters, 5000.0f, 1000000.0f);
+    cfg.satelliteBlend = std::clamp(cfg.satelliteBlend, 0.0f, 1.0f);
 }
 
 GraphicsTuningConfig MakeRealisticTuningPreset() {
     GraphicsTuningConfig cfg;
-    cfg.patchSizeKm = 100.0f;
-    cfg.gridResolution = 289;
-    cfg.lodDistanceScale = 1.2f;
-    cfg.lodResolutionScale = 1.2f;
-    cfg.nearToMidMultiplier = 2.25f;
-    cfg.midToFarMultiplier = 2.15f;
+    cfg.patchSizeKm = 110.0f;
+    cfg.gridResolution = 353;
+    cfg.lodDistanceScale = 1.35f;
+    cfg.lodResolutionScale = 1.55f;
+    cfg.nearToMidMultiplier = 1.90f;
+    cfg.midToFarMultiplier = 1.80f;
     cfg.farFieldRadiusKm = 1800.0f;
-    cfg.verticalExaggeration = 1.0f;
+    cfg.verticalExaggeration = 1.08f;
     cfg.colorHeightMaxMeters = 7200.0f;
-    cfg.lodTransitionWidthMeters = 7000.0f;
+    cfg.lodTransitionWidthMeters = 5000.0f;
     cfg.hazeStrength = 0.0f;
-    cfg.hazeAltitudeRangeMeters = 25000.0f;
-    cfg.colorContrast = 1.10f;
-    cfg.slopeShadingStrength = 0.42f;
+    cfg.hazeAltitudeRangeMeters = 30000.0f;
+    cfg.colorContrast = 1.20f;
+    cfg.slopeShadingStrength = 0.60f;
     cfg.specularStrength = 0.10f;
-    cfg.lodSeamBlendStrength = 0.18f;
-    cfg.aerialPerspectiveDepthMeters = 140000.0f;
+    cfg.lodSeamBlendStrength = 0.12f;
+    cfg.aerialPerspectiveDepthMeters = 220000.0f;
     SanitizeGraphicsTuning(cfg);
     return cfg;
 }
@@ -283,6 +446,8 @@ void ApplyGraphicsTuning(
     visual.slopeShadingStrength = cfg.slopeShadingStrength;
     visual.specularStrength = cfg.specularStrength;
     visual.lodSeamBlendStrength = cfg.lodSeamBlendStrength;
+    visual.satelliteEnabled = cfg.satelliteEnabled;
+    visual.satelliteBlend = cfg.satelliteBlend;
     renderer.SetTerrainVisualSettings(visual);
     renderer.SetAerialPerspectiveDepthMeters(cfg.aerialPerspectiveDepthMeters);
 }
@@ -313,6 +478,11 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
             value = j[key].get<int>();
         }
     };
+    auto readBool = [&j](const char* key, bool& value) {
+        if (j.contains(key) && j[key].is_boolean()) {
+            value = j[key].get<bool>();
+        }
+    };
 
     readFloat("patch_size_km", outCfg.patchSizeKm);
     readInt("grid_resolution", outCfg.gridResolution);
@@ -332,6 +502,8 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
     readFloat("specular_strength", outCfg.specularStrength);
     readFloat("lod_seam_blend_strength", outCfg.lodSeamBlendStrength);
     readFloat("aerial_perspective_depth_m", outCfg.aerialPerspectiveDepthMeters);
+    readBool("satellite_enabled", outCfg.satelliteEnabled);
+    readFloat("satellite_blend", outCfg.satelliteBlend);
 
     // Migrate older profiles that used heavy non-physical haze defaults.
     const int version = j.value("config_version", 1);
@@ -339,6 +511,16 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
         outCfg.hazeStrength = std::min(outCfg.hazeStrength * 0.25f, 0.12f);
         outCfg.lodSeamBlendStrength = std::min(outCfg.lodSeamBlendStrength, 0.22f);
         outCfg.aerialPerspectiveDepthMeters = std::max(outCfg.aerialPerspectiveDepthMeters, 120000.0f);
+    }
+    if (version < 3) {
+        outCfg.hazeStrength = std::min(outCfg.hazeStrength, 0.08f);
+        outCfg.aerialPerspectiveDepthMeters = std::max(outCfg.aerialPerspectiveDepthMeters, 180000.0f);
+        outCfg.lodSeamBlendStrength = std::min(outCfg.lodSeamBlendStrength, 0.16f);
+    }
+    if (version < 4) {
+        // Satellite imagery defaults to enabled when first introduced.
+        outCfg.satelliteEnabled = true;
+        outCfg.satelliteBlend = 1.0f;
     }
 
     SanitizeGraphicsTuning(outCfg);
@@ -378,7 +560,9 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
     j["specular_strength"] = cfg.specularStrength;
     j["lod_seam_blend_strength"] = cfg.lodSeamBlendStrength;
     j["aerial_perspective_depth_m"] = cfg.aerialPerspectiveDepthMeters;
-    j["config_version"] = 2;
+    j["satellite_enabled"] = cfg.satelliteEnabled;
+    j["satellite_blend"] = cfg.satelliteBlend;
+    j["config_version"] = 4;
 
     out << j.dump(2) << "\n";
     return true;
@@ -437,13 +621,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     }
 
     MeshData planeMesh;
+    MeshData missileMesh;
     std::string meshError;
-    const std::filesystem::path modelPath = std::filesystem::path("assets") / "models" / "Airplane.glb";
-    const bool glbLoaded = flight::LoadGlbMesh(modelPath, planeMesh, meshError);
-    if (!glbLoaded) {
+    std::string missileMeshStatus;
+
+    const std::filesystem::path airplanePath = std::filesystem::path("assets") / "models" / "Airplane.glb";
+    const bool airplaneLoaded = flight::LoadGlbMesh(airplanePath, planeMesh, meshError);
+    if (!airplaneLoaded) {
         planeMesh = flight::CreatePlaceholderPlane();
+        missileMeshStatus = "Airplane fallback mesh active";
     } else {
-        // Align this GLB's local facing with the simulation forward direction.
+        // Align GLB local facing with simulation forward direction.
         for (auto& v : planeMesh.vertices) {
             v.position.x = -v.position.x;
             v.position.z = -v.position.z;
@@ -452,13 +640,48 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
     }
 
+    const std::filesystem::path missilePath = std::filesystem::path("assets") / "models" / "AIM120D.glb";
+    std::string missileLoadError;
+    const bool missileLoaded = flight::LoadGlbMesh(missilePath, missileMesh, missileLoadError);
+    if (!missileLoaded) {
+        missileMesh = flight::CreatePlaceholderPlane();
+        // Shrink fallback placeholder so it does not look like an airliner-sized missile.
+        for (auto& v : missileMesh.vertices) {
+            v.position.x *= 0.08f;
+            v.position.y *= 0.08f;
+            v.position.z *= 0.08f;
+        }
+        missileMeshStatus = "Missile model load failed, using placeholder: " + missileLoadError;
+    } else {
+        // Align missile model orientation and scale down from loader's default 60m normalization.
+        for (auto& v : missileMesh.vertices) {
+            v.position.x = -v.position.x * 0.08f;
+            v.position.y = v.position.y * 0.08f;
+            v.position.z = -v.position.z * 0.08f;
+            v.normal.x = -v.normal.x;
+            v.normal.z = -v.normal.z;
+        }
+        missileMeshStatus = "Missile model loaded: " + missilePath.string();
+    }
+
     std::string uploadError;
     if (!renderer.SetPlaneMesh(planeMesh, uploadError)) {
         MessageBoxA(hwnd, uploadError.c_str(), "Plane Upload Error", MB_OK | MB_ICONERROR);
     }
 
     FlightSim sim;
+    FlightSim missileViewSim;
     FlightStart editableStart = sim.GetStart();
+    VehicleMode vehicleMode = VehicleMode::Plane;
+    VehicleMode appliedRenderMode = VehicleMode::Plane;
+    MissileAutopilotState missileState{};
+    missileState.launchLatDeg = editableStart.latitudeDeg;
+    missileState.launchLonDeg = editableStart.longitudeDeg;
+    missileState.launchAltMeters = editableStart.altitudeMeters;
+    missileState.targetLatDeg = editableStart.latitudeDeg + 0.35;
+    missileState.targetLonDeg = WrapLonDeg(editableStart.longitudeDeg + 0.55);
+    missileState.targetAltMeters = std::max(0.0, editableStart.altitudeMeters * 0.25);
+    PrepareMissileAtLaunch(missileState);
     float simTimeScale = 1.0f;
     bool useImperialUnits = false;
     float localSolarTimeHours = 14.0f;
@@ -530,8 +753,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     float debugProbeStepKm = 10.0f;
 
     std::string terrainRuntimeError;
+    std::string vehicleModeStatus;
 
     bool previousBackspace = false;
+    auto applyVehicleMesh = [&](VehicleMode mode) {
+        if (mode == appliedRenderMode) {
+            return;
+        }
+        std::string meshUploadError;
+        const bool ok = renderer.SetPlaneMesh((mode == VehicleMode::Missile) ? missileMesh : planeMesh, meshUploadError);
+        if (!ok) {
+            vehicleModeStatus = "Vehicle mesh switch failed: " + meshUploadError;
+            return;
+        }
+        appliedRenderMode = mode;
+        vehicleModeStatus = (mode == VehicleMode::Missile) ? "Switched to missile vehicle view" : "Switched to airplane vehicle view";
+    };
+
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     MSG msg{};
@@ -596,7 +834,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         previousBackspace = backspaceDown;
 
         sim.SetStart(editableStart);
-        sim.Update(dt, input, static_cast<double>(simTimeScale));
+        if (vehicleMode == VehicleMode::Plane) {
+            sim.Update(dt, input, static_cast<double>(simTimeScale));
+        }
+
+        if (vehicleMode == VehicleMode::Missile) {
+            if (!missileState.launched && !missileState.impacted) {
+                PrepareMissileAtLaunch(missileState);
+            }
+            UpdateMissileAutopilot(missileState, dt, static_cast<double>(simTimeScale));
+            missileViewSim.SetKinematicStateRadians(
+                missileState.latRad,
+                missileState.lonRad,
+                missileState.altMeters,
+                missileState.speedMps,
+                missileState.headingRad,
+                missileState.pitchRad,
+                missileState.rollRad);
+        }
+
+        const FlightSim& activeSim = (vehicleMode == VehicleMode::Missile) ? missileViewSim : sim;
 
         if (autoTimeOfDay) {
             AdvanceLocalSolarClock(localSolarTimeHours, dayOfYear, static_cast<double>(timeOfDayRateHoursPerSecond) * dt);
@@ -605,32 +862,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         dayOfYear = std::clamp(dayOfYear, 1, 365);
 
         const flight::Double3 sunDir =
-            ComputeSunDirectionFromLocalSolarTime(sim.LatitudeDeg(), sim.LongitudeDeg(), dayOfYear, localSolarTimeHours);
+            ComputeSunDirectionFromLocalSolarTime(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), dayOfYear, localSolarTimeHours);
         renderer.SetSunDirection(sunDir);
-        const double sunElevationDeg = flight::RadToDeg(std::asin(std::clamp(flight::Dot(sunDir, sim.UpEcef()), -1.0, 1.0)));
+        const double sunElevationDeg = flight::RadToDeg(std::asin(std::clamp(flight::Dot(sunDir, activeSim.UpEcef()), -1.0, 1.0)));
 
         if (terrainSystemReady) {
-            terrainSystem.PrefetchAround(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.HeadingDeg(), sim.SpeedMps(), 2);
+            terrainSystem.PrefetchAround(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.HeadingDeg(), activeSim.SpeedMps(), 2);
         }
 
         if (terrainSystemReady) {
-            groundHeightRaw = terrainSystem.SampleHeightMetersDebug(sim.LatitudeDeg(), sim.LongitudeDeg(), terrainSampleDebug);
+            groundHeightRaw = terrainSystem.SampleHeightMetersDebug(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), terrainSampleDebug);
             currentTileKey = terrainSampleDebug.key;
             tileLoadedAtPlane = terrainSampleDebug.tileLoaded;
         } else {
             groundHeightRaw = 0.0;
             tileLoadedAtPlane = false;
             terrainSampleDebug = {};
-            currentTileKey = TerrainSystem::KeyForLatLon(sim.LatitudeDeg(), sim.LongitudeDeg());
+            currentTileKey = TerrainSystem::KeyForLatLon(activeSim.LatitudeDeg(), activeSim.LongitudeDeg());
         }
         groundHeightClamped = std::max(groundHeightRaw, 0.0);
 
         if (terrainSystemReady) {
             bool shouldRegenerate = regenerateTerrainRequested || !havePatchCenter;
             if (!shouldRegenerate && havePatchCenter) {
-                const double dLatRad = flight::DegToRad(sim.LatitudeDeg() - patchCenterLatDeg);
-                const double dLonRad = flight::DegToRad(LonDeltaDeg(sim.LongitudeDeg(), patchCenterLonDeg));
-                const double avgLatRad = flight::DegToRad(0.5 * (sim.LatitudeDeg() + patchCenterLatDeg));
+                const double dLatRad = flight::DegToRad(activeSim.LatitudeDeg() - patchCenterLatDeg);
+                const double dLonRad = flight::DegToRad(LonDeltaDeg(activeSim.LongitudeDeg(), patchCenterLonDeg));
+                const double avgLatRad = flight::DegToRad(0.5 * (activeSim.LatitudeDeg() + patchCenterLatDeg));
 
                 const double northMeters = dLatRad * flight::kEarthRadiusMeters;
                 const double eastMeters = dLonRad * flight::kEarthRadiusMeters * std::max(0.01, std::cos(avgLatRad));
@@ -644,9 +901,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 std::string buildError;
                 if (flight::terrain::BuildTerrainPatch(
                         terrainSystem,
-                        sim.LatitudeDeg(),
-                        sim.LongitudeDeg(),
-                        sim.PlaneEcef(),
+                        activeSim.LatitudeDeg(),
+                        activeSim.LongitudeDeg(),
+                        activeSim.PlaneEcef(),
                         patchSettings,
                         patch,
                         buildError)) {
@@ -672,16 +929,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::NewFrame();
 
         ImGui::Begin("Flight HUD");
-        ImGui::Text("Lat: %.6f deg", sim.LatitudeDeg());
-        ImGui::Text("Lon: %.6f deg", sim.LongitudeDeg());
+        ImGui::Text("Vehicle: %s", (vehicleMode == VehicleMode::Plane) ? "Airplane" : "Missile");
+        ImGui::Text("Lat: %.6f deg", activeSim.LatitudeDeg());
+        ImGui::Text("Lon: %.6f deg", activeSim.LongitudeDeg());
         if (useImperialUnits) {
-            ImGui::Text("Altitude: %.1f ft", ToDisplayAltitude(sim.AltitudeMeters(), true));
-            ImGui::Text("Speed: %.1f mph", ToDisplaySpeed(sim.SpeedMps(), true));
+            ImGui::Text("Altitude: %.1f ft", ToDisplayAltitude(activeSim.AltitudeMeters(), true));
+            ImGui::Text("Speed: %.1f mph", ToDisplaySpeed(activeSim.SpeedMps(), true));
         } else {
-            ImGui::Text("Altitude: %.1f m", sim.AltitudeMeters());
-            ImGui::Text("Speed: %.1f m/s", sim.SpeedMps());
+            ImGui::Text("Altitude: %.1f m", activeSim.AltitudeMeters());
+            ImGui::Text("Speed: %.1f m/s", activeSim.SpeedMps());
         }
-        ImGui::Text("Heading: %.2f deg", sim.HeadingDeg());
+        ImGui::Text("Heading: %.2f deg", activeSim.HeadingDeg());
         ImGui::Checkbox("Imperial Units (mph/ft)", &useImperialUnits);
 
         ImGui::Separator();
@@ -696,6 +954,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
         ImGui::Text("Tile loaded: %s", tileLoadedAtPlane ? "yes" : "no");
         ImGui::Text("Cache: %zu / %zu", terrainSystem.LoadedTileCount(), terrainSystem.CacheCapacity());
+        const DirectX::XMFLOAT4 satBounds = renderer.SatelliteLonLatBounds();
+        if (renderer.HasSatelliteSourceFile()) {
+            const std::string satPath = renderer.SatelliteSourcePath().string();
+            ImGui::TextWrapped("Satellite source: %s", satPath.c_str());
+        } else {
+            ImGui::Text("Satellite source: fallback 1x1 (no file found)");
+        }
+        ImGui::Text(
+            "Satellite bounds lon[%.3f, %.3f] lat[%.3f, %.3f]",
+            satBounds.x,
+            satBounds.y,
+            satBounds.z,
+            satBounds.w);
+        const bool satWrapsLon = renderer.SatelliteWrapsLongitude();
+        const double latDeg = activeSim.LatitudeDeg();
+        const double lonDeg = activeSim.LongitudeDeg();
+        bool lonInCoverage = false;
+        if (satWrapsLon) {
+            lonInCoverage = true;
+        } else if (satBounds.x <= satBounds.y) {
+            lonInCoverage = (lonDeg >= satBounds.x && lonDeg <= satBounds.y);
+        } else {
+            lonInCoverage = (lonDeg >= satBounds.x || lonDeg <= satBounds.y);
+        }
+        const bool latInCoverage = (latDeg >= satBounds.z && latDeg <= satBounds.w);
+        const bool satInCoverage = lonInCoverage && latInCoverage;
+        ImGui::Text("Satellite wraps lon: %s", satWrapsLon ? "yes" : "no");
+        ImGui::Text("Satellite sample at plane: %s", satInCoverage ? "in coverage" : "out of coverage");
 
         bool atmosphereEnabled = renderer.IsAtmosphereEnabled();
         if (ImGui::Checkbox("Atmosphere Enabled", &atmosphereEnabled)) {
@@ -747,6 +1033,80 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         ImGui::Separator();
+        int vehicleModeIndex = (vehicleMode == VehicleMode::Plane) ? 0 : 1;
+        if (ImGui::Combo("Vehicle Mode", &vehicleModeIndex, "Airplane\0AIM-120D Missile\0")) {
+            vehicleMode = (vehicleModeIndex == 0) ? VehicleMode::Plane : VehicleMode::Missile;
+            applyVehicleMesh(vehicleMode);
+            regenerateTerrainRequested = true;
+            havePatchCenter = false;
+            if (vehicleMode == VehicleMode::Missile && !missileState.launched) {
+                missileState.impacted = false;
+                PrepareMissileAtLaunch(missileState);
+            }
+        }
+        if (!missileMeshStatus.empty()) {
+            ImGui::TextWrapped("%s", missileMeshStatus.c_str());
+        }
+        if (!vehicleModeStatus.empty()) {
+            ImGui::TextWrapped("%s", vehicleModeStatus.c_str());
+        }
+
+        if (vehicleMode == VehicleMode::Missile) {
+            ImGui::Separator();
+            ImGui::Text("Missile Mission");
+            ImGui::Text("State: %s", missileState.launched ? "In Flight" : (missileState.impacted ? "Impact Complete" : "Ready"));
+            ImGui::Text("Phase: %s", missileState.reachedMach1 ? "Terminal" : "Boost to Mach 1");
+            if (useImperialUnits) {
+                ImGui::Text("Distance to target: %.2f mi", missileState.distanceToTargetMeters * 0.000621371);
+            } else {
+                ImGui::Text("Distance to target: %.1f km", missileState.distanceToTargetMeters * 0.001);
+            }
+
+            ImGui::Text("Launch Coordinates");
+            ImGui::InputDouble("Launch Lat", &missileState.launchLatDeg, 0.1, 1.0, "%.6f");
+            ImGui::InputDouble("Launch Lon", &missileState.launchLonDeg, 0.1, 1.0, "%.6f");
+            if (useImperialUnits) {
+                double launchFeet = ToDisplayAltitude(missileState.launchAltMeters, true);
+                if (ImGui::InputDouble("Launch Alt (ft)", &launchFeet, 100.0, 1000.0, "%.1f")) {
+                    missileState.launchAltMeters = std::max(0.0, launchFeet / kMetersToFeet);
+                }
+            } else {
+                ImGui::InputDouble("Launch Alt (m)", &missileState.launchAltMeters, 10.0, 100.0, "%.1f");
+            }
+
+            ImGui::Text("Ending Coordinates");
+            ImGui::InputDouble("Target Lat", &missileState.targetLatDeg, 0.1, 1.0, "%.6f");
+            ImGui::InputDouble("Target Lon", &missileState.targetLonDeg, 0.1, 1.0, "%.6f");
+            if (useImperialUnits) {
+                double targetFeet = ToDisplayAltitude(missileState.targetAltMeters, true);
+                if (ImGui::InputDouble("Target Alt (ft)", &targetFeet, 100.0, 1000.0, "%.1f")) {
+                    missileState.targetAltMeters = std::max(0.0, targetFeet / kMetersToFeet);
+                }
+            } else {
+                ImGui::InputDouble("Target Alt (m)", &missileState.targetAltMeters, 10.0, 100.0, "%.1f");
+            }
+
+            if (ImGui::Button("Set Launch To Plane")) {
+                missileState.launchLatDeg = sim.LatitudeDeg();
+                missileState.launchLonDeg = sim.LongitudeDeg();
+                missileState.launchAltMeters = sim.AltitudeMeters();
+                missileState.impacted = false;
+                if (!missileState.launched) {
+                    PrepareMissileAtLaunch(missileState);
+                }
+                regenerateTerrainRequested = true;
+                havePatchCenter = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Launch Missile")) {
+                LaunchMissile(missileState);
+                regenerateTerrainRequested = true;
+                havePatchCenter = false;
+                vehicleModeStatus = "Missile launched";
+            }
+        }
+
+        ImGui::Separator();
         ImGui::Text("Start/Respawn");
         ImGui::InputDouble("Start Latitude", &editableStart.latitudeDeg, 0.1, 1.0, "%.6f");
         ImGui::InputDouble("Start Longitude", &editableStart.longitudeDeg, 0.1, 1.0, "%.6f");
@@ -768,9 +1128,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         ImGui::Separator();
         ImGui::Text("Controls");
-        ImGui::Text("Pitch W/S, Roll A/D, Yaw Q/E");
-        ImGui::Text("Throttle Up/Down arrows");
-        ImGui::Text("Altitude R/F, Reset Backspace");
+        if (vehicleMode == VehicleMode::Plane) {
+            ImGui::Text("Pitch W/S, Roll A/D, Yaw Q/E");
+            ImGui::Text("Throttle Up/Down arrows");
+            ImGui::Text("Altitude R/F, Reset Backspace");
+        } else {
+            ImGui::TextUnformatted("Missile mode: autonomous guidance");
+            ImGui::TextUnformatted("Switch back to Airplane mode for manual controls");
+        }
         ImGui::Text("Landmask: %s", renderer.HasLandmask() ? "loaded" : "fallback");
         ImGui::End();
 
@@ -834,6 +1199,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             visualTuningChanged = true;
         }
         if (ImGui::SliderFloat("Aerial Depth (m)", &graphicsTuning.aerialPerspectiveDepthMeters, 5000.0f, 1000000.0f, "%.0f")) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::Checkbox("Satellite Imagery", &graphicsTuning.satelliteEnabled)) {
+            visualTuningChanged = true;
+        }
+        if (ImGui::SliderFloat("Satellite Blend", &graphicsTuning.satelliteBlend, 0.0f, 1.0f, "%.2f")) {
             visualTuningChanged = true;
         }
 
@@ -919,7 +1290,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             const std::string expectedPath = terrainSampleDebug.expectedTilePath.string();
             const std::string resolvedPath = terrainSampleDebug.tilePathFound ? terrainSampleDebug.resolvedTilePath.string() : "(missing)";
 
-            ImGui::Text("Sample Lat/Lon: %.6f, %.6f", sim.LatitudeDeg(), sim.LongitudeDeg());
+            ImGui::Text("Sample Lat/Lon: %.6f, %.6f", activeSim.LatitudeDeg(), activeSim.LongitudeDeg());
             ImGui::Text("Tile key: %s", terrainSampleDebug.key.ToCompactString().c_str());
             ImGui::Text("Cache hit: %s", terrainSampleDebug.cacheHit ? "yes" : "no");
             ImGui::Text("Tile available: %s", terrainSampleDebug.tileLoaded ? "yes" : "no");
@@ -950,15 +1321,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
             ImGui::Separator();
             ImGui::SliderFloat("Probe Step (km)", &debugProbeStepKm, 1.0f, 100.0f, "%.1f");
-            ImGui::Text("3x3 raw heights around plane (%s, north rows, west->east cols)", useImperialUnits ? "ft" : "m");
+            ImGui::Text("3x3 raw heights around vehicle (%s, north rows, west->east cols)", useImperialUnits ? "ft" : "m");
             for (int row = 1; row >= -1; --row) {
                 double rowSamples[3]{};
                 for (int col = -1; col <= 1; ++col) {
                     double sampleLatDeg = 0.0;
                     double sampleLonDeg = 0.0;
                     OffsetLatLonMeters(
-                        sim.LatitudeDeg(),
-                        sim.LongitudeDeg(),
+                        activeSim.LatitudeDeg(),
+                        activeSim.LongitudeDeg(),
                         static_cast<double>(row) * static_cast<double>(debugProbeStepKm) * 1000.0,
                         static_cast<double>(col) * static_cast<double>(debugProbeStepKm) * 1000.0,
                         sampleLatDeg,
@@ -980,7 +1351,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::End();
 
         ImGui::Render();
-        renderer.Render(sim, ImGui::GetDrawData());
+        renderer.Render(activeSim, ImGui::GetDrawData());
     }
 
     renderer.Shutdown();

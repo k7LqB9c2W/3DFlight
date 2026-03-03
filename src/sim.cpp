@@ -167,6 +167,25 @@ void FlightSim::Update(double dtSeconds, const InputState& input, double timeSca
     WrapLongitude(m_longitudeRad);
 }
 
+void FlightSim::SetKinematicStateRadians(
+    double latitudeRad,
+    double longitudeRad,
+    double altitudeMeters,
+    double speedMps,
+    double headingRad,
+    double pitchRad,
+    double rollRad) {
+    m_latitudeRad = std::clamp(latitudeRad, DegToRad(-89.9), DegToRad(89.9));
+    m_longitudeRad = longitudeRad;
+    WrapLongitude(m_longitudeRad);
+    m_altitudeMeters = std::max(0.0, altitudeMeters);
+    m_speedMps = std::max(0.0, speedMps);
+    m_headingRad = headingRad;
+    WrapLongitude(m_headingRad);
+    m_pitchRad = std::clamp(pitchRad, DegToRad(-89.0), DegToRad(89.0));
+    m_rollRad = std::clamp(rollRad, DegToRad(-89.0), DegToRad(89.0));
+}
+
 Double3 FlightSim::PlaneEcef() const {
     return GeodeticToEcef(m_latitudeRad, m_longitudeRad, m_altitudeMeters);
 }

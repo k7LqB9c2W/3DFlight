@@ -13,6 +13,7 @@
 #include <imgui.h>
 #include <imgui_impl_dx12.h>
 #include <imgui_impl_win32.h>
+#include <gdal_priv.h>
 
 #include "earth.h"
 #include "mesh.h"
@@ -67,6 +68,93 @@ MeshData GenerateSkyboxCube(float halfExtent) {
         0, 1, 5, 0, 5, 4, // -Y
     };
     return mesh;
+}
+
+bool LoadGeoTiffRgbWithGeoTransform(
+    const std::filesystem::path& path,
+    uint32_t maxDim,
+    std::vector<uint8_t>& outPixelsRgba,
+    uint32_t& outWidth,
+    uint32_t& outHeight,
+    std::array<double, 6>& outGeoTransform,
+    bool& outHasGeoTransform,
+    std::string& error) {
+    error.clear();
+    outHasGeoTransform = false;
+
+    static bool gdalRegistered = false;
+    if (!gdalRegistered) {
+        GDALAllRegister();
+        gdalRegistered = true;
+    }
+
+    GDALDataset* dataset = static_cast<GDALDataset*>(GDALOpen(path.string().c_str(), GA_ReadOnly));
+    if (!dataset) {
+        error = "GDALOpen failed for " + path.string();
+        return false;
+    }
+
+    const int srcW = dataset->GetRasterXSize();
+    const int srcH = dataset->GetRasterYSize();
+    const int bands = dataset->GetRasterCount();
+    if (srcW <= 0 || srcH <= 0 || bands < 3) {
+        GDALClose(dataset);
+        error = "GeoTIFF missing expected dimensions/bands: " + path.string();
+        return false;
+    }
+
+    int dstW = srcW;
+    int dstH = srcH;
+    if (maxDim > 0 && std::max(srcW, srcH) > static_cast<int>(maxDim)) {
+        const double scale = static_cast<double>(maxDim) / static_cast<double>(std::max(srcW, srcH));
+        dstW = std::max(1, static_cast<int>(std::floor(static_cast<double>(srcW) * scale)));
+        dstH = std::max(1, static_cast<int>(std::floor(static_cast<double>(srcH) * scale)));
+    }
+
+    double gt[6]{};
+    if (dataset->GetGeoTransform(gt) == CE_None) {
+        outHasGeoTransform = true;
+        // If we downscale the raster on load, scale geotransform terms so lon/lat bounds remain correct.
+        const double scaleX = static_cast<double>(srcW) / static_cast<double>(std::max(dstW, 1));
+        const double scaleY = static_cast<double>(srcH) / static_cast<double>(std::max(dstH, 1));
+        outGeoTransform[0] = gt[0];
+        outGeoTransform[1] = gt[1] * scaleX;
+        outGeoTransform[2] = gt[2] * scaleY;
+        outGeoTransform[3] = gt[3];
+        outGeoTransform[4] = gt[4] * scaleX;
+        outGeoTransform[5] = gt[5] * scaleY;
+    }
+
+    outWidth = static_cast<uint32_t>(dstW);
+    outHeight = static_cast<uint32_t>(dstH);
+    outPixelsRgba.assign(static_cast<size_t>(dstW) * static_cast<size_t>(dstH) * 4u, 255u);
+
+    // Read RGB bands into RGBA buffer (alpha left as 255).
+    int bandMap[3] = {1, 2, 3};
+    const CPLErr ioErr = dataset->RasterIO(
+        GF_Read,
+        0,
+        0,
+        srcW,
+        srcH,
+        outPixelsRgba.data(),
+        dstW,
+        dstH,
+        GDT_Byte,
+        3,
+        bandMap,
+        4,
+        4 * dstW,
+        1);
+
+    GDALClose(dataset);
+
+    if (ioErr != CE_None) {
+        error = "GDAL RasterIO failed for " + path.string();
+        return false;
+    }
+
+    return true;
 }
 
 } // namespace
@@ -157,6 +245,9 @@ bool D3D12Renderer::Initialize(
     if (!CreateSkyboxTexture(m_commandList.Get(), error)) {
         return false;
     }
+    if (!CreateEarthAlbedoTexture(m_commandList.Get(), error)) {
+        return false;
+    }
 
     const HRESULT closeHr = m_commandList->Close();
     if (FAILED(closeHr)) {
@@ -173,6 +264,7 @@ bool D3D12Renderer::Initialize(
     m_skyboxMesh.ReleaseUploadBuffers();
     m_landmaskUpload.Reset();
     m_skyboxUpload.Reset();
+    m_earthAlbedoUpload.Reset();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -410,6 +502,7 @@ void D3D12Renderer::SetTerrainVisualSettings(const TerrainVisualSettings& settin
     clamped.slopeShadingStrength = std::clamp(clamped.slopeShadingStrength, 0.0f, 2.0f);
     clamped.specularStrength = std::clamp(clamped.specularStrength, 0.0f, 1.0f);
     clamped.lodSeamBlendStrength = std::clamp(clamped.lodSeamBlendStrength, 0.0f, 2.0f);
+    clamped.satelliteBlend = std::clamp(clamped.satelliteBlend, 0.0f, 1.0f);
     m_terrainVisualSettings = clamped;
 }
 
@@ -597,6 +690,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.colorAndFlags = {1.0f, 1.0f, 1.0f, 0.0f};
         obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning2 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 0), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 0);
@@ -615,6 +709,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.colorAndFlags = {0.25f, 0.60f, 0.22f, m_hasLandmaskTexture ? 1.0f : 0.0f};
         obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning2 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 1), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 1);
@@ -647,6 +742,13 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             m_terrainVisualSettings.specularStrength,
             m_terrainVisualSettings.lodSeamBlendStrength,
         };
+        obj.tuning2 = {
+            m_terrainVisualSettings.satelliteEnabled ? 1.0f : 0.0f,
+            m_terrainVisualSettings.satelliteBlend,
+            m_earthAlbedoWrapLon,
+            0.0f,
+        };
+        obj.tuning3 = m_earthAlbedoBoundsLonLat;
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
@@ -680,6 +782,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.colorAndFlags = {0.92f, 0.93f, 0.95f, 0.0f};
         obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning2 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
@@ -932,7 +1035,7 @@ bool D3D12Renderer::CompileShader(
 bool D3D12Renderer::CreatePipeline(std::string& error) {
     D3D12_DESCRIPTOR_RANGE graphicsSrvRange{};
     graphicsSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    graphicsSrvRange.NumDescriptors = 6; // t0..t5
+    graphicsSrvRange.NumDescriptors = 7; // t0..t6
     graphicsSrvRange.BaseShaderRegister = 0;
     graphicsSrvRange.RegisterSpace = 0;
     graphicsSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1010,7 +1113,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
 
     D3D12_DESCRIPTOR_RANGE computeSrvRange{};
     computeSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    computeSrvRange.NumDescriptors = 6; // t0..t5
+    computeSrvRange.NumDescriptors = 7; // t0..t6 (t6 unused by LUT compute, but present in shared SRV heap table)
     computeSrvRange.BaseShaderRegister = 0;
     computeSrvRange.RegisterSpace = 0;
     computeSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1589,6 +1692,7 @@ bool D3D12Renderer::LoadColorPixels(
     std::vector<uint8_t>& pixelsRgba,
     uint32_t& outWidth,
     uint32_t& outHeight,
+    uint32_t maxDim,
     std::string& error) {
     if (!m_wicFactory) {
         error = "WIC factory is not initialized";
@@ -1619,7 +1723,6 @@ bool D3D12Renderer::LoadColorPixels(
     frame->GetSize(&srcW, &srcH);
 
     ComPtr<IWICBitmapSource> source = frame;
-    const UINT maxDim = 4096;
     UINT dstW = srcW;
     UINT dstH = srcH;
     if (std::max(srcW, srcH) > maxDim) {
@@ -1952,7 +2055,7 @@ bool D3D12Renderer::CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, 
             uint32_t w = 0;
             uint32_t h = 0;
             std::string loadError;
-            if (!LoadColorPixels(facePaths[i], faces[i], w, h, loadError)) {
+            if (!LoadColorPixels(facePaths[i], faces[i], w, h, 4096, loadError)) {
                 allFacesPresent = false;
                 break;
             }
@@ -1980,6 +2083,273 @@ bool D3D12Renderer::CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, 
     fallback[5] = {164, 200, 250, 255};
 
     return CreateSkyboxTextureFromFaces(commandList, fallback, 1, 1, error);
+}
+
+bool D3D12Renderer::CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandList, std::string& error) {
+    // Optional global equirectangular albedo used for terrain coloring (Natural Earth shaded relief).
+    // Missing/failed loads fall back to a 1x1 neutral pixel so the game keeps running.
+    error.clear();
+
+    const std::filesystem::path blueMarbleRel = std::filesystem::path("textures") / "satellite" / "world.200406.3x21600x21600.A1_geo.tif";
+    const std::filesystem::path neRel = std::filesystem::path("NE_Shaded") / "NE1_HR_LC_SR.tif";
+    std::filesystem::path found;
+
+    auto consider = [&](const std::filesystem::path& p) {
+        if (!found.empty()) {
+            return;
+        }
+        std::error_code ec;
+        if (std::filesystem::exists(p, ec) && !ec) {
+            found = p;
+        }
+    };
+
+    // Prefer an assets-based canonical location.
+    consider(m_assetDir / blueMarbleRel);
+    consider(m_assetDir / "textures" / "ne" / "NE1_HR_LC_SR.tif");
+    consider(m_assetDir / "textures" / "NE1_HR_LC_SR.tif");
+    consider(m_assetDir / neRel);
+
+    // Also search upwards from the working directory so running from build/Debug still finds repo-root NE_Shaded/.
+    std::filesystem::path dir = std::filesystem::current_path();
+    for (int i = 0; i < 8 && !dir.empty(); ++i) {
+        consider(dir / blueMarbleRel);
+        consider(dir / neRel);
+        const std::filesystem::path parent = dir.parent_path();
+        if (parent == dir) {
+            break;
+        }
+        dir = parent;
+    }
+
+    std::vector<uint8_t> basePixels;
+    uint32_t width = 1;
+    uint32_t height = 1;
+    bool loaded = false;
+    std::array<double, 6> geoTransform{};
+    bool hasGeoTransform = false;
+    m_earthAlbedoSourcePath.clear();
+    m_hasEarthAlbedoSourceFile = false;
+    m_earthAlbedoBoundsLonLat = {-180.0f, 180.0f, -90.0f, 90.0f};
+    m_earthAlbedoWrapLon = 1.0f;
+    if (!found.empty()) {
+        std::string loadError;
+        // Downscale to keep memory reasonable. This is a single global/large texture.
+        const uint32_t maxDim = 6144;
+
+        const std::wstring ext = found.extension().wstring();
+        const bool isTiff = (ext == L".tif") || (ext == L".tiff") || (ext == L".TIF") || (ext == L".TIFF");
+        if (isTiff) {
+            if (LoadGeoTiffRgbWithGeoTransform(found, maxDim, basePixels, width, height, geoTransform, hasGeoTransform, loadError)) {
+                loaded = true;
+            }
+        } else {
+            if (LoadColorPixels(found, basePixels, width, height, maxDim, loadError)) {
+                loaded = true;
+            }
+        }
+
+        if (loaded && hasGeoTransform) {
+            // Compute bounds from geotransform (lon/lat degrees).
+            const double gt0 = geoTransform[0];
+            const double gt1 = geoTransform[1];
+            const double gt2 = geoTransform[2];
+            const double gt3 = geoTransform[3];
+            const double gt4 = geoTransform[4];
+            const double gt5 = geoTransform[5];
+
+            const double w = static_cast<double>(width);
+            const double h = static_cast<double>(height);
+            const double lonA = gt0;
+            const double latA = gt3;
+            const double lonB = gt0 + gt1 * w + gt2 * h;
+            const double latB = gt3 + gt4 * w + gt5 * h;
+
+            const double lonW = std::min(lonA, lonB);
+            const double lonE = std::max(lonA, lonB);
+            const double latS = std::min(latA, latB);
+            const double latN = std::max(latA, latB);
+
+            m_earthAlbedoBoundsLonLat = {
+                static_cast<float>(lonW),
+                static_cast<float>(lonE),
+                static_cast<float>(latS),
+                static_cast<float>(latN),
+            };
+
+            const double lonSpan = lonE - lonW;
+            m_earthAlbedoWrapLon = (std::abs(lonSpan - 360.0) < 0.1) ? 1.0f : 0.0f;
+        }
+    }
+
+    if (!loaded) {
+        // Neutral mid-gray; used when imagery is missing.
+        basePixels = {128, 128, 128, 255};
+        width = 1;
+        height = 1;
+    } else {
+        m_hasEarthAlbedoSourceFile = true;
+        m_earthAlbedoSourcePath = found;
+    }
+
+    // Build a CPU mip chain to reduce shimmer (hardware will pick proper mips at distance).
+    std::vector<std::vector<uint8_t>> mipPixels;
+    std::vector<uint32_t> mipW;
+    std::vector<uint32_t> mipH;
+    mipPixels.emplace_back(std::move(basePixels));
+    mipW.push_back(width);
+    mipH.push_back(height);
+
+    uint32_t curW = width;
+    uint32_t curH = height;
+    while (curW > 1 || curH > 1) {
+        const uint32_t nextW = std::max(1u, curW / 2);
+        const uint32_t nextH = std::max(1u, curH / 2);
+        std::vector<uint8_t> next(static_cast<size_t>(nextW) * static_cast<size_t>(nextH) * 4u);
+
+        const std::vector<uint8_t>& src = mipPixels.back();
+        for (uint32_t y = 0; y < nextH; ++y) {
+            const uint32_t sy0 = std::min(curH - 1, y * 2);
+            const uint32_t sy1 = std::min(curH - 1, y * 2 + 1);
+            for (uint32_t x = 0; x < nextW; ++x) {
+                const uint32_t sx0 = std::min(curW - 1, x * 2);
+                const uint32_t sx1 = std::min(curW - 1, x * 2 + 1);
+
+                const uint32_t idx00 = (sy0 * curW + sx0) * 4;
+                const uint32_t idx10 = (sy0 * curW + sx1) * 4;
+                const uint32_t idx01 = (sy1 * curW + sx0) * 4;
+                const uint32_t idx11 = (sy1 * curW + sx1) * 4;
+
+                const uint32_t dst = (y * nextW + x) * 4;
+                for (uint32_t c = 0; c < 4; ++c) {
+                    const uint32_t sum =
+                        static_cast<uint32_t>(src[idx00 + c]) +
+                        static_cast<uint32_t>(src[idx10 + c]) +
+                        static_cast<uint32_t>(src[idx01 + c]) +
+                        static_cast<uint32_t>(src[idx11 + c]);
+                    next[dst + c] = static_cast<uint8_t>(sum / 4u);
+                }
+            }
+        }
+
+        mipPixels.emplace_back(std::move(next));
+        mipW.push_back(nextW);
+        mipH.push_back(nextH);
+        curW = nextW;
+        curH = nextH;
+    }
+
+    const UINT mipLevels = static_cast<UINT>(mipPixels.size());
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC texDesc{};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = mipW[0];
+    texDesc.Height = mipH[0];
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = static_cast<UINT16>(mipLevels);
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    HRESULT hr = m_device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(m_earthAlbedoTexture.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(earth albedo) failed", hr);
+        return false;
+    }
+
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mipLevels);
+    std::vector<UINT> numRows(mipLevels);
+    std::vector<UINT64> rowBytes(mipLevels);
+    UINT64 totalBytes = 0;
+    m_device->GetCopyableFootprints(&texDesc, 0, mipLevels, 0, footprints.data(), numRows.data(), rowBytes.data(), &totalBytes);
+
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC uploadDesc{};
+    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDesc.Width = totalBytes;
+    uploadDesc.Height = 1;
+    uploadDesc.DepthOrArraySize = 1;
+    uploadDesc.MipLevels = 1;
+    uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uploadDesc.SampleDesc.Count = 1;
+    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    hr = m_device->CreateCommittedResource(
+        &uploadHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(m_earthAlbedoUpload.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(earth albedo upload) failed", hr);
+        return false;
+    }
+
+    uint8_t* mapped = nullptr;
+    hr = m_earthAlbedoUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+    if (FAILED(hr) || mapped == nullptr) {
+        error = HrMessage("Map(earth albedo upload) failed", hr);
+        return false;
+    }
+
+    for (UINT mip = 0; mip < mipLevels; ++mip) {
+        const uint32_t w = mipW[mip];
+        const uint32_t h = mipH[mip];
+        const uint8_t* src = mipPixels[mip].data();
+        const UINT srcStride = w * 4;
+
+        const auto& fp = footprints[mip];
+        uint8_t* dstBase = mapped + fp.Offset;
+        const UINT dstStride = fp.Footprint.RowPitch;
+        for (uint32_t y = 0; y < h; ++y) {
+            std::memcpy(dstBase + static_cast<size_t>(y) * dstStride, src + static_cast<size_t>(y) * srcStride, srcStride);
+        }
+    }
+
+    m_earthAlbedoUpload->Unmap(0, nullptr);
+
+    for (UINT mip = 0; mip < mipLevels; ++mip) {
+        D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+        dstLoc.pResource = m_earthAlbedoTexture.Get();
+        dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dstLoc.SubresourceIndex = mip;
+
+        D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+        srcLoc.pResource = m_earthAlbedoUpload.Get();
+        srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcLoc.PlacedFootprint = footprints[mip];
+
+        commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = m_earthAlbedoTexture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = mipLevels;
+    m_device->CreateShaderResourceView(m_earthAlbedoTexture.Get(), &srv, CpuSrv(kEarthAlbedoSrvIndex));
+
+    return true;
 }
 
 void D3D12Renderer::WaitForFrame(UINT frameIndex) {

@@ -34,6 +34,8 @@ public:
         float slopeShadingStrength = 0.35f;
         float specularStrength = 0.14f;
         float lodSeamBlendStrength = 0.20f;
+        bool satelliteEnabled = true;
+        float satelliteBlend = 1.0f;
     };
 
     bool Initialize(
@@ -68,6 +70,10 @@ public:
     [[nodiscard]] bool IsMultipleScatteringEnabled() const { return m_multipleScatteringEnabled; }
     void SetAtmosphereExposure(float exposure) { m_atmosphereExposure = exposure; }
     [[nodiscard]] float AtmosphereExposure() const { return m_atmosphereExposure; }
+    [[nodiscard]] bool HasSatelliteSourceFile() const { return m_hasEarthAlbedoSourceFile; }
+    [[nodiscard]] const std::filesystem::path& SatelliteSourcePath() const { return m_earthAlbedoSourcePath; }
+    [[nodiscard]] DirectX::XMFLOAT4 SatelliteLonLatBounds() const { return m_earthAlbedoBoundsLonLat; }
+    [[nodiscard]] bool SatelliteWrapsLongitude() const { return m_earthAlbedoWrapLon > 0.5f; }
 
 private:
     static constexpr UINT kFrameCount = 2;
@@ -79,6 +85,7 @@ private:
     static constexpr UINT kSkyViewSrvIndex = 4;
     static constexpr UINT kMultipleScatteringSrvIndex = 5;
     static constexpr UINT kAerialPerspectiveSrvIndex = 6;
+    static constexpr UINT kEarthAlbedoSrvIndex = 7;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
@@ -95,7 +102,9 @@ private:
         DirectX::XMFLOAT3 rayleighScattering = {5.802e-6f, 13.558e-6f, 33.1e-6f};
         DirectX::XMFLOAT3 rayleighAbsorption = {0.0f, 0.0f, 0.0f};
         DirectX::XMFLOAT3 mieScattering = {3.996e-6f, 3.996e-6f, 3.996e-6f};
-        DirectX::XMFLOAT3 mieAbsorption = {4.40e-6f, 4.40e-6f, 4.40e-6f};
+        // Use absorption (not extinction) here because extinction is computed as sigma_s + sigma_a.
+        // Table extinction often cited as 4.40e-6, so absorption ~= 4.40e-6 - 3.996e-6 = 0.404e-6.
+        DirectX::XMFLOAT3 mieAbsorption = {0.404e-6f, 0.404e-6f, 0.404e-6f};
         DirectX::XMFLOAT3 ozoneAbsorption = {0.650e-6f, 1.881e-6f, 0.085e-6f};
         float rayleighScaleHeightMeters = 8000.0f;
         float mieScaleHeightMeters = 1200.0f;
@@ -129,6 +138,8 @@ private:
         DirectX::XMFLOAT4 colorAndFlags{};
         DirectX::XMFLOAT4 tuning0{};
         DirectX::XMFLOAT4 tuning1{};
+        DirectX::XMFLOAT4 tuning2{};
+        DirectX::XMFLOAT4 tuning3{};
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -140,6 +151,7 @@ private:
     void DispatchAtmosphereLuts(ID3D12GraphicsCommandList* commandList, const SceneConstants& sceneCb);
     bool CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
+    bool CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateLandmaskTextureFromPixels(
         ID3D12GraphicsCommandList* commandList,
         const uint8_t* pixels,
@@ -158,6 +170,7 @@ private:
         std::vector<uint8_t>& pixelsRgba,
         uint32_t& outWidth,
         uint32_t& outHeight,
+        uint32_t maxDim,
         std::string& error);
     bool CreateSkyboxTextureFromFaces(
         ID3D12GraphicsCommandList* commandList,
@@ -241,6 +254,12 @@ private:
     bool m_hasLandmaskTexture = false;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxUpload;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_earthAlbedoTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_earthAlbedoUpload;
+    std::filesystem::path m_earthAlbedoSourcePath;
+    bool m_hasEarthAlbedoSourceFile = false;
+    DirectX::XMFLOAT4 m_earthAlbedoBoundsLonLat = {-180.0f, 180.0f, -90.0f, 90.0f}; // lonW, lonE, latS, latN
+    float m_earthAlbedoWrapLon = 1.0f;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_transmittanceLut;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyViewLut;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_multipleScatteringLut;
@@ -256,7 +275,7 @@ private:
     bool m_atmosphereEnabled = true;
     bool m_multipleScatteringEnabled = true;
     float m_atmosphereExposure = 1.0f;
-    float m_aerialPerspectiveDepthMeters = 120000.0f;
+    float m_aerialPerspectiveDepthMeters = 180000.0f;
 
     bool m_imguiInitialized = false;
 };

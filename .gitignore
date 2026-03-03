@@ -41,6 +41,7 @@ CMakeScripts/
 *.tmp
 *.temp
 *.cache
+/NE_Shaded/
 imgui.ini
 
 # vcpkg artifacts (manifest mode in build tree)
