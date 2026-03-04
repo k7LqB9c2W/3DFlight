@@ -232,26 +232,33 @@ struct SatelliteStreamer::Impl {
 
     std::array<RingParams, 3> ComputeRingParams(double altitudeMeters) {
         std::array<RingParams, 3> rings{};
-        // near / mid / far
-        rings[0].radiusKm = 4.0;
-        rings[1].radiusKm = 20.0;
-        rings[2].radiusKm = 80.0;
+        const double altitudeKm = std::max(0.0, altitudeMeters * 0.001);
+        const double horizonKm =
+            std::sqrt(std::max(0.0, (kEarthRadiusMeters + altitudeMeters) * (kEarthRadiusMeters + altitudeMeters) -
+                                         (kEarthRadiusMeters * kEarthRadiusMeters))) *
+            0.001;
+
+        // Scale stream coverage with altitude so cruising flight still sees streamed imagery instead of only fallback albedo.
+        const double farRadiusKm = std::clamp(horizonKm * 0.65, 80.0, 520.0);
+        const double midRadiusKm = std::clamp(farRadiusKm * 0.32, 20.0, 220.0);
+        const double nearRadiusKm = std::clamp(midRadiusKm * 0.26, 4.0, 70.0);
+
+        rings[0].radiusKm = nearRadiusKm;
+        rings[1].radiusKm = midRadiusKm;
+        rings[2].radiusKm = farRadiusKm;
         rings[0].textureSize = config.nearTextureSize;
         rings[1].textureSize = config.midTextureSize;
         rings[2].textureSize = config.farTextureSize;
-        rings[0].prefetchRadiusTiles = 6;
-        rings[1].prefetchRadiusTiles = 8;
-        rings[2].prefetchRadiusTiles = 10;
 
-        if (altitudeMeters < 500.0) {
+        if (altitudeKm < 0.5) {
             rings[0].zoom = 16;
             rings[1].zoom = 14;
             rings[2].zoom = 12;
-        } else if (altitudeMeters < 2000.0) {
+        } else if (altitudeKm < 2.0) {
             rings[0].zoom = 15;
             rings[1].zoom = 13;
             rings[2].zoom = 11;
-        } else if (altitudeMeters < 6000.0) {
+        } else if (altitudeKm < 6.0) {
             rings[0].zoom = 14;
             rings[1].zoom = 12;
             rings[2].zoom = 10;
@@ -260,6 +267,17 @@ struct SatelliteStreamer::Impl {
             rings[1].zoom = 11;
             rings[2].zoom = 9;
         }
+
+        auto prefetchTilesForRadius = [](double radiusKm, int zoom) {
+            const double tilesAtZoom = static_cast<double>(1u << zoom);
+            const double kmPerTileAtEquator = 40075.016686 / tilesAtZoom;
+            const int needed = static_cast<int>(std::ceil(radiusKm / std::max(kmPerTileAtEquator, 1e-3))) + 2;
+            return std::clamp(needed, 4, 26);
+        };
+        rings[0].prefetchRadiusTiles = prefetchTilesForRadius(rings[0].radiusKm, rings[0].zoom);
+        rings[1].prefetchRadiusTiles = prefetchTilesForRadius(rings[1].radiusKm, rings[1].zoom);
+        rings[2].prefetchRadiusTiles = prefetchTilesForRadius(rings[2].radiusKm, rings[2].zoom);
+
         activeZooms = {rings[0].zoom, rings[1].zoom, rings[2].zoom};
         return rings;
     }
@@ -334,7 +352,15 @@ struct SatelliteStreamer::Impl {
             return;
         }
         const auto rings = ComputeRingParams(altitudeMeters);
+        size_t queued = 0;
+        {
+            std::scoped_lock<std::mutex> lock(mutex);
+            queued = requestQueue.size();
+        }
         for (int i = 0; i < 3; ++i) {
+            if (i > 0 && queued > 3000) {
+                break;
+            }
             QueueBounds(
                 rings[i].zoom,
                 latDeg,
@@ -342,6 +368,9 @@ struct SatelliteStreamer::Impl {
                 rings[i].radiusKm,
                 rings[i].prefetchRadiusTiles,
                 i == 0);
+            if (queued < 6000) {
+                queued += 256;
+            }
         }
     }
 
@@ -719,8 +748,7 @@ struct SatelliteStreamer::Impl {
             }
         }
 
-        const size_t totalPixels = static_cast<size_t>(out.width) * static_cast<size_t>(out.height);
-        out.valid = (validPixelCount > (totalPixels / 20u)); // at least 5% coverage
+        out.valid = (validPixelCount > 0u);
         return out;
     }
 

@@ -365,6 +365,10 @@ void D3D12Renderer::Shutdown() {
     ReleaseRenderTargets();
     m_depthBuffer.Reset();
     m_commandList.Reset();
+    m_uploadCommandList.Reset();
+    m_uploadAllocator.Reset();
+    m_satelliteUploadCommandList.Reset();
+    m_satelliteUploadAllocator.Reset();
     for (auto& frame : m_frames) {
         frame.allocator.Reset();
         frame.fenceValue = 0;
@@ -548,18 +552,26 @@ bool D3D12Renderer::SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, u
 bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture, 3>& lods, std::string& error) {
     constexpr uint8_t kTransparent[4] = {0, 0, 0, 0};
 
-    WaitForGpu();
+    if (!m_satelliteUploadAllocator || !m_satelliteUploadCommandList || !m_fence) {
+        error = "SetSatelliteLodTextures upload resources are not initialized";
+        return false;
+    }
 
-    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
-    FrameContext& frame = m_frames[m_frameIndex];
-    if (FAILED(frame.allocator->Reset())) {
-        error = "SetSatelliteLodTextures allocator reset failed";
+    CleanupDeferredTerrainResources();
+
+    if (FAILED(m_satelliteUploadAllocator->Reset())) {
+        error = "SetSatelliteLodTextures satellite allocator reset failed";
         return false;
     }
-    if (FAILED(m_commandList->Reset(frame.allocator.Get(), nullptr))) {
-        error = "SetSatelliteLodTextures command list reset failed";
+    if (FAILED(m_satelliteUploadCommandList->Reset(m_satelliteUploadAllocator.Get(), nullptr))) {
+        error = "SetSatelliteLodTextures satellite command list reset failed";
         return false;
     }
+
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> newTextures;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> newUploads;
+
+    const UINT64 oldFenceSnapshot = m_fenceValue;
 
     for (size_t i = 0; i < lods.size(); ++i) {
         const SatelliteLodTexture& lod = lods[i];
@@ -568,10 +580,10 @@ bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture
         const uint32_t height = (lod.valid && lod.height > 0) ? lod.height : 1;
         const UINT srvIndex = (i == 0) ? kSatelliteNearSrvIndex : (i == 1 ? kSatelliteMidSrvIndex : kSatelliteFarSrvIndex);
         if (!CreateSatelliteTextureFromPixels(
-                m_commandList.Get(),
+                m_satelliteUploadCommandList.Get(),
                 srvIndex,
-                m_satelliteLodTextures[i],
-                m_satelliteLodUploads[i],
+                newTextures[i],
+                newUploads[i],
                 pixels,
                 width,
                 height,
@@ -582,17 +594,34 @@ bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture
         m_satelliteLodValid[i] = lod.valid ? 1.0f : 0.0f;
     }
 
-    if (FAILED(m_commandList->Close())) {
+    if (FAILED(m_satelliteUploadCommandList->Close())) {
         error = "SetSatelliteLodTextures command list close failed";
         return false;
     }
 
-    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    ID3D12CommandList* lists[] = {m_satelliteUploadCommandList.Get()};
     m_commandQueue->ExecuteCommandLists(1, lists);
-    WaitForGpu();
-    for (auto& upload : m_satelliteLodUploads) {
-        upload.Reset();
+
+    const UINT64 uploadFence = ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), uploadFence);
+
+    for (size_t i = 0; i < m_satelliteLodTextures.size(); ++i) {
+        if (m_satelliteLodTextures[i]) {
+            DeferredResource retired{};
+            retired.resource = std::move(m_satelliteLodTextures[i]);
+            retired.safeFenceValue = oldFenceSnapshot;
+            m_retiredResources.push_back(std::move(retired));
+        }
+        if (m_satelliteLodUploads[i]) {
+            DeferredResource retiredUpload{};
+            retiredUpload.resource = std::move(m_satelliteLodUploads[i]);
+            retiredUpload.safeFenceValue = oldFenceSnapshot;
+            m_retiredResources.push_back(std::move(retiredUpload));
+        }
+        m_satelliteLodTextures[i] = std::move(newTextures[i]);
+        m_satelliteLodUploads[i] = std::move(newUploads[i]);
     }
+    m_satelliteUploadFenceValue = uploadFence;
 
     return true;
 }
@@ -1116,6 +1145,26 @@ bool D3D12Renderer::CreateDeviceResources(std::string& error) {
         return false;
     }
     m_uploadCommandList->Close();
+
+    hr = m_device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(m_satelliteUploadAllocator.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandAllocator(satellite upload) failed", hr);
+        return false;
+    }
+
+    hr = m_device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        m_satelliteUploadAllocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(m_satelliteUploadCommandList.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandList(satellite upload) failed", hr);
+        return false;
+    }
+    m_satelliteUploadCommandList->Close();
 
     hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_fence.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
@@ -2767,6 +2816,12 @@ void D3D12Renderer::CleanupDeferredTerrainResources() {
         m_terrainMesh.ReleaseUploadBuffers();
         m_terrainUploadFenceValue = 0;
     }
+    if (m_satelliteUploadFenceValue != 0 && completed >= m_satelliteUploadFenceValue) {
+        for (auto& upload : m_satelliteLodUploads) {
+            upload.Reset();
+        }
+        m_satelliteUploadFenceValue = 0;
+    }
 
     auto it = m_retiredTerrainMeshes.begin();
     while (it != m_retiredTerrainMeshes.end()) {
@@ -2774,6 +2829,15 @@ void D3D12Renderer::CleanupDeferredTerrainResources() {
             it = m_retiredTerrainMeshes.erase(it);
         } else {
             ++it;
+        }
+    }
+
+    auto r = m_retiredResources.begin();
+    while (r != m_retiredResources.end()) {
+        if (completed >= r->safeFenceValue) {
+            r = m_retiredResources.erase(r);
+        } else {
+            ++r;
         }
     }
 }

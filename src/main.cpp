@@ -106,6 +106,24 @@ void OffsetLatLonMeters(double latDeg, double lonDeg, double northMeters, double
     outLonDeg = WrapLonDeg(lonDeg + dLonDeg);
 }
 
+bool IsLonLatInsideBounds(double latDeg, double lonDeg, const DirectX::XMFLOAT4& boundsLonLat) {
+    if (latDeg < boundsLonLat.z || latDeg > boundsLonLat.w) {
+        return false;
+    }
+    const double lonSpan = static_cast<double>(boundsLonLat.y - boundsLonLat.x);
+    if (std::abs(lonSpan) < 1e-6) {
+        return false;
+    }
+    double lonAdj = lonDeg;
+    while (lonAdj < static_cast<double>(boundsLonLat.x)) {
+        lonAdj += 360.0;
+    }
+    while (lonAdj > static_cast<double>(boundsLonLat.y)) {
+        lonAdj -= 360.0;
+    }
+    return lonAdj >= static_cast<double>(boundsLonLat.x) && lonAdj <= static_cast<double>(boundsLonLat.y);
+}
+
 double WrapHours24(double hours) {
     while (hours >= 24.0) {
         hours -= 24.0;
@@ -771,6 +789,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         satCfg.diskCacheDirectory = std::filesystem::path("cache") / "satellite" / "s2cloudless-2024_3857";
         satCfg.urlTemplate =
             "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg";
+        satCfg.nearTextureSize = 512;
+        satCfg.midTextureSize = 512;
+        satCfg.farTextureSize = 256;
+        satCfg.maxMemoryTiles = 768;
+        satCfg.workerCount = 4;
         std::string satError;
         if (satelliteStreamer.Initialize(satCfg, satError)) {
             satelliteStreamerReady = true;
@@ -839,14 +862,62 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     std::string vehicleTextureStatus = airplaneTextureStatus;
     StreamStats satelliteStats{};
     std::string satelliteRuntimeStatus;
+    struct SatelliteRingDebugInfo {
+        bool valid = false;
+        bool hasPixels = false;
+        int zoom = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint64_t nonZeroAlphaPixels = 0;
+        uint64_t totalPixels = 0;
+        float alphaCoverage = 0.0f;
+        DirectX::XMFLOAT4 boundsLonLat{0.0f, 0.0f, 0.0f, 0.0f};
+    };
+    std::array<SatelliteRingDebugInfo, 3> satelliteRingDebug{};
+    uint64_t satelliteComposeGeneration = 0;
+    uint64_t satelliteComposeFailureCount = 0;
+    uint64_t satelliteUploadGeneration = 0;
+    double satelliteLastComposeMs = 0.0;
+    double satelliteLastUploadMs = 0.0;
     double satelliteComposeCooldownSeconds = 0.0;
+    struct SatelliteComposeAsyncResult {
+        bool composed = false;
+        std::array<flight::satellite::RingTexture, 3> rings{};
+        std::string error;
+    };
+    bool satelliteComposeInFlight = false;
+    std::future<SatelliteComposeAsyncResult> satelliteComposeFuture;
+    std::chrono::steady_clock::time_point satelliteComposeLaunchTime{};
+    bool satelliteComposeLaunchValid = false;
     bool terrainBuildInFlight = false;
     std::future<TerrainBuildAsyncResult> terrainBuildFuture;
 
     auto uploadSatelliteRings = [&](const std::array<flight::satellite::RingTexture, 3>& rings) {
+        const auto uploadStart = std::chrono::steady_clock::now();
         std::array<D3D12Renderer::SatelliteLodTexture, 3> uploads{};
         bool anyValid = false;
         for (size_t i = 0; i < rings.size(); ++i) {
+            const auto& ring = rings[i];
+            auto& debug = satelliteRingDebug[i];
+            debug.valid = ring.valid;
+            debug.hasPixels = !ring.rgbaPixels.empty();
+            debug.zoom = ring.zoom;
+            debug.width = ring.width;
+            debug.height = ring.height;
+            debug.boundsLonLat = ring.boundsLonLat;
+            debug.totalPixels = static_cast<uint64_t>(ring.width) * static_cast<uint64_t>(ring.height);
+            debug.nonZeroAlphaPixels = 0;
+            if (!ring.rgbaPixels.empty()) {
+                for (size_t idx = 3; idx < ring.rgbaPixels.size(); idx += 4) {
+                    if (ring.rgbaPixels[idx] > 0) {
+                        debug.nonZeroAlphaPixels += 1;
+                    }
+                }
+            }
+            debug.alphaCoverage = (debug.totalPixels > 0)
+                ? static_cast<float>(static_cast<double>(debug.nonZeroAlphaPixels) / static_cast<double>(debug.totalPixels))
+                : 0.0f;
+
             uploads[i].rgbaPixels = rings[i].rgbaPixels.data();
             uploads[i].width = rings[i].width;
             uploads[i].height = rings[i].height;
@@ -855,6 +926,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             anyValid = anyValid || uploads[i].valid;
         }
         if (!anyValid) {
+            satelliteRuntimeStatus = "Satellite compose has no valid ring pixels yet";
             return false;
         }
         std::string uploadError;
@@ -862,6 +934,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             satelliteRuntimeStatus = "Satellite upload failed: " + uploadError;
             return false;
         }
+        satelliteUploadGeneration += 1;
+        satelliteLastUploadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uploadStart).count();
         satelliteRuntimeStatus = "Satellite rings uploaded";
         return true;
     };
@@ -909,12 +983,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     if (satelliteStreamerReady) {
         satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters());
         const auto preloadStart = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(4)) {
+        while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(3)) {
             satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters());
             std::array<flight::satellite::RingTexture, 3> rings{};
             std::string composeError;
             const bool composed =
-                satelliteStreamer.ComposeLodRings(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), false, rings, composeError);
+                satelliteStreamer.ComposeLodRings(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), true, rings, composeError);
             if (composed && uploadSatelliteRings(rings)) {
                 satelliteRuntimeStatus = "Satellite preload complete";
                 break;
@@ -1032,26 +1106,43 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (satelliteStreamerReady) {
             satelliteStreamer.PrefetchForView(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
             satelliteComposeCooldownSeconds = std::max(0.0, satelliteComposeCooldownSeconds - dt);
-            if (satelliteComposeCooldownSeconds <= 0.0) {
-                std::array<flight::satellite::RingTexture, 3> rings{};
-                std::string composeError;
-                const bool composed = satelliteStreamer.ComposeLodRings(
-                    activeSim.LatitudeDeg(),
-                    activeSim.LongitudeDeg(),
-                    activeSim.AltitudeMeters(),
-                    false,
-                    rings,
-                    composeError);
-                if (composed) {
-                    if (uploadSatelliteRings(rings)) {
-                        satelliteComposeCooldownSeconds = 0.75;
-                    } else {
-                        satelliteComposeCooldownSeconds = 1.0;
-                    }
-                } else if (!composeError.empty()) {
-                    satelliteRuntimeStatus = "Satellite compose failed: " + composeError;
-                    satelliteComposeCooldownSeconds = 1.0;
+            if (satelliteComposeInFlight &&
+                satelliteComposeFuture.valid() &&
+                satelliteComposeFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                SatelliteComposeAsyncResult result = satelliteComposeFuture.get();
+                satelliteComposeInFlight = false;
+                if (satelliteComposeLaunchValid) {
+                    satelliteLastComposeMs =
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - satelliteComposeLaunchTime).count();
+                    satelliteComposeLaunchValid = false;
                 }
+                if (result.composed) {
+                    satelliteComposeGeneration += 1;
+                    if (uploadSatelliteRings(result.rings)) {
+                        satelliteComposeCooldownSeconds = 0.85;
+                    } else {
+                        satelliteComposeCooldownSeconds = 1.2;
+                    }
+                } else if (!result.error.empty()) {
+                    satelliteComposeFailureCount += 1;
+                    satelliteRuntimeStatus = "Satellite compose failed: " + result.error;
+                    satelliteComposeCooldownSeconds = 1.2;
+                }
+            }
+
+            if (!satelliteComposeInFlight && satelliteComposeCooldownSeconds <= 0.0) {
+                const double satLat = activeSim.LatitudeDeg();
+                const double satLon = activeSim.LongitudeDeg();
+                const double satAlt = activeSim.AltitudeMeters();
+                satelliteComposeInFlight = true;
+                satelliteComposeLaunchTime = std::chrono::steady_clock::now();
+                satelliteComposeLaunchValid = true;
+                satelliteComposeFuture = std::async(std::launch::async, [&satelliteStreamer, satLat, satLon, satAlt]() {
+                    SatelliteComposeAsyncResult out{};
+                    out.composed = satelliteStreamer.ComposeLodRings(satLat, satLon, satAlt, false, out.rings, out.error);
+                    return out;
+                });
+                satelliteComposeCooldownSeconds = 0.25;
             }
             satelliteStats = satelliteStreamer.GetStats();
         }
@@ -1631,6 +1722,47 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     s2);
             }
             ImGui::Text("Columns are west / center / east at %+0.1f km.", debugProbeStepKm);
+        }
+        ImGui::End();
+
+        ImGui::Begin("Satellite Stream Debug");
+        ImGui::Text("Stream: %s", satelliteStreamerReady ? "enabled" : "disabled");
+        ImGui::Text("Compose in-flight: %s", satelliteComposeInFlight ? "yes" : "no");
+        ImGui::Text("Compose cooldown: %.2f s", satelliteComposeCooldownSeconds);
+        ImGui::Text(
+            "Composes / failures / uploads: %llu / %llu / %llu",
+            static_cast<unsigned long long>(satelliteComposeGeneration),
+            static_cast<unsigned long long>(satelliteComposeFailureCount),
+            static_cast<unsigned long long>(satelliteUploadGeneration));
+        ImGui::Text("Last compose: %.2f ms", satelliteLastComposeMs);
+        ImGui::Text("Last upload: %.2f ms", satelliteLastUploadMs);
+        ImGui::Text("View: lat %.6f lon %.6f alt %.1f m", activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
+        if (!satelliteRuntimeStatus.empty()) {
+            ImGui::TextWrapped("Status: %s", satelliteRuntimeStatus.c_str());
+        }
+        if (renderer.HasSatelliteSourceFile()) {
+            ImGui::TextWrapped("Fallback source: %s", renderer.SatelliteSourcePath().string().c_str());
+        }
+        const char* ringNames[3] = {"Near", "Mid", "Far"};
+        for (int i = 0; i < 3; ++i) {
+            const auto& ring = satelliteRingDebug[i];
+            const bool inBounds = IsLonLatInsideBounds(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), ring.boundsLonLat);
+            ImGui::Separator();
+            ImGui::Text("%s Ring", ringNames[i]);
+            ImGui::Text("Zoom: %d", ring.zoom);
+            ImGui::Text("Texture: %u x %u", ring.width, ring.height);
+            ImGui::Text(
+                "Valid: %s, pixels: %s, alpha coverage: %.1f%%",
+                ring.valid ? "yes" : "no",
+                ring.hasPixels ? "yes" : "no",
+                ring.alphaCoverage * 100.0f);
+            ImGui::Text(
+                "Bounds lon[%.6f, %.6f] lat[%.6f, %.6f]",
+                ring.boundsLonLat.x,
+                ring.boundsLonLat.y,
+                ring.boundsLonLat.z,
+                ring.boundsLonLat.w);
+            ImGui::Text("Plane in ring bounds: %s", inBounds ? "yes" : "no");
         }
         ImGui::End();
 

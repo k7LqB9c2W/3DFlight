@@ -102,10 +102,16 @@ private:
     static constexpr UINT kMultipleScatteringSrvIndex = 5;
     static constexpr UINT kAerialPerspectiveSrvIndex = 6;
     static constexpr UINT kEarthAlbedoSrvIndex = 7;
-    static constexpr UINT kSatelliteNearSrvIndex = 8;
-    static constexpr UINT kSatelliteMidSrvIndex = 9;
-    static constexpr UINT kSatelliteFarSrvIndex = 10;
-    static constexpr UINT kModelAlbedoSrvIndex = 11;
+    // Descriptor index maps to t-register as (index - kSrvTableStartIndex), because slot 0 is reserved for ImGui font.
+    // With kSrvTableStartIndex=1:
+    //   t8  -> descriptor 9
+    //   t9  -> descriptor 10
+    //   t10 -> descriptor 11
+    //   t11 -> descriptor 12
+    static constexpr UINT kSatelliteNearSrvIndex = 9;
+    static constexpr UINT kSatelliteMidSrvIndex = 10;
+    static constexpr UINT kSatelliteFarSrvIndex = 11;
+    static constexpr UINT kModelAlbedoSrvIndex = 12;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
@@ -246,6 +252,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_uploadAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_uploadCommandList;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_satelliteUploadAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_satelliteUploadCommandList;
 
     std::array<FrameContext, kFrameCount> m_frames;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_renderTargets;
@@ -282,8 +290,14 @@ private:
         GpuMesh mesh;
         UINT64 safeFenceValue = 0;
     };
+    struct DeferredResource {
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+        UINT64 safeFenceValue = 0;
+    };
     std::vector<DeferredTerrainMesh> m_retiredTerrainMeshes;
+    std::vector<DeferredResource> m_retiredResources;
     UINT64 m_terrainUploadFenceValue = 0;
+    UINT64 m_satelliteUploadFenceValue = 0;
     Double3 m_terrainAnchorEcef{};
     DirectX::XMFLOAT4 m_terrainRenderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
     TerrainVisualSettings m_terrainVisualSettings{};
