@@ -17,6 +17,7 @@
 #include "gltf_loader.h"
 #include "mesh.h"
 #include "satellite/satellite_streamer.h"
+#include "satellite/world_tile_system.h"
 #include "sim.h"
 #include "terrain/terrain_mesh.h"
 #include "terrain/terrain_system.h"
@@ -29,6 +30,7 @@ using flight::InputState;
 using flight::MeshData;
 using flight::satellite::SatelliteStreamer;
 using flight::satellite::StreamStats;
+using flight::satellite::WorldTileSystem;
 using flight::terrain::TerrainPatchBuildResult;
 using flight::terrain::TerrainPatchSettings;
 using flight::terrain::TerrainSampleDebug;
@@ -410,6 +412,7 @@ struct GraphicsTuningConfig {
 
     bool satelliteEnabled = true;
     float satelliteBlend = 1.0f;
+    bool worldLockedSatelliteEnabled = false;
 };
 
 void SanitizeGraphicsTuning(GraphicsTuningConfig& cfg) {
@@ -514,6 +517,7 @@ void ApplyGraphicsTuning(
     visual.satelliteEnabled = cfg.satelliteEnabled;
     visual.satelliteBlend = cfg.satelliteBlend;
     renderer.SetTerrainVisualSettings(visual);
+    renderer.SetWorldLockedSatelliteEnabled(cfg.worldLockedSatelliteEnabled);
     renderer.SetAerialPerspectiveDepthMeters(cfg.aerialPerspectiveDepthMeters);
 }
 
@@ -569,6 +573,7 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
     readFloat("aerial_perspective_depth_m", outCfg.aerialPerspectiveDepthMeters);
     readBool("satellite_enabled", outCfg.satelliteEnabled);
     readFloat("satellite_blend", outCfg.satelliteBlend);
+    readBool("world_locked_satellite_enabled", outCfg.worldLockedSatelliteEnabled);
 
     // Migrate older profiles that used heavy non-physical haze defaults.
     const int version = j.value("config_version", 1);
@@ -586,6 +591,9 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
         // Satellite imagery defaults to enabled when first introduced.
         outCfg.satelliteEnabled = true;
         outCfg.satelliteBlend = 1.0f;
+    }
+    if (version < 5) {
+        outCfg.worldLockedSatelliteEnabled = false;
     }
 
     SanitizeGraphicsTuning(outCfg);
@@ -627,7 +635,8 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
     j["aerial_perspective_depth_m"] = cfg.aerialPerspectiveDepthMeters;
     j["satellite_enabled"] = cfg.satelliteEnabled;
     j["satellite_blend"] = cfg.satelliteBlend;
-    j["config_version"] = 4;
+    j["world_locked_satellite_enabled"] = cfg.worldLockedSatelliteEnabled;
+    j["config_version"] = 5;
 
     out << j.dump(2) << "\n";
     return true;
@@ -812,6 +821,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
     }
 
+    WorldTileSystem worldTileSystem;
+    bool worldTileSystemReady = false;
+    std::string worldTileInitStatus;
+    {
+        WorldTileSystem::Config worldCfg{};
+        worldCfg.minZoom = 9;
+        worldCfg.maxZoom = 16;
+        worldCfg.atlasPagesX = 16;
+        worldCfg.atlasPagesY = 16;
+        worldCfg.pageTableWidth = 1024;
+        worldCfg.pageTableHeight = 1024;
+        worldCfg.maxVisibleTilesPerFrame = 1600;
+        worldCfg.maxRequestsPerFrame = 320;
+        worldCfg.maxUploadsPerFrame = 12;
+        worldCfg.zoomSwitchHoldFrames = 45;
+        worldCfg.altitudeBandHysteresisMeters = 180.0;
+        worldCfg.governorRecoveryHoldFrames = 45;
+        std::string worldError;
+        if (worldTileSystem.Initialize(worldCfg, worldError)) {
+            worldTileSystemReady = true;
+            worldTileInitStatus = "World-locked tile manager ready";
+        } else {
+            worldTileInitStatus = "World-locked tile manager init failed: " + worldError;
+        }
+    }
+
     TerrainPatchSettings patchSettings{};
     GraphicsTuningConfig graphicsTuning = MakeRealisticTuningPreset();
     const std::filesystem::path graphicsConfigPath = std::filesystem::path("config") / "graphics_tuning.json";
@@ -875,6 +910,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     std::string vehicleTextureStatus = airplaneTextureStatus;
     StreamStats satelliteStats{};
     std::string satelliteRuntimeStatus;
+    flight::satellite::WorldTileSystemStats worldTileStats{};
+    D3D12Renderer::WorldStreamingStats worldStreamingStats{};
+    std::string worldTileRuntimeStatus;
     struct SatelliteRingDebugInfo {
         bool valid = false;
         bool hasPixels = false;
@@ -1171,6 +1209,65 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
             satelliteStats = satelliteStreamer.GetStats();
         }
+        if (worldTileSystemReady) {
+            const bool worldEnabled = renderer.IsWorldLockedSatelliteEnabled() && satelliteStreamerReady;
+            worldTileSystem.SetEnabled(worldEnabled);
+            if (worldEnabled) {
+                worldTileSystem.SetFrameTimeMs(frameTimeEmaMs);
+                WorldTileSystem::ViewState view{};
+                view.latDeg = activeSim.LatitudeDeg();
+                view.lonDeg = activeSim.LongitudeDeg();
+                view.altitudeMeters = activeSim.AltitudeMeters();
+                view.headingDeg = activeSim.HeadingDeg();
+                worldTileSystem.Tick(view, satelliteStreamer);
+
+                std::vector<flight::satellite::WorldAtlasUpload> atlasUploads;
+                std::vector<flight::satellite::WorldPageTableUpdate> pageUpdates;
+                worldTileSystem.ConsumeGpuUpdates(atlasUploads, pageUpdates);
+
+                if (!atlasUploads.empty() || !pageUpdates.empty()) {
+                    std::vector<D3D12Renderer::WorldAtlasPageUpload> rendererUploads;
+                    rendererUploads.reserve(atlasUploads.size());
+                    for (const auto& upload : atlasUploads) {
+                        if (!upload.rgbaPixels || upload.rgbaPixels->size() < (256u * 256u * 4u)) {
+                            continue;
+                        }
+                        D3D12Renderer::WorldAtlasPageUpload item{};
+                        item.rgbaPixels = upload.rgbaPixels->data();
+                        item.atlasPageX = upload.atlasPageX;
+                        item.atlasPageY = upload.atlasPageY;
+                        rendererUploads.push_back(item);
+                    }
+
+                    std::vector<D3D12Renderer::WorldPageTableUpdate> rendererPageUpdates;
+                    rendererPageUpdates.reserve(pageUpdates.size());
+                    for (const auto& update : pageUpdates) {
+                        D3D12Renderer::WorldPageTableUpdate item{};
+                        item.x = update.x;
+                        item.y = update.y;
+                        item.key0 = update.key0;
+                        item.key1 = update.key1;
+                        item.value = update.value;
+                        rendererPageUpdates.push_back(item);
+                    }
+
+                    std::string worldUploadError;
+                    if (!renderer.UploadWorldLockedSatelliteData(rendererUploads, rendererPageUpdates, worldUploadError)) {
+                        worldTileRuntimeStatus = "World stream GPU upload failed: " + worldUploadError;
+                    } else {
+                        worldTileRuntimeStatus = "World stream updated atlas/page-table";
+                    }
+                }
+            } else {
+                worldTileRuntimeStatus = "World stream disabled";
+            }
+            worldTileStats = worldTileSystem.GetStats();
+            renderer.SetWorldSamplingZooms(
+                worldTileStats.activeZoomNear,
+                worldTileStats.activeZoomMid,
+                worldTileStats.activeZoomFar);
+            worldStreamingStats = renderer.GetWorldStreamingStats();
+        }
 
         if (terrainSystemReady) {
             groundHeightRaw = terrainSystem.SampleHeightMetersDebugCached(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), terrainSampleDebug);
@@ -1384,6 +1481,41 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             if (!satelliteRuntimeStatus.empty()) {
                 ImGui::TextWrapped("%s", satelliteRuntimeStatus.c_str());
             }
+        }
+        ImGui::Text("World-locked stream: %s", renderer.IsWorldLockedSatelliteEnabled() ? "enabled" : "disabled");
+        if (!worldTileInitStatus.empty()) {
+            ImGui::TextWrapped("%s", worldTileInitStatus.c_str());
+        }
+        ImGui::Text(
+            "World tiles visible/resident/protected: %zu / %zu / %zu",
+            worldTileStats.visibleTileCount,
+            worldTileStats.residentTileCount,
+            worldTileStats.protectedTileCount);
+        ImGui::Text(
+            "World requests/hits/misses: %llu / %llu / %llu",
+            static_cast<unsigned long long>(worldTileStats.streamerRequests),
+            static_cast<unsigned long long>(worldTileStats.streamerCacheHits),
+            static_cast<unsigned long long>(worldTileStats.streamerCacheMisses));
+        ImGui::Text(
+            "World zooms N/M/F: %d / %d / %d (band %d, hold %llu)",
+            worldTileStats.activeZoomNear,
+            worldTileStats.activeZoomMid,
+            worldTileStats.activeZoomFar,
+            worldTileStats.activeZoomBand,
+            static_cast<unsigned long long>(worldTileStats.zoomBandHoldFramesRemaining));
+        ImGui::Text(
+            "World governor L%d frame %.2f ms budgets req/up: %zu / %zu",
+            worldTileStats.governorLevel,
+            worldTileStats.governorFrameTimeMs,
+            worldTileStats.governorRequestBudget,
+            worldTileStats.governorUploadBudget);
+        ImGui::Text(
+            "World uploads/pages/bytes: %llu / %llu / %.2f MB",
+            static_cast<unsigned long long>(worldStreamingStats.uploadBatches),
+            static_cast<unsigned long long>(worldStreamingStats.atlasPageUploads),
+            static_cast<double>(worldStreamingStats.uploadBytes) / (1024.0 * 1024.0));
+        if (!worldTileRuntimeStatus.empty()) {
+            ImGui::TextWrapped("%s", worldTileRuntimeStatus.c_str());
         }
 
         bool atmosphereEnabled = renderer.IsAtmosphereEnabled();
@@ -1645,6 +1777,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (ImGui::SliderFloat("Satellite Blend", &graphicsTuning.satelliteBlend, 0.0f, 1.0f, "%.2f")) {
             visualTuningChanged = true;
         }
+        if (ImGui::Checkbox("World-Locked Satellite (Phase 4-6)", &graphicsTuning.worldLockedSatelliteEnabled)) {
+            visualTuningChanged = true;
+        }
 
         ImGui::Separator();
         if (ImGui::Button("Preset: Realistic")) {
@@ -1800,8 +1935,31 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Text("Last compose: %.2f ms", satelliteLastComposeMs);
         ImGui::Text("Last upload: %.2f ms", satelliteLastUploadMs);
         ImGui::Text("View: lat %.6f lon %.6f alt %.1f m", activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
+        ImGui::Separator();
+        ImGui::Text("World-Locked: %s", renderer.IsWorldLockedSatelliteEnabled() ? "enabled" : "disabled");
+        ImGui::Text(
+            "Frame/Visible/Resident/Pending: %llu / %zu / %zu / %zu",
+            static_cast<unsigned long long>(worldTileStats.frameId),
+            worldTileStats.visibleTileCount,
+            worldTileStats.residentTileCount,
+            worldTileStats.pendingUploadCount);
+        ImGui::Text(
+            "PageTable occupancy/writes: %zu / %llu",
+            worldTileStats.pageTableOccupancy,
+            static_cast<unsigned long long>(worldTileStats.pageTableWrites));
+        ImGui::Text(
+            "Evictions/skips(no page): %llu / %llu",
+            static_cast<unsigned long long>(worldTileStats.evictions),
+            static_cast<unsigned long long>(worldTileStats.uploadSkipsNoPage));
+        ImGui::Text(
+            "GPU upload batches/failures: %llu / %llu",
+            static_cast<unsigned long long>(worldStreamingStats.uploadBatches),
+            static_cast<unsigned long long>(worldStreamingStats.uploadFailures));
         if (!satelliteRuntimeStatus.empty()) {
             ImGui::TextWrapped("Status: %s", satelliteRuntimeStatus.c_str());
+        }
+        if (!worldTileRuntimeStatus.empty()) {
+            ImGui::TextWrapped("World Status: %s", worldTileRuntimeStatus.c_str());
         }
         if (renderer.HasSatelliteSourceFile()) {
             ImGui::TextWrapped("Fallback source: %s", renderer.SatelliteSourcePath().string().c_str());

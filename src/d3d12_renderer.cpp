@@ -249,6 +249,9 @@ bool D3D12Renderer::Initialize(
     if (!CreateEarthAlbedoTexture(m_commandList.Get(), error)) {
         return false;
     }
+    if (!CreateWorldStreamingResources(m_commandList.Get(), error)) {
+        return false;
+    }
     {
         constexpr uint8_t kTransparent[4] = {0, 0, 0, 0};
         if (!CreateSatelliteTextureFromPixels(
@@ -406,6 +409,8 @@ void D3D12Renderer::Shutdown() {
     m_uploadAllocator.Reset();
     m_satelliteUploadCommandList.Reset();
     m_satelliteUploadAllocator.Reset();
+    m_worldUploadCommandList.Reset();
+    m_worldUploadAllocator.Reset();
     for (auto& frame : m_frames) {
         frame.allocator.Reset();
         frame.fenceValue = 0;
@@ -431,6 +436,13 @@ void D3D12Renderer::Shutdown() {
     m_skyboxUpload.Reset();
     m_earthAlbedoTexture.Reset();
     m_earthAlbedoUpload.Reset();
+    m_worldSatelliteAtlasTexture.Reset();
+    m_worldSatellitePageTableTexture.Reset();
+    m_worldSatellitePageKeyTexture.Reset();
+    m_worldSatellitePageTableCpu.clear();
+    m_worldSatellitePageKeyCpu.clear();
+    m_worldStreamingResourcesReady = false;
+    m_worldStreamingStats = {};
     for (auto& tex : m_satelliteLodTextures) {
         tex.Reset();
     }
@@ -691,7 +703,21 @@ bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture
     m_satelliteUploadFenceValue = uploadFence;
 
     const bool hasNewValid = (newValid[0] + newValid[1] + newValid[2]) > 0.5f;
-    if (hadCurrentValid && hasNewValid) {
+    auto sameBounds = [](const DirectX::XMFLOAT4& a, const DirectX::XMFLOAT4& b) {
+        return std::abs(a.x - b.x) < 1e-5f &&
+            std::abs(a.y - b.y) < 1e-5f &&
+            std::abs(a.z - b.z) < 1e-5f &&
+            std::abs(a.w - b.w) < 1e-5f;
+    };
+    bool mappingChanged = false;
+    for (size_t i = 0; i < m_satelliteLodBounds.size(); ++i) {
+        if (!sameBounds(newBounds[i], m_satellitePrevLodBounds[i]) || std::abs(newValid[i] - m_satellitePrevLodValid[i]) > 1e-3f) {
+            mappingChanged = true;
+            break;
+        }
+    }
+
+    if (hadCurrentValid && hasNewValid && mappingChanged) {
         m_satelliteTransitionStart = std::chrono::steady_clock::now();
         m_satelliteTransitionT = 0.0f;
         m_satelliteTransitionActive = true;
@@ -1108,7 +1134,20 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning9 = m_satellitePrevLodBounds[1];
         obj.tuning10 = m_satellitePrevLodBounds[2];
         obj.tuning11 = {m_satellitePrevLodValid[0], m_satellitePrevLodValid[1], m_satellitePrevLodValid[2], m_satelliteTransitionT};
-        obj.tuning12 = {layerAlpha, 0.0f, 0.0f, 0.0f};
+        const bool worldSamplingEnabled = m_worldLockedSatelliteEnabled && m_worldStreamingResourcesReady;
+        obj.tuning12 = {layerAlpha, worldSamplingEnabled ? 1.0f : 0.0f, 1.0f, 0.0f};
+        obj.tuning13 = {
+            static_cast<float>(kWorldSatelliteAtlasPagesX),
+            static_cast<float>(kWorldSatelliteAtlasPagesY),
+            static_cast<float>(kWorldSatellitePageTableWidth),
+            static_cast<float>(kWorldSatellitePageTableHeight),
+        };
+        obj.tuning14 = {
+            static_cast<float>(std::clamp(m_worldSamplingZooms[0], 0, 22)),
+            static_cast<float>(std::clamp(m_worldSamplingZooms[1], 0, 22)),
+            static_cast<float>(std::clamp(m_worldSamplingZooms[2], 0, 22)),
+            2.0f,
+        };
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
@@ -1308,6 +1347,26 @@ bool D3D12Renderer::CreateDeviceResources(std::string& error) {
     }
     m_satelliteUploadCommandList->Close();
 
+    hr = m_device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(m_worldUploadAllocator.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandAllocator(world upload) failed", hr);
+        return false;
+    }
+
+    hr = m_device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        m_worldUploadAllocator.Get(),
+        nullptr,
+        IID_PPV_ARGS(m_worldUploadCommandList.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommandList(world upload) failed", hr);
+        return false;
+    }
+    m_worldUploadCommandList->Close();
+
     hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_fence.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
         error = HrMessage("CreateFence failed", hr);
@@ -1448,12 +1507,17 @@ bool D3D12Renderer::CompileShader(
 }
 
 bool D3D12Renderer::CreatePipeline(std::string& error) {
-    D3D12_DESCRIPTOR_RANGE graphicsSrvRange{};
-    graphicsSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    graphicsSrvRange.NumDescriptors = 15; // t0..t14
-    graphicsSrvRange.BaseShaderRegister = 0;
-    graphicsSrvRange.RegisterSpace = 0;
-    graphicsSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_DESCRIPTOR_RANGE graphicsSrvRanges[2]{};
+    graphicsSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    graphicsSrvRanges[0].NumDescriptors = 16; // t0..t15
+    graphicsSrvRanges[0].BaseShaderRegister = 0;
+    graphicsSrvRanges[0].RegisterSpace = 0;
+    graphicsSrvRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    graphicsSrvRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    graphicsSrvRanges[1].NumDescriptors = 3; // t19..t21
+    graphicsSrvRanges[1].BaseShaderRegister = 19;
+    graphicsSrvRanges[1].RegisterSpace = 0;
+    graphicsSrvRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
     D3D12_ROOT_PARAMETER graphicsParams[3]{};
 
@@ -1468,8 +1532,8 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     graphicsParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     graphicsParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    graphicsParams[2].DescriptorTable.NumDescriptorRanges = 1;
-    graphicsParams[2].DescriptorTable.pDescriptorRanges = &graphicsSrvRange;
+    graphicsParams[2].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(std::size(graphicsSrvRanges));
+    graphicsParams[2].DescriptorTable.pDescriptorRanges = graphicsSrvRanges;
     graphicsParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     std::array<D3D12_STATIC_SAMPLER_DESC, 2> staticSamplers{};
@@ -1526,12 +1590,17 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
 
-    D3D12_DESCRIPTOR_RANGE computeSrvRange{};
-    computeSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    computeSrvRange.NumDescriptors = 15; // t0..t14 (higher slots unused by LUT compute, present in shared SRV heap table)
-    computeSrvRange.BaseShaderRegister = 0;
-    computeSrvRange.RegisterSpace = 0;
-    computeSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_DESCRIPTOR_RANGE computeSrvRanges[2]{};
+    computeSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    computeSrvRanges[0].NumDescriptors = 16; // t0..t15
+    computeSrvRanges[0].BaseShaderRegister = 0;
+    computeSrvRanges[0].RegisterSpace = 0;
+    computeSrvRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    computeSrvRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    computeSrvRanges[1].NumDescriptors = 3; // t19..t21
+    computeSrvRanges[1].BaseShaderRegister = 19;
+    computeSrvRanges[1].RegisterSpace = 0;
+    computeSrvRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
     D3D12_DESCRIPTOR_RANGE computeUavRange{};
     computeUavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -1547,8 +1616,8 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     computeParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     computeParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    computeParams[1].DescriptorTable.NumDescriptorRanges = 1;
-    computeParams[1].DescriptorTable.pDescriptorRanges = &computeSrvRange;
+    computeParams[1].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(std::size(computeSrvRanges));
+    computeParams[1].DescriptorTable.pDescriptorRanges = computeSrvRanges;
     computeParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     computeParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -2966,6 +3035,561 @@ bool D3D12Renderer::CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandL
     return true;
 }
 
+bool D3D12Renderer::CreateWorldStreamingResources(ID3D12GraphicsCommandList* commandList, std::string& error) {
+    if (!commandList) {
+        error = "CreateWorldStreamingResources received null command list";
+        return false;
+    }
+
+    m_worldSatellitePageTableCpu.assign(
+        static_cast<size_t>(kWorldSatellitePageTableWidth) * static_cast<size_t>(kWorldSatellitePageTableHeight),
+        0u);
+    m_worldSatellitePageKeyCpu.assign(
+        static_cast<size_t>(kWorldSatellitePageTableWidth) * static_cast<size_t>(kWorldSatellitePageTableHeight) * 2u,
+        0u);
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC atlasDesc{};
+    atlasDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    atlasDesc.Width = static_cast<UINT64>(kWorldSatelliteTileSize) * static_cast<UINT64>(kWorldSatelliteAtlasPagesX);
+    atlasDesc.Height = kWorldSatelliteTileSize * kWorldSatelliteAtlasPagesY;
+    atlasDesc.DepthOrArraySize = 1;
+    atlasDesc.MipLevels = 1;
+    atlasDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    atlasDesc.SampleDesc.Count = 1;
+    atlasDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    atlasDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    HRESULT hr = m_device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &atlasDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        nullptr,
+        IID_PPV_ARGS(m_worldSatelliteAtlasTexture.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(world satellite atlas) failed", hr);
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC pageTableDesc{};
+    pageTableDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    pageTableDesc.Width = kWorldSatellitePageTableWidth;
+    pageTableDesc.Height = kWorldSatellitePageTableHeight;
+    pageTableDesc.DepthOrArraySize = 1;
+    pageTableDesc.MipLevels = 1;
+    pageTableDesc.Format = DXGI_FORMAT_R32_UINT;
+    pageTableDesc.SampleDesc.Count = 1;
+    pageTableDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    pageTableDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    hr = m_device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &pageTableDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(m_worldSatellitePageTableTexture.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(world satellite page table) failed", hr);
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC pageKeyDesc{};
+    pageKeyDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    pageKeyDesc.Width = kWorldSatellitePageTableWidth;
+    pageKeyDesc.Height = kWorldSatellitePageTableHeight;
+    pageKeyDesc.DepthOrArraySize = 1;
+    pageKeyDesc.MipLevels = 1;
+    pageKeyDesc.Format = DXGI_FORMAT_R32G32_UINT;
+    pageKeyDesc.SampleDesc.Count = 1;
+    pageKeyDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    pageKeyDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    hr = m_device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &pageKeyDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(m_worldSatellitePageKeyTexture.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateCommittedResource(world satellite page key texture) failed", hr);
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    auto uploadZeroTexture = [&](ID3D12Resource* dstTexture, const D3D12_RESOURCE_DESC& desc, ComPtr<ID3D12Resource>& outUpload,
+                                 const char* createLabel, const char* mapLabel) -> bool {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT numRows = 0;
+        UINT64 rowBytes = 0;
+        UINT64 uploadBytes = 0;
+        m_device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &numRows, &rowBytes, &uploadBytes);
+
+        D3D12_RESOURCE_DESC uploadDesc{};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = uploadBytes;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        HRESULT localHr = m_device->CreateCommittedResource(
+            &uploadHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &uploadDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(outUpload.ReleaseAndGetAddressOf()));
+        if (FAILED(localHr)) {
+            error = HrMessage(createLabel, localHr);
+            return false;
+        }
+
+        uint8_t* mapped = nullptr;
+        D3D12_RANGE readRange{};
+        localHr = outUpload->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+        if (FAILED(localHr) || mapped == nullptr) {
+            error = HrMessage(mapLabel, localHr);
+            return false;
+        }
+        std::memset(mapped, 0, static_cast<size_t>(uploadBytes));
+        outUpload->Unmap(0, nullptr);
+
+        D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+        dstLoc.pResource = dstTexture;
+        dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dstLoc.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+        srcLoc.pResource = outUpload.Get();
+        srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcLoc.PlacedFootprint = footprint;
+        commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+        return true;
+    };
+
+    ComPtr<ID3D12Resource> pageTableUpload;
+    if (!uploadZeroTexture(
+            m_worldSatellitePageTableTexture.Get(),
+            pageTableDesc,
+            pageTableUpload,
+            "CreateCommittedResource(world page table upload) failed",
+            "Map(world page table upload) failed")) {
+        return false;
+    }
+
+    ComPtr<ID3D12Resource> pageKeyUpload;
+    if (!uploadZeroTexture(
+            m_worldSatellitePageKeyTexture.Get(),
+            pageKeyDesc,
+            pageKeyUpload,
+            "CreateCommittedResource(world page key upload) failed",
+            "Map(world page key upload) failed")) {
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = m_worldSatellitePageTableTexture.Get();
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = m_worldSatellitePageKeyTexture.Get();
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(2, barriers);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC atlasSrv{};
+    atlasSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    atlasSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    atlasSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    atlasSrv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_worldSatelliteAtlasTexture.Get(), &atlasSrv, CpuSrv(kWorldSatelliteAtlasSrvIndex));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC pageSrv{};
+    pageSrv.Format = DXGI_FORMAT_R32_UINT;
+    pageSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    pageSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    pageSrv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_worldSatellitePageTableTexture.Get(), &pageSrv, CpuSrv(kWorldSatellitePageTableSrvIndex));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC pageKeySrv{};
+    pageKeySrv.Format = DXGI_FORMAT_R32G32_UINT;
+    pageKeySrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    pageKeySrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    pageKeySrv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_worldSatellitePageKeyTexture.Get(), &pageKeySrv, CpuSrv(kWorldSatellitePageKeySrvIndex));
+
+    m_worldStreamingResourcesReady = true;
+    m_worldStreamingStats.resourcesReady = true;
+    DeferredResource deferredPageTable{};
+    deferredPageTable.resource = std::move(pageTableUpload);
+    deferredPageTable.safeFenceValue = m_fenceValue;
+    m_retiredResources.push_back(std::move(deferredPageTable));
+    DeferredResource deferredPageKey{};
+    deferredPageKey.resource = std::move(pageKeyUpload);
+    deferredPageKey.safeFenceValue = m_fenceValue;
+    m_retiredResources.push_back(std::move(deferredPageKey));
+    return true;
+}
+
+bool D3D12Renderer::UploadWorldLockedSatelliteData(
+    const std::vector<WorldAtlasPageUpload>& pageUploads,
+    const std::vector<WorldPageTableUpdate>& pageTableUpdates,
+    std::string& error) {
+    error.clear();
+    if (!m_worldStreamingResourcesReady || !m_worldSatelliteAtlasTexture || !m_worldSatellitePageTableTexture ||
+        !m_worldSatellitePageKeyTexture) {
+        error = "World satellite streaming resources are not initialized";
+        m_worldStreamingStats.uploadFailures += 1;
+        return false;
+    }
+    if (!m_worldUploadAllocator || !m_worldUploadCommandList || !m_fence) {
+        error = "World upload command resources are not initialized";
+        m_worldStreamingStats.uploadFailures += 1;
+        return false;
+    }
+    if (pageUploads.empty() && pageTableUpdates.empty()) {
+        return true;
+    }
+
+    CleanupDeferredTerrainResources();
+
+    if (FAILED(m_worldUploadAllocator->Reset())) {
+        error = "World upload allocator reset failed";
+        m_worldStreamingStats.uploadFailures += 1;
+        return false;
+    }
+    if (FAILED(m_worldUploadCommandList->Reset(m_worldUploadAllocator.Get(), nullptr))) {
+        error = "World upload command list reset failed";
+        m_worldStreamingStats.uploadFailures += 1;
+        return false;
+    }
+
+    std::vector<ComPtr<ID3D12Resource>> transientUploads;
+    transientUploads.reserve(pageUploads.size() + 4);
+    uint64_t uploadedBytes = 0;
+
+    if (!pageUploads.empty()) {
+        D3D12_RESOURCE_BARRIER toCopy{};
+        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy.Transition.pResource = m_worldSatelliteAtlasTexture.Get();
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_worldUploadCommandList->ResourceBarrier(1, &toCopy);
+
+        for (const WorldAtlasPageUpload& upload : pageUploads) {
+            if (!upload.rgbaPixels) {
+                continue;
+            }
+            if (upload.atlasPageX >= kWorldSatelliteAtlasPagesX || upload.atlasPageY >= kWorldSatelliteAtlasPagesY) {
+                continue;
+            }
+
+            const UINT rowBytes = kWorldSatelliteTileSize * 4u;
+            const UINT rowPitch =
+                ((rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            const UINT64 uploadBytes = static_cast<UINT64>(rowPitch) * static_cast<UINT64>(kWorldSatelliteTileSize);
+
+            D3D12_HEAP_PROPERTIES uploadHeap{};
+            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+            D3D12_RESOURCE_DESC uploadDesc{};
+            uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            uploadDesc.Width = uploadBytes;
+            uploadDesc.Height = 1;
+            uploadDesc.DepthOrArraySize = 1;
+            uploadDesc.MipLevels = 1;
+            uploadDesc.SampleDesc.Count = 1;
+            uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            ComPtr<ID3D12Resource> uploadBuffer;
+            HRESULT hr = m_device->CreateCommittedResource(
+                &uploadHeap,
+                D3D12_HEAP_FLAG_NONE,
+                &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(uploadBuffer.ReleaseAndGetAddressOf()));
+            if (FAILED(hr)) {
+                error = HrMessage("CreateCommittedResource(world atlas upload) failed", hr);
+                m_worldStreamingStats.uploadFailures += 1;
+                return false;
+            }
+
+            uint8_t* mapped = nullptr;
+            D3D12_RANGE readRange{};
+            hr = uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+            if (FAILED(hr) || mapped == nullptr) {
+                error = HrMessage("Map(world atlas upload) failed", hr);
+                m_worldStreamingStats.uploadFailures += 1;
+                return false;
+            }
+            for (uint32_t row = 0; row < kWorldSatelliteTileSize; ++row) {
+                const uint8_t* src = upload.rgbaPixels + static_cast<size_t>(row) * static_cast<size_t>(rowBytes);
+                std::memcpy(mapped + static_cast<size_t>(row) * static_cast<size_t>(rowPitch), src, rowBytes);
+            }
+            uploadBuffer->Unmap(0, nullptr);
+
+            D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+            dstLoc.pResource = m_worldSatelliteAtlasTexture.Get();
+            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dstLoc.SubresourceIndex = 0;
+
+            D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+            srcLoc.pResource = uploadBuffer.Get();
+            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            srcLoc.PlacedFootprint.Offset = 0;
+            srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            srcLoc.PlacedFootprint.Footprint.Width = kWorldSatelliteTileSize;
+            srcLoc.PlacedFootprint.Footprint.Height = kWorldSatelliteTileSize;
+            srcLoc.PlacedFootprint.Footprint.Depth = 1;
+            srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
+
+            const UINT dstX = upload.atlasPageX * kWorldSatelliteTileSize;
+            const UINT dstY = upload.atlasPageY * kWorldSatelliteTileSize;
+            m_worldUploadCommandList->CopyTextureRegion(&dstLoc, dstX, dstY, 0, &srcLoc, nullptr);
+
+            uploadedBytes += uploadBytes;
+            transientUploads.push_back(std::move(uploadBuffer));
+        }
+
+        D3D12_RESOURCE_BARRIER toShader{};
+        toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toShader.Transition.pResource = m_worldSatelliteAtlasTexture.Get();
+        toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_worldUploadCommandList->ResourceBarrier(1, &toShader);
+    }
+
+    if (!pageTableUpdates.empty()) {
+        bool anyValid = false;
+        uint32_t minX = kWorldSatellitePageTableWidth;
+        uint32_t minY = kWorldSatellitePageTableHeight;
+        uint32_t maxX = 0;
+        uint32_t maxY = 0;
+        for (const WorldPageTableUpdate& u : pageTableUpdates) {
+            if (u.x >= kWorldSatellitePageTableWidth || u.y >= kWorldSatellitePageTableHeight) {
+                continue;
+            }
+            anyValid = true;
+            minX = std::min(minX, u.x);
+            minY = std::min(minY, u.y);
+            maxX = std::max(maxX, u.x);
+            maxY = std::max(maxY, u.y);
+            const size_t idx = static_cast<size_t>(u.y) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(u.x);
+            m_worldSatellitePageTableCpu[idx] = u.value;
+            const size_t keyIdx = idx * 2u;
+            m_worldSatellitePageKeyCpu[keyIdx + 0] = u.key0;
+            m_worldSatellitePageKeyCpu[keyIdx + 1] = u.key1;
+        }
+
+        if (anyValid) {
+            D3D12_RESOURCE_BARRIER toCopy[2]{};
+            toCopy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCopy[0].Transition.pResource = m_worldSatellitePageTableTexture.Get();
+            toCopy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toCopy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            toCopy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toCopy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCopy[1].Transition.pResource = m_worldSatellitePageKeyTexture.Get();
+            toCopy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            toCopy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_worldUploadCommandList->ResourceBarrier(2, toCopy);
+
+            const uint32_t rectW = (maxX - minX) + 1u;
+            const uint32_t rectH = (maxY - minY) + 1u;
+            const UINT pageRowBytes = rectW * sizeof(uint32_t);
+            const UINT pageRowPitch =
+                ((pageRowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
+                D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            const UINT64 pageUploadBytes = static_cast<UINT64>(pageRowPitch) * static_cast<UINT64>(rectH);
+
+            D3D12_HEAP_PROPERTIES uploadHeap{};
+            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC uploadDesc{};
+            uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            uploadDesc.Width = pageUploadBytes;
+            uploadDesc.Height = 1;
+            uploadDesc.DepthOrArraySize = 1;
+            uploadDesc.MipLevels = 1;
+            uploadDesc.SampleDesc.Count = 1;
+            uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            ComPtr<ID3D12Resource> uploadBuffer;
+            HRESULT hr = m_device->CreateCommittedResource(
+                &uploadHeap,
+                D3D12_HEAP_FLAG_NONE,
+                &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(uploadBuffer.ReleaseAndGetAddressOf()));
+            if (FAILED(hr)) {
+                error = HrMessage("CreateCommittedResource(world page table rect upload) failed", hr);
+                m_worldStreamingStats.uploadFailures += 1;
+                return false;
+            }
+
+            uint8_t* mapped = nullptr;
+            D3D12_RANGE readRange{};
+            hr = uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+            if (FAILED(hr) || mapped == nullptr) {
+                error = HrMessage("Map(world page table rect upload) failed", hr);
+                m_worldStreamingStats.uploadFailures += 1;
+                return false;
+            }
+            for (uint32_t row = 0; row < rectH; ++row) {
+                const uint32_t srcY = minY + row;
+                const uint32_t* src = m_worldSatellitePageTableCpu.data() +
+                    static_cast<size_t>(srcY) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(minX);
+                std::memcpy(mapped + static_cast<size_t>(row) * static_cast<size_t>(pageRowPitch), src, static_cast<size_t>(pageRowBytes));
+            }
+            uploadBuffer->Unmap(0, nullptr);
+
+            D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+            dstLoc.pResource = m_worldSatellitePageTableTexture.Get();
+            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dstLoc.SubresourceIndex = 0;
+
+            D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+            srcLoc.pResource = uploadBuffer.Get();
+            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            srcLoc.PlacedFootprint.Offset = 0;
+            srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_UINT;
+            srcLoc.PlacedFootprint.Footprint.Width = rectW;
+            srcLoc.PlacedFootprint.Footprint.Height = rectH;
+            srcLoc.PlacedFootprint.Footprint.Depth = 1;
+            srcLoc.PlacedFootprint.Footprint.RowPitch = pageRowPitch;
+
+            D3D12_BOX srcBox{};
+            srcBox.left = 0;
+            srcBox.top = 0;
+            srcBox.front = 0;
+            srcBox.right = rectW;
+            srcBox.bottom = rectH;
+            srcBox.back = 1;
+            m_worldUploadCommandList->CopyTextureRegion(&dstLoc, minX, minY, 0, &srcLoc, &srcBox);
+
+            uploadedBytes += pageUploadBytes;
+            transientUploads.push_back(std::move(uploadBuffer));
+
+            const UINT keyRowBytes = rectW * sizeof(uint32_t) * 2u;
+            const UINT keyRowPitch =
+                ((keyRowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
+                D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            const UINT64 keyUploadBytes = static_cast<UINT64>(keyRowPitch) * static_cast<UINT64>(rectH);
+
+            D3D12_RESOURCE_DESC keyUploadDesc{};
+            keyUploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            keyUploadDesc.Width = keyUploadBytes;
+            keyUploadDesc.Height = 1;
+            keyUploadDesc.DepthOrArraySize = 1;
+            keyUploadDesc.MipLevels = 1;
+            keyUploadDesc.SampleDesc.Count = 1;
+            keyUploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            ComPtr<ID3D12Resource> keyUploadBuffer;
+            hr = m_device->CreateCommittedResource(
+                &uploadHeap,
+                D3D12_HEAP_FLAG_NONE,
+                &keyUploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(keyUploadBuffer.ReleaseAndGetAddressOf()));
+            if (FAILED(hr)) {
+                error = HrMessage("CreateCommittedResource(world page key rect upload) failed", hr);
+                m_worldStreamingStats.uploadFailures += 1;
+                return false;
+            }
+
+            uint8_t* keyMapped = nullptr;
+            hr = keyUploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&keyMapped));
+            if (FAILED(hr) || keyMapped == nullptr) {
+                error = HrMessage("Map(world page key rect upload) failed", hr);
+                m_worldStreamingStats.uploadFailures += 1;
+                return false;
+            }
+            for (uint32_t row = 0; row < rectH; ++row) {
+                const uint32_t srcY = minY + row;
+                const uint32_t* src = m_worldSatellitePageKeyCpu.data() +
+                    ((static_cast<size_t>(srcY) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(minX)) * 2u);
+                std::memcpy(keyMapped + static_cast<size_t>(row) * static_cast<size_t>(keyRowPitch), src, static_cast<size_t>(keyRowBytes));
+            }
+            keyUploadBuffer->Unmap(0, nullptr);
+
+            D3D12_TEXTURE_COPY_LOCATION keyDstLoc{};
+            keyDstLoc.pResource = m_worldSatellitePageKeyTexture.Get();
+            keyDstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            keyDstLoc.SubresourceIndex = 0;
+
+            D3D12_TEXTURE_COPY_LOCATION keySrcLoc{};
+            keySrcLoc.pResource = keyUploadBuffer.Get();
+            keySrcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            keySrcLoc.PlacedFootprint.Offset = 0;
+            keySrcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32_UINT;
+            keySrcLoc.PlacedFootprint.Footprint.Width = rectW;
+            keySrcLoc.PlacedFootprint.Footprint.Height = rectH;
+            keySrcLoc.PlacedFootprint.Footprint.Depth = 1;
+            keySrcLoc.PlacedFootprint.Footprint.RowPitch = keyRowPitch;
+
+            m_worldUploadCommandList->CopyTextureRegion(&keyDstLoc, minX, minY, 0, &keySrcLoc, &srcBox);
+
+            D3D12_RESOURCE_BARRIER toShader[2]{};
+            toShader[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toShader[0].Transition.pResource = m_worldSatellitePageTableTexture.Get();
+            toShader[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            toShader[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toShader[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toShader[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toShader[1].Transition.pResource = m_worldSatellitePageKeyTexture.Get();
+            toShader[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            toShader[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toShader[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_worldUploadCommandList->ResourceBarrier(2, toShader);
+
+            uploadedBytes += keyUploadBytes;
+            transientUploads.push_back(std::move(keyUploadBuffer));
+        }
+    }
+
+    if (FAILED(m_worldUploadCommandList->Close())) {
+        error = "World upload command list close failed";
+        m_worldStreamingStats.uploadFailures += 1;
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_worldUploadCommandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    const UINT64 uploadFence = ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), uploadFence);
+    m_worldUploadFenceValue = uploadFence;
+
+    for (auto& res : transientUploads) {
+        DeferredResource d{};
+        d.resource = std::move(res);
+        d.safeFenceValue = uploadFence;
+        m_retiredResources.push_back(std::move(d));
+    }
+
+    m_worldStreamingStats.resourcesReady = true;
+    m_worldStreamingStats.uploadBatches += 1;
+    m_worldStreamingStats.atlasPageUploads += pageUploads.size();
+    m_worldStreamingStats.pageTableWrites += pageTableUpdates.size();
+    m_worldStreamingStats.uploadBytes += uploadedBytes;
+    return true;
+}
+
 void D3D12Renderer::WaitForFrame(UINT frameIndex) {
     if (m_fence->GetCompletedValue() < m_frames[frameIndex].fenceValue) {
         m_fence->SetEventOnCompletion(m_frames[frameIndex].fenceValue, m_fenceEvent);
@@ -2988,6 +3612,9 @@ void D3D12Renderer::CleanupDeferredTerrainResources() {
             upload.Reset();
         }
         m_satelliteUploadFenceValue = 0;
+    }
+    if (m_worldUploadFenceValue != 0 && completed >= m_worldUploadFenceValue) {
+        m_worldUploadFenceValue = 0;
     }
 
     auto it = m_retiredTerrainMeshes.begin();

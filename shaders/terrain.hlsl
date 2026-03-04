@@ -13,6 +13,9 @@ Texture2D<float4> gSatelliteFar : register(t10);
 Texture2D<float4> gSatellitePrevNear : register(t11);
 Texture2D<float4> gSatellitePrevMid : register(t12);
 Texture2D<float4> gSatellitePrevFar : register(t13);
+Texture2D<float4> gWorldSatelliteAtlas : register(t19);
+Texture2D<uint> gWorldSatellitePageTable : register(t20);
+Texture2D<uint2> gWorldSatellitePageKeys : register(t21);
 
 SamplerState gWrapSampler : register(s0);
 SamplerState gClampSampler : register(s1);
@@ -33,7 +36,9 @@ cbuffer ObjectCB : register(b1)
     float4 gTuning9; // previous streamed mid  bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning10; // previous streamed far bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning11; // x prevNearValid, y prevMidValid, z prevFarValid, w transition [0..1] old->new
-    float4 gTuning12; // x terrain layer alpha
+    float4 gTuning12; // x terrain layer alpha, y worldLockedEnabled, z worldLockedBlend, w unused
+    float4 gTuning13; // x atlasPagesX, y atlasPagesY, z pageTableWidth, w pageTableHeight
+    float4 gTuning14; // x nearZoom, y midZoom, z farZoom, w maxPageTableProbeCount
 };
 
 struct VSInput
@@ -82,12 +87,21 @@ float3 TerrainColor(float heightMeters)
     return (h01 < 0.55) ? lerp(low, mid, h01 / 0.55) : lerp(mid, high, (h01 - 0.55) / 0.45);
 }
 
+float LatDegToMercatorY(float latDeg)
+{
+    const float clampedLat = clamp(latDeg, -85.05112878, 85.05112878);
+    const float latRad = radians(clampedLat);
+    return log(tan(latRad) + rcp(cos(latRad)));
+}
+
 float2 MapLonLatToRingUv(float lonDeg, float latDeg, float4 boundsLonLat, out bool inside)
 {
     inside = false;
     const float lonSpan = boundsLonLat.y - boundsLonLat.x;
-    const float latSpan = boundsLonLat.w - boundsLonLat.z;
-    if (abs(lonSpan) < 1e-5 || abs(latSpan) < 1e-5)
+    const float mercSouth = LatDegToMercatorY(boundsLonLat.z);
+    const float mercNorth = LatDegToMercatorY(boundsLonLat.w);
+    const float mercSpan = mercNorth - mercSouth;
+    if (abs(lonSpan) < 1e-5 || abs(mercSpan) < 1e-6)
     {
         return float2(0.0, 0.0);
     }
@@ -103,9 +117,159 @@ float2 MapLonLatToRingUv(float lonDeg, float latDeg, float4 boundsLonLat, out bo
     }
 
     const float u = (lonAdj - boundsLonLat.x) / lonSpan;
-    const float v = (boundsLonLat.w - latDeg) / latSpan;
+    const float mercLat = LatDegToMercatorY(latDeg);
+    const float v = (mercNorth - mercLat) / mercSpan;
     inside = (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0);
     return float2(u, v);
+}
+
+uint WorldHashTileKey(uint z, uint x, uint y)
+{
+    uint h = 2166136261u;
+    h = (h ^ z) * 16777619u;
+    h = (h ^ x) * 16777619u;
+    h = (h ^ y) * 16777619u;
+    return h;
+}
+
+uint PackWorldKey0(uint z, uint x)
+{
+    return ((z & 63u) << 26u) | (x & 0x03FFFFFFu);
+}
+
+uint PackWorldKey1(uint y)
+{
+    return y & 0x03FFFFFFu;
+}
+
+uint WrapTileXSigned(int x, uint n)
+{
+    int r = x % int(n);
+    if (r < 0)
+    {
+        r += int(n);
+    }
+    return uint(r);
+}
+
+bool LookupWorldAtlasPage(uint z, uint x, uint y, out uint atlasPageIndex)
+{
+    atlasPageIndex = 0u;
+    const uint tableW = max(uint(gTuning13.z), 1u);
+    const uint tableH = max(uint(gTuning13.w), 1u);
+    const uint slotCount = tableW * tableH;
+    if (slotCount == 0u)
+    {
+        return false;
+    }
+
+    const uint key0 = PackWorldKey0(z, x);
+    const uint key1 = PackWorldKey1(y);
+    const uint start = WorldHashTileKey(z, x, y) % slotCount;
+    const uint maxProbe = min(max(uint(gTuning14.w), 1u), 4u);
+    [loop]
+    for (uint p = 0u; p < maxProbe; ++p)
+    {
+        const uint slot = (start + p) % slotCount;
+        const uint2 coord = uint2(slot % tableW, slot / tableW);
+        const uint value = gWorldSatellitePageTable.Load(int3(coord, 0));
+        if ((value & 0x80000000u) == 0u)
+        {
+            // Zero means never-used slot (end of chain). Tombstones have 0x40000000 set.
+            if (value == 0u)
+            {
+                return false;
+            }
+            continue;
+        }
+
+        const uint2 packedKey = gWorldSatellitePageKeys.Load(int3(coord, 0));
+        if (packedKey.x == key0 && packedKey.y == key1 && ((value & 0x80000000u) != 0u))
+        {
+            atlasPageIndex = value & 0x00FFFFFFu;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SampleWorldAtlasTile(int z, int tileXi, int tileYi, float2 localUv, out float4 sampleOut)
+{
+    sampleOut = 0.0;
+    if (z < 0 || z > 22)
+    {
+        return false;
+    }
+
+    const uint n = (1u << uint(z));
+    const uint x = WrapTileXSigned(tileXi, n);
+    const uint y = uint(clamp(tileYi, 0, int(n) - 1));
+
+    uint atlasPageIndex = 0u;
+    if (!LookupWorldAtlasPage(uint(z), x, y, atlasPageIndex))
+    {
+        return false;
+    }
+
+    const uint atlasPagesX = max(uint(gTuning13.x), 1u);
+    const uint atlasPagesY = max(uint(gTuning13.y), 1u);
+    const uint atlasPageCount = atlasPagesX * atlasPagesY;
+    if (atlasPageIndex >= atlasPageCount)
+    {
+        return false;
+    }
+
+    const uint pageX = atlasPageIndex % atlasPagesX;
+    const uint pageY = atlasPageIndex / atlasPagesX;
+
+    // Keep sampling away from atlas page borders to avoid unrelated-page bilinear bleed.
+    const float guard = 0.5 / 256.0;
+    const float2 guardedUv = clamp(localUv, float2(guard, guard), float2(1.0 - guard, 1.0 - guard));
+    const float2 atlasUv = (float2(pageX, pageY) + guardedUv) / float2(atlasPagesX, atlasPagesY);
+    sampleOut = gWorldSatelliteAtlas.SampleLevel(gClampSampler, atlasUv, 0.0);
+    return sampleOut.a > 0.001;
+}
+
+bool SampleWorldLonLatSeamAware(float lonDeg, float latDeg, int z, out float4 sampleOut)
+{
+    sampleOut = 0.0;
+    if (z < 0 || z > 22)
+    {
+        return false;
+    }
+
+    const float n = exp2(float(z));
+    const float x = (lonDeg + 180.0) / 360.0 * n;
+    const float latRad = radians(clamp(latDeg, -85.05112878, 85.05112878));
+    const float y = (1.0 - log(tan(latRad) + rcp(cos(latRad))) / kPi) * 0.5 * n;
+
+    const int tileXi = int(floor(x));
+    const int tileYi = int(floor(y));
+    const float2 localUv = float2(frac(x), frac(y));
+
+    return SampleWorldAtlasTile(z, tileXi, tileYi, localUv, sampleOut);
+}
+
+bool SampleWorldHierarchical(
+    float lonDeg,
+    float latDeg,
+    int preferredZoom,
+    int fallbackZoomA,
+    int fallbackZoomB,
+    out float4 sampleOut)
+{
+    sampleOut = 0.0;
+    const int z0 = clamp(preferredZoom, 0, 22);
+    const int z1 = clamp(preferredZoom - 1, 0, 22);
+    const int z2 = clamp(fallbackZoomA, 0, 22);
+    const int z3 = clamp(fallbackZoomB, 0, 22);
+
+    float4 s = 0.0;
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z0, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z1, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z2, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z3, s)) { sampleOut = s; return true; }
+    return false;
 }
 
 float4 PSMain(VSOutput input) : SV_Target
@@ -172,12 +336,71 @@ float4 PSMain(VSOutput input) : SV_Target
             }
         }
 
-        if (gTuning2.w > 0.5)
-        {
-            const float nearWeight = 1.0 - saturate(smoothstep(boundary0 - transitionWidth, boundary1 + transitionWidth, distMeters));
-            const float farWeight = saturate(smoothstep(boundary1 - transitionWidth, boundary2 + transitionWidth, distMeters));
-            const float midWeight = saturate(1.0 - nearWeight - farWeight);
+        const float nearWeight = 1.0 - saturate(smoothstep(boundary0 - transitionWidth, boundary1 + transitionWidth, distMeters));
+        const float farWeight = saturate(smoothstep(boundary1 - transitionWidth, boundary2 + transitionWidth, distMeters));
+        const float midWeight = saturate(1.0 - nearWeight - farWeight);
 
+        const bool worldLockedEnabled = (gTuning12.y > 0.5);
+        if (worldLockedEnabled)
+        {
+            int nearZoom = int(gTuning14.x + 0.5);
+            int midZoom = int(gTuning14.y + 0.5);
+            int farZoom = int(gTuning14.z + 0.5);
+
+            // Fallback if CPU profile is invalid for any reason.
+            if (nearZoom <= 0 || midZoom <= 0 || farZoom <= 0)
+            {
+                const float camAltMeters = max(0.0, length(CameraPosition() - PlanetCenter()) - GroundRadiusMeters());
+                if (camAltMeters < 500.0)      { nearZoom = 16; midZoom = 15; farZoom = 13; }
+                else if (camAltMeters < 2000.0) { nearZoom = 15; midZoom = 14; farZoom = 12; }
+                else if (camAltMeters < 6000.0) { nearZoom = 14; midZoom = 13; farZoom = 11; }
+                else                            { nearZoom = 13; midZoom = 12; farZoom = 10; }
+            }
+
+            float3 worldAccum = 0.0;
+            float worldW = 0.0;
+
+            if (nearWeight > 1e-4)
+            {
+                float4 s;
+                if (SampleWorldHierarchical(lonDeg, latDeg, nearZoom, midZoom, farZoom, s))
+                {
+                    const float w = nearWeight * saturate(max(s.a, 0.001));
+                    worldAccum += s.rgb * w;
+                    worldW += w;
+                }
+            }
+            if (midWeight > 1e-4)
+            {
+                float4 s;
+                if (SampleWorldHierarchical(lonDeg, latDeg, midZoom, farZoom, nearZoom - 2, s))
+                {
+                    const float w = midWeight * saturate(max(s.a, 0.001));
+                    worldAccum += s.rgb * w;
+                    worldW += w;
+                }
+            }
+            if (farWeight > 1e-4)
+            {
+                float4 s;
+                if (SampleWorldHierarchical(lonDeg, latDeg, farZoom, farZoom - 1, farZoom - 2, s))
+                {
+                    const float w = farWeight * saturate(max(s.a, 0.001));
+                    worldAccum += s.rgb * w;
+                    worldW += w;
+                }
+            }
+
+            if (worldW > 1e-4)
+            {
+                const float3 streamed = worldAccum / worldW;
+                const float blend = saturate(worldW * gTuning12.z);
+                satelliteColor = haveFallback ? lerp(satelliteColor, streamed, blend) : streamed;
+                haveFallback = true;
+            }
+        }
+        else if (gTuning2.w > 0.5)
+        {
             float3 streamAccum = 0.0;
             float streamW = 0.0;
             float3 prevAccum = 0.0;

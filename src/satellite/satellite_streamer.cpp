@@ -67,6 +67,15 @@ double LatToTileY(double latDeg, int z) {
     return std::clamp(y, 0.0, n - 1.0e-6);
 }
 
+double LatDegToMercatorY(double latDeg) {
+    const double latRad = flight::DegToRad(ClampLatDeg(latDeg));
+    return std::log(std::tan(latRad) + 1.0 / std::cos(latRad));
+}
+
+double MercatorYToLatDeg(double mercatorY) {
+    return flight::RadToDeg(std::atan(std::sinh(mercatorY)));
+}
+
 double TileYToLatDeg(double y, int z) {
     const double n = static_cast<double>(1u << z);
     const double merc = kPi * (1.0 - 2.0 * (y / n));
@@ -322,6 +331,7 @@ struct SatelliteStreamer::Impl {
     bool EnqueueTileRequest(const TileKey& key, bool highPriority) {
         std::scoped_lock<std::mutex> lock(mutex);
         if (tileCache.find(key) != tileCache.end()) {
+            TouchLru(key);
             return false;
         }
         if (queuedSet.find(key) != queuedSet.end()) {
@@ -852,12 +862,29 @@ struct SatelliteStreamer::Impl {
 
             const double fx = x - std::floor(x);
             const double fy = y - std::floor(y);
-            const int px = std::clamp(static_cast<int>(fx * 255.0), 0, 255);
-            const int py = std::clamp(static_cast<int>(fy * 255.0), 0, 255);
-            const size_t idx = (static_cast<size_t>(py) * 256u + static_cast<size_t>(px)) * 4u;
-            outColor[0] = (*found->second)[idx + 0];
-            outColor[1] = (*found->second)[idx + 1];
-            outColor[2] = (*found->second)[idx + 2];
+            const double pxf = fx * 255.0;
+            const double pyf = fy * 255.0;
+            const int px0 = std::clamp(static_cast<int>(std::floor(pxf)), 0, 255);
+            const int py0 = std::clamp(static_cast<int>(std::floor(pyf)), 0, 255);
+            const int px1 = std::min(px0 + 1, 255);
+            const int py1 = std::min(py0 + 1, 255);
+            const float tx = static_cast<float>(pxf - static_cast<double>(px0));
+            const float ty = static_cast<float>(pyf - static_cast<double>(py0));
+
+            const auto sampleChannel = [&](int xPx, int yPx, int channel) -> float {
+                const size_t idx = (static_cast<size_t>(yPx) * 256u + static_cast<size_t>(xPx)) * 4u + static_cast<size_t>(channel);
+                return static_cast<float>((*found->second)[idx]);
+            };
+            for (int c = 0; c < 3; ++c) {
+                const float c00 = sampleChannel(px0, py0, c);
+                const float c10 = sampleChannel(px1, py0, c);
+                const float c01 = sampleChannel(px0, py1, c);
+                const float c11 = sampleChannel(px1, py1, c);
+                const float c0 = c00 + (c10 - c00) * tx;
+                const float c1 = c01 + (c11 - c01) * tx;
+                const float value = c0 + (c1 - c0) * ty;
+                outColor[c] = static_cast<uint8_t>(std::clamp(std::lround(value), 0l, 255l));
+            }
             outColor[3] = 0;
             outSampleZoom = z;
             return true;
@@ -900,11 +927,15 @@ struct SatelliteStreamer::Impl {
         const double tileLonEBase = (static_cast<double>(key.x + 1) / static_cast<double>(n)) * 360.0 - 180.0;
         const double tileLatN = TileYToLatDeg(static_cast<double>(key.y), key.z);
         const double tileLatS = TileYToLatDeg(static_cast<double>(key.y + 1), key.z);
+        const double tileMercN = LatDegToMercatorY(tileLatN);
+        const double tileMercS = LatDegToMercatorY(tileLatS);
 
         const double ringLonW = ring.boundsLonLat.x;
         const double ringLonE = ring.boundsLonLat.y;
         const double ringLatS = ring.boundsLonLat.z;
         const double ringLatN = ring.boundsLonLat.w;
+        const double ringMercS = LatDegToMercatorY(ringLatS);
+        const double ringMercN = LatDegToMercatorY(ringLatN);
         const double ringLonCenter = 0.5 * (ringLonW + ringLonE);
         const double tileLonCenterBase = 0.5 * (tileLonWBase + tileLonEBase);
         const double wrapShift = std::round((ringLonCenter - tileLonCenterBase) / 360.0) * 360.0;
@@ -913,23 +944,23 @@ struct SatelliteStreamer::Impl {
 
         const double interLonW = std::max(ringLonW, tileLonW);
         const double interLonE = std::min(ringLonE, tileLonE);
-        const double interLatS = std::max(ringLatS, tileLatS);
-        const double interLatN = std::min(ringLatN, tileLatN);
-        if (interLonW >= interLonE || interLatS >= interLatN) {
+        const double interMercS = std::max(ringMercS, tileMercS);
+        const double interMercN = std::min(ringMercN, tileMercN);
+        if (interLonW >= interLonE || interMercS >= interMercN) {
             return false;
         }
 
         const double lonSpan = ringLonE - ringLonW;
-        const double latSpan = ringLatN - ringLatS;
-        if (lonSpan <= 1e-9 || latSpan <= 1e-9) {
+        const double mercSpan = ringMercN - ringMercS;
+        if (lonSpan <= 1e-9 || mercSpan <= 1e-9) {
             return false;
         }
 
         constexpr int kPad = 2;
         const double u0 = (interLonW - ringLonW) / lonSpan;
         const double u1 = (interLonE - ringLonW) / lonSpan;
-        const double v0 = (ringLatN - interLatN) / latSpan;
-        const double v1 = (ringLatN - interLatS) / latSpan;
+        const double v0 = (ringMercN - interMercN) / mercSpan;
+        const double v1 = (ringMercN - interMercS) / mercSpan;
 
         int x0 = static_cast<int>(std::floor(u0 * static_cast<double>(ring.width))) - kPad;
         int x1 = static_cast<int>(std::ceil(u1 * static_cast<double>(ring.width))) + kPad;
@@ -966,12 +997,15 @@ struct SatelliteStreamer::Impl {
         const double lonE = ring.boundsLonLat.y;
         const double latS = ring.boundsLonLat.z;
         const double latN = ring.boundsLonLat.w;
+        const double mercS = LatDegToMercatorY(latS);
+        const double mercN = LatDegToMercatorY(latN);
         const double invW = 1.0 / static_cast<double>(ring.width);
         const double invH = 1.0 / static_cast<double>(ring.height);
         constexpr double kEdgeFeather = 0.08;
         for (uint32_t y = yBegin; y < yEndExclusive; ++y) {
             const double v = (static_cast<double>(y) + 0.5) * invH;
-            const double lat = latN + (latS - latN) * v;
+            const double merc = mercN + (mercS - mercN) * v;
+            const double lat = MercatorYToLatDeg(merc);
             for (uint32_t x = xBegin; x < xEndExclusive; ++x) {
                 const double u = (static_cast<double>(x) + 0.5) * invW;
                 const double lon = lonW + (lonE - lonW) * u;
@@ -1092,7 +1126,6 @@ struct SatelliteStreamer::Impl {
         const double nearRecenterMeters = std::clamp(targetRings[0].radiusKm * 1000.0 * 0.65, 9000.0, 65000.0);
         const double nearSnapMeters = std::clamp(nearRecenterMeters * 0.30, 3000.0, 22000.0);
         const double midFarRecenterMeters = std::clamp(targetRings[1].radiusKm * 1000.0 * 0.30, 3500.0, 32000.0);
-        const double midFarSnapMeters = std::clamp(midFarRecenterMeters * 0.55, 2000.0, 16000.0);
 
         const bool nearMoved =
             !hasNearState || DistanceMeters(lastNearComposeLatDeg, lastNearComposeLonDeg, latDeg, lonDeg) > nearRecenterMeters;
@@ -1107,7 +1140,8 @@ struct SatelliteStreamer::Impl {
         const bool needsNearCompose =
             force || !hasNearState || dirty || nearMoved || nearRadiusChanged || (nearZoomTargetChanged && allowNearZoomChange);
         const bool needsMidFarCompose =
-            force || !hasMidFarState || dirty || midFarMoved || midZoomChanged || farZoomChanged || midRadiusChanged || farRadiusChanged;
+            force || !hasMidFarState || dirty || nearMoved || midFarMoved || midZoomChanged || farZoomChanged || midRadiusChanged ||
+            farRadiusChanged;
 
         if (!needsNearCompose && !needsMidFarCompose) {
             return false;
@@ -1122,14 +1156,8 @@ struct SatelliteStreamer::Impl {
             pickCenter(latDeg, lonDeg, nearSnapMeters, nearLatDeg, nearLonDeg);
         }
 
-        double midFarLatDeg = latDeg;
-        double midFarLonDeg = WrapLonDeg(lonDeg);
-        if (hasMidFarState && !force && !midFarMoved) {
-            midFarLatDeg = lastMidFarComposeLatDeg;
-            midFarLonDeg = lastMidFarComposeLonDeg;
-        } else {
-            pickCenter(latDeg, lonDeg, midFarSnapMeters, midFarLatDeg, midFarLonDeg);
-        }
+        double midFarLatDeg = nearLatDeg;
+        double midFarLonDeg = nearLonDeg;
 
         bool dirtyTilesRemaining = false;
         std::vector<TileKey> dirtyTilesForCompose;
@@ -1210,6 +1238,43 @@ struct SatelliteStreamer::Impl {
         return true;
     }
 
+    bool QueueTileRequest(int zoom, int tileX, int tileY, bool highPriority) {
+        if (!initialized || zoom < 0 || zoom > 22) {
+            return false;
+        }
+        const int n = 1 << zoom;
+        TileKey key{};
+        key.z = zoom;
+        key.x = WrapTileX(tileX, n);
+        key.y = std::clamp(tileY, 0, n - 1);
+        return EnqueueTileRequest(key, highPriority);
+    }
+
+    bool TryGetCachedTileRgba(
+        int zoom,
+        int tileX,
+        int tileY,
+        std::shared_ptr<const std::vector<uint8_t>>& outPixels) {
+        outPixels.reset();
+        if (!initialized || zoom < 0 || zoom > 22) {
+            return false;
+        }
+        const int n = 1 << zoom;
+        TileKey key{};
+        key.z = zoom;
+        key.x = WrapTileX(tileX, n);
+        key.y = std::clamp(tileY, 0, n - 1);
+
+        std::scoped_lock<std::mutex> lock(mutex);
+        const auto found = tileCache.find(key);
+        if (found == tileCache.end() || !found->second.rgbaPixels) {
+            return false;
+        }
+        TouchLru(key);
+        outPixels = found->second.rgbaPixels;
+        return true;
+    }
+
     StreamStats Stats() const {
         StreamStats s{};
         s.diskHits = diskHits.load();
@@ -1269,6 +1334,25 @@ bool SatelliteStreamer::ComposeLodRings(
         return false;
     }
     return m_impl->ComposeLodRings(latDeg, lonDeg, altitudeMeters, force, outRings, error);
+}
+
+bool SatelliteStreamer::QueueTileRequest(int zoom, int tileX, int tileY, bool highPriority) {
+    if (!m_impl) {
+        return false;
+    }
+    return m_impl->QueueTileRequest(zoom, tileX, tileY, highPriority);
+}
+
+bool SatelliteStreamer::TryGetCachedTileRgba(
+    int zoom,
+    int tileX,
+    int tileY,
+    std::shared_ptr<const std::vector<uint8_t>>& outPixels) {
+    if (!m_impl) {
+        outPixels.reset();
+        return false;
+    }
+    return m_impl->TryGetCachedTileRgba(zoom, tileX, tileY, outPixels);
 }
 
 StreamStats SatelliteStreamer::GetStats() const {

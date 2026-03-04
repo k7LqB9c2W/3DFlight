@@ -33,6 +33,29 @@ public:
         bool valid = false;
     };
 
+    struct WorldAtlasPageUpload {
+        const uint8_t* rgbaPixels = nullptr;
+        uint32_t atlasPageX = 0;
+        uint32_t atlasPageY = 0;
+    };
+
+    struct WorldPageTableUpdate {
+        uint32_t x = 0;
+        uint32_t y = 0;
+        uint32_t key0 = 0;
+        uint32_t key1 = 0;
+        uint32_t value = 0;
+    };
+
+    struct WorldStreamingStats {
+        bool resourcesReady = false;
+        uint64_t uploadBatches = 0;
+        uint64_t atlasPageUploads = 0;
+        uint64_t pageTableWrites = 0;
+        uint64_t uploadBytes = 0;
+        uint64_t uploadFailures = 0;
+    };
+
     struct TerrainVisualSettings {
         float colorHeightMaxMeters = 6000.0f;
         float lodTransitionWidthMeters = 5000.0f;
@@ -66,6 +89,10 @@ public:
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
     bool SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
     bool SetSatelliteLodTextures(const std::array<SatelliteLodTexture, 3>& lods, std::string& error);
+    bool UploadWorldLockedSatelliteData(
+        const std::vector<WorldAtlasPageUpload>& pageUploads,
+        const std::vector<WorldPageTableUpdate>& pageTableUpdates,
+        std::string& error);
     bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, const DirectX::XMFLOAT4& renderParams, std::string& error);
     void SetTerrainVisualSettings(const TerrainVisualSettings& settings);
     [[nodiscard]] const TerrainVisualSettings& GetTerrainVisualSettings() const { return m_terrainVisualSettings; }
@@ -91,6 +118,12 @@ public:
     [[nodiscard]] const std::filesystem::path& SatelliteSourcePath() const { return m_earthAlbedoSourcePath; }
     [[nodiscard]] DirectX::XMFLOAT4 SatelliteLonLatBounds() const { return m_earthAlbedoBoundsLonLat; }
     [[nodiscard]] bool SatelliteWrapsLongitude() const { return m_earthAlbedoWrapLon > 0.5f; }
+    void SetWorldLockedSatelliteEnabled(bool enabled) { m_worldLockedSatelliteEnabled = enabled; }
+    [[nodiscard]] bool IsWorldLockedSatelliteEnabled() const { return m_worldLockedSatelliteEnabled; }
+    void SetWorldSamplingZooms(int nearZoom, int midZoom, int farZoom) {
+        m_worldSamplingZooms = {nearZoom, midZoom, farZoom};
+    }
+    [[nodiscard]] WorldStreamingStats GetWorldStreamingStats() const { return m_worldStreamingStats; }
 
 private:
     static constexpr UINT kFrameCount = 2;
@@ -112,6 +145,9 @@ private:
     //   t12 -> descriptor 13
     //   t13 -> descriptor 14
     //   t14 -> descriptor 15
+    //   t19 -> descriptor 20 (world atlas)
+    //   t20 -> descriptor 21 (world page table values)
+    //   t21 -> descriptor 22 (world page table keys)
     static constexpr UINT kSatelliteNearSrvIndex = 9;
     static constexpr UINT kSatelliteMidSrvIndex = 10;
     static constexpr UINT kSatelliteFarSrvIndex = 11;
@@ -119,11 +155,19 @@ private:
     static constexpr UINT kSatellitePrevMidSrvIndex = 13;
     static constexpr UINT kSatellitePrevFarSrvIndex = 14;
     static constexpr UINT kModelAlbedoSrvIndex = 15;
+    static constexpr UINT kWorldSatelliteAtlasSrvIndex = 20;
+    static constexpr UINT kWorldSatellitePageTableSrvIndex = 21;
+    static constexpr UINT kWorldSatellitePageKeySrvIndex = 22;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
     static constexpr UINT kMultipleScatteringUavIndex = kUavTableStartIndex + 2;
     static constexpr UINT kAerialPerspectiveUavIndex = kUavTableStartIndex + 3;
+    static constexpr uint32_t kWorldSatelliteTileSize = 256;
+    static constexpr uint32_t kWorldSatelliteAtlasPagesX = 16;
+    static constexpr uint32_t kWorldSatelliteAtlasPagesY = 16;
+    static constexpr uint32_t kWorldSatellitePageTableWidth = 1024;
+    static constexpr uint32_t kWorldSatellitePageTableHeight = 1024;
 
     struct FrameContext {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -182,6 +226,8 @@ private:
         DirectX::XMFLOAT4 tuning10{};
         DirectX::XMFLOAT4 tuning11{};
         DirectX::XMFLOAT4 tuning12{};
+        DirectX::XMFLOAT4 tuning13{};
+        DirectX::XMFLOAT4 tuning14{};
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -190,6 +236,7 @@ private:
     bool CreatePipeline(std::string& error);
     bool CreateConstantBuffers(std::string& error);
     bool CreateAtmosphereResources(std::string& error);
+    bool CreateWorldStreamingResources(ID3D12GraphicsCommandList* commandList, std::string& error);
     void DispatchAtmosphereLuts(ID3D12GraphicsCommandList* commandList, const SceneConstants& sceneCb);
     bool CreateLandmaskTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreateSkyboxTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
@@ -267,6 +314,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_uploadCommandList;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_satelliteUploadAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_satelliteUploadCommandList;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_worldUploadAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_worldUploadCommandList;
 
     std::array<FrameContext, kFrameCount> m_frames;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_renderTargets;
@@ -313,6 +362,7 @@ private:
     std::vector<DeferredResource> m_retiredResources;
     UINT64 m_terrainUploadFenceValue = 0;
     UINT64 m_satelliteUploadFenceValue = 0;
+    UINT64 m_worldUploadFenceValue = 0;
     Double3 m_terrainAnchorEcef{};
     Double3 m_prevTerrainAnchorEcef{};
     DirectX::XMFLOAT4 m_terrainRenderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
@@ -358,13 +408,22 @@ private:
         DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f}};
     std::array<float, 3> m_satellitePrevLodValid{0.0f, 0.0f, 0.0f};
     std::chrono::steady_clock::time_point m_satelliteTransitionStart{};
-    float m_satelliteTransitionDurationSeconds = 0.55f;
+    float m_satelliteTransitionDurationSeconds = 0.22f;
     float m_satelliteTransitionT = 1.0f;
     bool m_satelliteTransitionActive = false;
     std::filesystem::path m_earthAlbedoSourcePath;
     bool m_hasEarthAlbedoSourceFile = false;
     DirectX::XMFLOAT4 m_earthAlbedoBoundsLonLat = {-180.0f, 180.0f, -90.0f, 90.0f}; // lonW, lonE, latS, latN
     float m_earthAlbedoWrapLon = 1.0f;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_worldSatelliteAtlasTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_worldSatellitePageTableTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_worldSatellitePageKeyTexture;
+    std::vector<uint32_t> m_worldSatellitePageTableCpu;
+    std::vector<uint32_t> m_worldSatellitePageKeyCpu;
+    bool m_worldStreamingResourcesReady = false;
+    bool m_worldLockedSatelliteEnabled = false;
+    std::array<int, 3> m_worldSamplingZooms{13, 12, 10};
+    WorldStreamingStats m_worldStreamingStats{};
     Microsoft::WRL::ComPtr<ID3D12Resource> m_transmittanceLut;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyViewLut;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_multipleScatteringLut;

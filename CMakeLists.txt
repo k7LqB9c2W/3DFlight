@@ -30,6 +30,8 @@ add_executable(3DFlight WIN32
     src/terrain/terrain_mesh.h
     src/satellite/satellite_streamer.cpp
     src/satellite/satellite_streamer.h
+    src/satellite/world_tile_system.cpp
+    src/satellite/world_tile_system.h
     third_party/cgltf/cgltf.c
 )
 

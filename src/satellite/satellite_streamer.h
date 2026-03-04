@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -59,6 +60,12 @@ public:
         bool force,
         std::array<RingTexture, 3>& outRings,
         std::string& error);
+    bool QueueTileRequest(int zoom, int tileX, int tileY, bool highPriority);
+    bool TryGetCachedTileRgba(
+        int zoom,
+        int tileX,
+        int tileY,
+        std::shared_ptr<const std::vector<uint8_t>>& outPixels);
 
     [[nodiscard]] StreamStats GetStats() const;
 
