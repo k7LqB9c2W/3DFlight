@@ -33,6 +33,7 @@ cbuffer ObjectCB : register(b1)
     float4 gTuning9; // previous streamed mid  bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning10; // previous streamed far bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning11; // x prevNearValid, y prevMidValid, z prevFarValid, w transition [0..1] old->new
+    float4 gTuning12; // x terrain layer alpha
 };
 
 struct VSInput
@@ -304,5 +305,5 @@ float4 PSMain(VSOutput input) : SV_Target
 
     color = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), color);
     color = 1.0 - exp(-color * max(gAtmosphereFlags.z, 0.01));
-    return float4(saturate(color), 1.0);
+    return float4(saturate(color), saturate(gTuning12.x));
 }

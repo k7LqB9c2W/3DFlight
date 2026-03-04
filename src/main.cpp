@@ -106,6 +106,15 @@ void OffsetLatLonMeters(double latDeg, double lonDeg, double northMeters, double
     outLonDeg = WrapLonDeg(lonDeg + dLonDeg);
 }
 
+void QuantizeLatLonMeters(double latDeg, double lonDeg, double gridMeters, double& outLatDeg, double& outLonDeg) {
+    const double g = std::max(10.0, gridMeters);
+    const double stepLatDeg = flight::RadToDeg(g / flight::kEarthRadiusMeters);
+    const double cosLat = std::max(0.20, std::cos(flight::DegToRad(latDeg)));
+    const double stepLonDeg = flight::RadToDeg(g / (flight::kEarthRadiusMeters * cosLat));
+    outLatDeg = std::clamp(std::round(latDeg / stepLatDeg) * stepLatDeg, -89.999, 89.999);
+    outLonDeg = WrapLonDeg(std::round(lonDeg / stepLonDeg) * stepLonDeg);
+}
+
 bool IsLonLatInsideBounds(double latDeg, double lonDeg, const DirectX::XMFLOAT4& boundsLonLat) {
     if (latDeg < boundsLonLat.z || latDeg > boundsLonLat.w) {
         return false;
@@ -791,9 +800,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg";
         satCfg.nearTextureSize = 512;
         satCfg.midTextureSize = 512;
-        satCfg.farTextureSize = 256;
-        satCfg.maxMemoryTiles = 768;
-        satCfg.workerCount = 4;
+        satCfg.farTextureSize = 384;
+        satCfg.maxMemoryTiles = 2048;
+        satCfg.workerCount = 12;
         std::string satError;
         if (satelliteStreamer.Initialize(satCfg, satError)) {
             satelliteStreamerReady = true;
@@ -844,6 +853,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     bool havePatchCenter = false;
     double patchCenterLatDeg = 0.0;
     double patchCenterLonDeg = 0.0;
+    double lastTerrainBuildCenterLatDeg = 0.0;
+    double lastTerrainBuildCenterLonDeg = 0.0;
+    bool haveTerrainBuildCenter = false;
+    double terrainBuildCooldownSeconds = 0.0;
 
     bool renderOldEarthSphere = false;
     renderer.SetRenderOldEarthSphere(renderOldEarthSphere);
@@ -1023,6 +1036,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         double dt = std::chrono::duration<double>(now - lastTime).count();
         lastTime = now;
         dt = std::clamp(dt, 0.0, 0.1);
+        terrainBuildCooldownSeconds = std::max(0.0, terrainBuildCooldownSeconds - dt);
 
         graphicsHotReloadAccumulator += dt;
         if (graphicsHotReloadAccumulator >= 1.0) {
@@ -1119,14 +1133,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 if (result.composed) {
                     satelliteComposeGeneration += 1;
                     if (uploadSatelliteRings(result.rings)) {
-                        satelliteComposeCooldownSeconds = 0.85;
+                        satelliteComposeCooldownSeconds = 0.08;
                     } else {
-                        satelliteComposeCooldownSeconds = 1.2;
+                        satelliteComposeCooldownSeconds = 0.25;
                     }
                 } else if (!result.error.empty()) {
                     satelliteComposeFailureCount += 1;
                     satelliteRuntimeStatus = "Satellite compose failed: " + result.error;
-                    satelliteComposeCooldownSeconds = 1.2;
+                    satelliteComposeCooldownSeconds = 0.30;
                 }
             }
 
@@ -1142,7 +1156,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     out.composed = satelliteStreamer.ComposeLodRings(satLat, satLon, satAlt, false, out.rings, out.error);
                     return out;
                 });
-                satelliteComposeCooldownSeconds = 0.25;
+                satelliteComposeCooldownSeconds = 0.04;
             }
             satelliteStats = satelliteStreamer.GetStats();
         }
@@ -1160,22 +1174,55 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         groundHeightClamped = std::max(groundHeightRaw, 0.0);
 
         if (terrainSystemReady) {
-            bool shouldRegenerate = regenerateTerrainRequested || !havePatchCenter;
-            if (!shouldRegenerate && havePatchCenter) {
-                const double dLatRad = flight::DegToRad(activeSim.LatitudeDeg() - patchCenterLatDeg);
-                const double dLonRad = flight::DegToRad(LonDeltaDeg(activeSim.LongitudeDeg(), patchCenterLonDeg));
-                const double avgLatRad = flight::DegToRad(0.5 * (activeSim.LatitudeDeg() + patchCenterLatDeg));
-
+            auto latLonDistanceMeters = [](double latA, double lonA, double latB, double lonB) {
+                const double dLatRad = flight::DegToRad(latA - latB);
+                const double dLonRad = flight::DegToRad(LonDeltaDeg(lonA, lonB));
+                const double avgLatRad = flight::DegToRad(0.5 * (latA + latB));
                 const double northMeters = dLatRad * flight::kEarthRadiusMeters;
                 const double eastMeters = dLonRad * flight::kEarthRadiusMeters * std::max(0.01, std::cos(avgLatRad));
-                const double distMeters = std::sqrt(northMeters * northMeters + eastMeters * eastMeters);
-                const double warp = std::clamp(static_cast<double>(simTimeScale), 1.0, 20.0);
-                double thresholdScale = std::clamp(1.0 + (warp - 1.0) * 0.10, 1.0, 3.0);
-                if (vehicleMode == VehicleMode::Missile) {
-                    thresholdScale = std::min(3.5, thresholdScale * 1.25);
+                return std::sqrt(northMeters * northMeters + eastMeters * eastMeters);
+            };
+
+            const double warp = std::clamp(static_cast<double>(simTimeScale), 1.0, 20.0);
+            double quantizeGridMeters = 500.0;
+            if (vehicleMode == VehicleMode::Missile || warp >= 8.0) {
+                quantizeGridMeters = 1000.0;
+            }
+            if (warp >= 14.0) {
+                quantizeGridMeters = 1600.0;
+            }
+            double desiredCenterLatDeg = activeSim.LatitudeDeg();
+            double desiredCenterLonDeg = activeSim.LongitudeDeg();
+            QuantizeLatLonMeters(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), quantizeGridMeters, desiredCenterLatDeg, desiredCenterLonDeg);
+
+            const double nearHoldRadiusMeters = std::clamp(patchSettings.patchSizeKm * 1000.0 * 0.45, 18000.0, 130000.0);
+            const double hardRecenterMeters = std::clamp(patchSettings.patchSizeKm * 1000.0 * 0.75, 35000.0, 240000.0);
+            const double farRefreshStepMeters = std::clamp(patchSettings.patchSizeKm * 1000.0 * 0.18, 8000.0, 55000.0);
+            const double minBuildCadenceSeconds = std::clamp(1.0 - (warp - 1.0) * 0.035, 0.35, 1.0);
+
+            bool shouldRegenerate = regenerateTerrainRequested || !havePatchCenter;
+            if (!shouldRegenerate && havePatchCenter) {
+                const double distFromPatchCenter = latLonDistanceMeters(
+                    activeSim.LatitudeDeg(),
+                    activeSim.LongitudeDeg(),
+                    patchCenterLatDeg,
+                    patchCenterLonDeg);
+                const bool movedHard = distFromPatchCenter >= hardRecenterMeters;
+                const bool movedPastNearHold = distFromPatchCenter >= nearHoldRadiusMeters;
+                double quantizedCenterShiftMeters = 0.0;
+                if (haveTerrainBuildCenter) {
+                    quantizedCenterShiftMeters = latLonDistanceMeters(
+                        desiredCenterLatDeg,
+                        desiredCenterLonDeg,
+                        lastTerrainBuildCenterLatDeg,
+                        lastTerrainBuildCenterLonDeg);
+                } else {
+                    quantizedCenterShiftMeters = farRefreshStepMeters + 1.0;
                 }
-                const double threshold = std::clamp(patchSettings.patchSizeKm * 1000.0 * 0.20 * thresholdScale, 1000.0, 90000.0);
-                shouldRegenerate = (distMeters >= threshold);
+                const bool cadenceReady = (terrainBuildCooldownSeconds <= 0.0);
+                shouldRegenerate =
+                    movedHard ||
+                    (movedPastNearHold && quantizedCenterShiftMeters >= farRefreshStepMeters && cadenceReady);
             }
 
             if (terrainBuildInFlight) {
@@ -1203,8 +1250,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
 
             if (shouldRegenerate && !terrainBuildInFlight) {
-                const double requestLatDeg = activeSim.LatitudeDeg();
-                const double requestLonDeg = activeSim.LongitudeDeg();
+                const double requestLatDeg = desiredCenterLatDeg;
+                const double requestLonDeg = desiredCenterLonDeg;
                 const flight::Double3 requestAnchorEcef = activeSim.PlaneEcef();
                 TerrainPatchSettings requestSettings = patchSettings;
                 if (simTimeScale >= 10.0f) {
@@ -1216,6 +1263,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 }
                 terrainBuildInFlight = true;
                 regenerateTerrainRequested = false;
+                terrainBuildCooldownSeconds = minBuildCadenceSeconds;
+                lastTerrainBuildCenterLatDeg = requestLatDeg;
+                lastTerrainBuildCenterLonDeg = requestLonDeg;
+                haveTerrainBuildCenter = true;
                 terrainBuildFuture = std::async(
                     std::launch::async,
                     [&terrainSystem, requestLatDeg, requestLonDeg, requestAnchorEcef, requestSettings]() {
@@ -1268,6 +1319,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Text("Tile loaded: %s", tileLoadedAtPlane ? "yes" : "no");
         ImGui::Text("Cache: %zu / %zu", terrainSystem.LoadedTileCount(), terrainSystem.CacheCapacity());
         ImGui::Text("Terrain build: %s", terrainBuildInFlight ? "background in-flight" : "idle");
+        ImGui::Text("Terrain build cooldown: %.2f s", terrainBuildCooldownSeconds);
         const DirectX::XMFLOAT4 satBounds = renderer.SatelliteLonLatBounds();
         if (renderer.HasSatelliteSourceFile()) {
             const std::string satPath = renderer.SatelliteSourcePath().string();

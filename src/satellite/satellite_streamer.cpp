@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -64,6 +65,12 @@ double LatToTileY(double latDeg, int z) {
     const double latRad = flight::DegToRad(ClampLatDeg(latDeg));
     const double y = (1.0 - std::log(std::tan(latRad) + 1.0 / std::cos(latRad)) / kPi) * 0.5 * n;
     return std::clamp(y, 0.0, n - 1.0e-6);
+}
+
+double TileYToLatDeg(double y, int z) {
+    const double n = static_cast<double>(1u << z);
+    const double merc = kPi * (1.0 - 2.0 * (y / n));
+    return flight::RadToDeg(std::atan(std::sinh(merc)));
 }
 
 double DistanceMeters(double latA, double lonA, double latB, double lonB) {
@@ -153,6 +160,8 @@ struct SatelliteStreamer::Impl {
 
     std::unordered_map<TileKey, CachedTile, TileKeyHasher> tileCache;
     std::list<TileKey> lru;
+    std::deque<TileKey> dirtyTileQueue;
+    std::unordered_set<TileKey, TileKeyHasher> dirtyTileSet;
 
     std::atomic<uint64_t> diskHits{0};
     std::atomic<uint64_t> networkHits{0};
@@ -163,7 +172,14 @@ struct SatelliteStreamer::Impl {
     std::array<int, 3> activeZooms{13, 11, 9};
     double lastComposeLatDeg = 1000.0;
     double lastComposeLonDeg = 1000.0;
+    double lastNearComposeLatDeg = 1000.0;
+    double lastNearComposeLonDeg = 1000.0;
+    double lastMidFarComposeLatDeg = 1000.0;
+    double lastMidFarComposeLonDeg = 1000.0;
     std::array<int, 3> lastComposeZooms{-1, -1, -1};
+    std::array<double, 3> lastComposeRadiusKm{0.0, 0.0, 0.0};
+    std::array<RingTexture, 3> lastComposedRings{};
+    std::array<bool, 3> hasComposedRing{false, false, false};
     bool hasComposeState = false;
 
     HINTERNET hSession = nullptr;
@@ -175,7 +191,7 @@ struct SatelliteStreamer::Impl {
     bool Initialize(const Config& cfg, std::string& error) {
         Shutdown();
         config = cfg;
-        config.workerCount = std::clamp(config.workerCount, 1, 8);
+        config.workerCount = std::clamp(config.workerCount, 1, 16);
         config.maxMemoryTiles = std::max<size_t>(config.maxMemoryTiles, 128);
         config.nearTextureSize = std::clamp(config.nearTextureSize, 256, 2048);
         config.midTextureSize = std::clamp(config.midTextureSize, 256, 2048);
@@ -198,6 +214,9 @@ struct SatelliteStreamer::Impl {
             error = "WinHttpOpen failed";
             return false;
         }
+        DWORD maxConnections = static_cast<DWORD>(std::clamp(config.workerCount * 2, 8, 32));
+        (void)WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxConnections, sizeof(maxConnections));
+        (void)WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxConnections, sizeof(maxConnections));
 
         stopWorkers = false;
         for (int i = 0; i < config.workerCount; ++i) {
@@ -231,8 +250,19 @@ struct SatelliteStreamer::Impl {
             std::scoped_lock<std::mutex> lock(mutex);
             tileCache.clear();
             lru.clear();
+            dirtyTileQueue.clear();
+            dirtyTileSet.clear();
         }
         hasComposeState = false;
+        hasComposedRing = {false, false, false};
+        lastComposeZooms = {-1, -1, -1};
+        lastComposeRadiusKm = {0.0, 0.0, 0.0};
+        lastComposeLatDeg = 1000.0;
+        lastComposeLonDeg = 1000.0;
+        lastNearComposeLatDeg = 1000.0;
+        lastNearComposeLonDeg = 1000.0;
+        lastMidFarComposeLatDeg = 1000.0;
+        lastMidFarComposeLonDeg = 1000.0;
         dirtySinceLastCompose = true;
         initialized = false;
     }
@@ -245,10 +275,10 @@ struct SatelliteStreamer::Impl {
                                          (kEarthRadiusMeters * kEarthRadiusMeters))) *
             0.001;
 
-        // Scale stream coverage with altitude so cruising flight keeps high-res imagery farther toward the horizon.
-        const double farRadiusKm = std::clamp(horizonKm * 0.90, 140.0, 900.0);
-        const double midRadiusKm = std::clamp(farRadiusKm * 0.42, 30.0, 300.0);
-        const double nearRadiusKm = std::clamp(midRadiusKm * 0.28, 6.0, 95.0);
+        // Scale stream coverage with altitude so cruising flight keeps streamed imagery much farther out.
+        const double farRadiusKm = std::clamp(horizonKm * 1.45 + 100.0, 220.0, 1400.0);
+        const double midRadiusKm = std::clamp(farRadiusKm * 0.48, 45.0, 520.0);
+        const double nearRadiusKm = std::clamp(midRadiusKm * 0.30, 10.0, 150.0);
 
         rings[0].radiusKm = nearRadiusKm;
         rings[1].radiusKm = midRadiusKm;
@@ -289,13 +319,13 @@ struct SatelliteStreamer::Impl {
         return rings;
     }
 
-    void EnqueueTileRequest(const TileKey& key, bool highPriority) {
+    bool EnqueueTileRequest(const TileKey& key, bool highPriority) {
         std::scoped_lock<std::mutex> lock(mutex);
         if (tileCache.find(key) != tileCache.end()) {
-            return;
+            return false;
         }
         if (queuedSet.find(key) != queuedSet.end()) {
-            return;
+            return false;
         }
         if (highPriority) {
             requestQueue.push_front(key);
@@ -304,9 +334,17 @@ struct SatelliteStreamer::Impl {
         }
         queuedSet.insert(key);
         cv.notify_one();
+        return true;
     }
 
-    void QueueBounds(int zoom, double latDeg, double lonDeg, double radiusKm, int capRadiusTiles, bool highPriority) {
+    size_t QueueBounds(
+        int zoom,
+        double latDeg,
+        double lonDeg,
+        double radiusKm,
+        int capRadiusTiles,
+        bool highPriority,
+        size_t maxEnqueue = std::numeric_limits<size_t>::max()) {
         const double latRad = flight::DegToRad(latDeg);
         const double radiusMeters = radiusKm * 1000.0;
         const double dLatDeg = flight::RadToDeg(radiusMeters / kEarthRadiusMeters);
@@ -343,15 +381,46 @@ struct SatelliteStreamer::Impl {
         y0 = std::max(y0, capY0);
         y1 = std::min(y1, capY1);
 
+        struct Candidate {
+            TileKey key{};
+            double distSq = 0.0;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(static_cast<size_t>((x1 - x0 + 1) * (y1 - y0 + 1)));
+
         for (int y = y0; y <= y1; ++y) {
             for (int x = x0; x <= x1; ++x) {
-                TileKey key{};
-                key.z = zoom;
-                key.x = WrapTileX(x, n);
-                key.y = std::clamp(y, 0, n - 1);
-                EnqueueTileRequest(key, highPriority);
+                Candidate c{};
+                c.key.z = zoom;
+                c.key.x = WrapTileX(x, n);
+                c.key.y = std::clamp(y, 0, n - 1);
+                const double dx = static_cast<double>(x) - centerX;
+                const double dy = static_cast<double>(y) - centerY;
+                c.distSq = dx * dx + dy * dy;
+                candidates.push_back(c);
             }
         }
+
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.distSq == b.distSq) {
+                if (a.key.y == b.key.y) {
+                    return a.key.x < b.key.x;
+                }
+                return a.key.y < b.key.y;
+            }
+            return a.distSq < b.distSq;
+        });
+
+        size_t enqueued = 0;
+        for (const Candidate& c : candidates) {
+            if (enqueued >= maxEnqueue) {
+                break;
+            }
+            if (EnqueueTileRequest(c.key, highPriority)) {
+                enqueued += 1;
+            }
+        }
+        return enqueued;
     }
 
     void PrefetchForView(double latDeg, double lonDeg, double altitudeMeters) {
@@ -364,20 +433,58 @@ struct SatelliteStreamer::Impl {
             std::scoped_lock<std::mutex> lock(mutex);
             queued = requestQueue.size();
         }
-        for (int i = 0; i < 3; ++i) {
-            if (i > 0 && queued > 3000) {
-                break;
-            }
-            QueueBounds(
-                rings[i].zoom,
+
+        if (queued > 12000) {
+            return;
+        }
+
+        // Prioritize immediate surroundings first, then progressively expand.
+        const int nearCoreRadius = std::clamp(rings[0].prefetchRadiusTiles / 3, 2, 8);
+        const size_t nearCoreBudget = (queued < 1200) ? 480 : 192;
+        size_t added = QueueBounds(
+            rings[0].zoom,
+            latDeg,
+            lonDeg,
+            rings[0].radiusKm,
+            nearCoreRadius,
+            true,
+            nearCoreBudget);
+
+        size_t queueNow = queued + added;
+        const size_t nearExpandBudget = (queueNow < 1800) ? 720 : ((queueNow < 3200) ? 320 : 128);
+        added += QueueBounds(
+            rings[0].zoom,
+            latDeg,
+            lonDeg,
+            rings[0].radiusKm,
+            rings[0].prefetchRadiusTiles,
+            false,
+            nearExpandBudget);
+        queueNow = queued + added;
+
+        if (queueNow < 6200) {
+            const size_t midBudget = (queueNow < 2600) ? 420 : 192;
+            added += QueueBounds(
+                rings[1].zoom,
                 latDeg,
                 lonDeg,
-                rings[i].radiusKm,
-                rings[i].prefetchRadiusTiles,
-                i == 0);
-            if (queued < 6000) {
-                queued += 256;
-            }
+                rings[1].radiusKm,
+                rings[1].prefetchRadiusTiles,
+                false,
+                midBudget);
+            queueNow = queued + added;
+        }
+
+        if (queueNow < 7800) {
+            const size_t farBudget = (queueNow < 3200) ? 260 : 128;
+            (void)QueueBounds(
+                rings[2].zoom,
+                latDeg,
+                lonDeg,
+                rings[2].radiusKm,
+                rings[2].prefetchRadiusTiles,
+                false,
+                farBudget);
         }
     }
 
@@ -423,7 +530,24 @@ struct SatelliteStreamer::Impl {
         return static_cast<bool>(out);
     }
 
-    bool HttpGetBytes(const std::string& urlUtf8, std::vector<uint8_t>& outBytes) {
+    struct HttpWorkerContext {
+        HINTERNET hConnect = nullptr;
+        std::wstring host;
+        INTERNET_PORT port = 0;
+
+        ~HttpWorkerContext() {
+            if (hConnect) {
+                WinHttpCloseHandle(hConnect);
+                hConnect = nullptr;
+            }
+        }
+    };
+
+    struct WicWorkerContext {
+        ComPtr<IWICImagingFactory> factory;
+    };
+
+    bool HttpGetBytes(const std::string& urlUtf8, std::vector<uint8_t>& outBytes, HttpWorkerContext& ctx) {
         if (!hSession) {
             return false;
         }
@@ -454,14 +578,23 @@ struct SatelliteStreamer::Impl {
 
         const bool isHttps = (parts.nScheme == INTERNET_SCHEME_HTTPS);
         const DWORD openFlags = isHttps ? WINHTTP_FLAG_SECURE : 0;
-
-        HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), parts.nPort, 0);
-        if (!hConnect) {
-            return false;
+        const bool connectionChanged =
+            (!ctx.hConnect) || (ctx.port != parts.nPort) || (ctx.host != host);
+        if (connectionChanged) {
+            if (ctx.hConnect) {
+                WinHttpCloseHandle(ctx.hConnect);
+                ctx.hConnect = nullptr;
+            }
+            ctx.hConnect = WinHttpConnect(hSession, host.c_str(), parts.nPort, 0);
+            if (!ctx.hConnect) {
+                return false;
+            }
+            ctx.host = host;
+            ctx.port = parts.nPort;
         }
 
         HINTERNET hRequest = WinHttpOpenRequest(
-            hConnect,
+            ctx.hConnect,
             L"GET",
             path.c_str(),
             nullptr,
@@ -469,7 +602,6 @@ struct SatelliteStreamer::Impl {
             WINHTTP_DEFAULT_ACCEPT_TYPES,
             openFlags);
         if (!hRequest) {
-            WinHttpCloseHandle(hConnect);
             return false;
         }
 
@@ -511,23 +643,28 @@ struct SatelliteStreamer::Impl {
         }
 
         WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
         return ok && !outBytes.empty();
     }
 
-    bool DecodeJpegToRgba(const std::vector<uint8_t>& jpegBytes, std::vector<uint8_t>& outRgba) {
-        ComPtr<IWICImagingFactory> factory;
-        HRESULT hr = CoCreateInstance(
+    bool EnsureWicWorkerContext(WicWorkerContext& ctx) {
+        if (ctx.factory) {
+            return true;
+        }
+        const HRESULT hr = CoCreateInstance(
             CLSID_WICImagingFactory,
             nullptr,
             CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(factory.ReleaseAndGetAddressOf()));
-        if (FAILED(hr)) {
+            IID_PPV_ARGS(ctx.factory.ReleaseAndGetAddressOf()));
+        return SUCCEEDED(hr);
+    }
+
+    bool DecodeJpegToRgba(const std::vector<uint8_t>& jpegBytes, std::vector<uint8_t>& outRgba, WicWorkerContext& ctx) {
+        if (!EnsureWicWorkerContext(ctx)) {
             return false;
         }
 
         ComPtr<IWICStream> stream;
-        hr = factory->CreateStream(stream.ReleaseAndGetAddressOf());
+        HRESULT hr = ctx.factory->CreateStream(stream.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             return false;
         }
@@ -537,7 +674,7 @@ struct SatelliteStreamer::Impl {
         }
 
         ComPtr<IWICBitmapDecoder> decoder;
-        hr = factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.ReleaseAndGetAddressOf());
+        hr = ctx.factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             return false;
         }
@@ -556,7 +693,7 @@ struct SatelliteStreamer::Impl {
         }
 
         ComPtr<IWICFormatConverter> converter;
-        hr = factory->CreateFormatConverter(converter.ReleaseAndGetAddressOf());
+        hr = ctx.factory->CreateFormatConverter(converter.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             return false;
         }
@@ -607,10 +744,13 @@ struct SatelliteStreamer::Impl {
             lru.pop_back();
             tileCache.erase(tail);
         }
+        if (dirtyTileSet.insert(key).second) {
+            dirtyTileQueue.push_back(key);
+        }
         dirtySinceLastCompose = true;
     }
 
-    bool FetchAndDecodeTile(const TileKey& key) {
+    bool FetchAndDecodeTile(const TileKey& key, HttpWorkerContext& httpCtx, WicWorkerContext& wicCtx) {
         std::vector<uint8_t> bytes;
         const std::filesystem::path diskPath = CachePathForTile(key);
         bool haveBytes = ReadFileBytes(diskPath, bytes);
@@ -618,7 +758,7 @@ struct SatelliteStreamer::Impl {
             ++diskHits;
         } else {
             const std::string url = BuildTileUrl(key);
-            if (!HttpGetBytes(url, bytes)) {
+            if (!HttpGetBytes(url, bytes, httpCtx)) {
                 ++networkFailures;
                 return false;
             }
@@ -627,7 +767,7 @@ struct SatelliteStreamer::Impl {
         }
 
         std::vector<uint8_t> rgba;
-        if (!DecodeJpegToRgba(bytes, rgba)) {
+        if (!DecodeJpegToRgba(bytes, rgba, wicCtx)) {
             ++decodeFailures;
             return false;
         }
@@ -638,6 +778,8 @@ struct SatelliteStreamer::Impl {
 
     void WorkerLoop() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        HttpWorkerContext httpCtx{};
+        WicWorkerContext wicCtx{};
         while (true) {
             TileKey key{};
             {
@@ -653,7 +795,7 @@ struct SatelliteStreamer::Impl {
                     continue;
                 }
             }
-            (void)FetchAndDecodeTile(key);
+            (void)FetchAndDecodeTile(key, httpCtx, wicCtx);
         }
         CoUninitialize();
     }
@@ -668,13 +810,27 @@ struct SatelliteStreamer::Impl {
         return snapshot;
     }
 
+    std::vector<TileKey> ConsumeDirtyTiles(size_t maxCount, bool& hasMore) {
+        std::vector<TileKey> out;
+        out.reserve(maxCount);
+        std::scoped_lock<std::mutex> lock(mutex);
+        while (!dirtyTileQueue.empty() && out.size() < maxCount) {
+            const TileKey key = dirtyTileQueue.front();
+            dirtyTileQueue.pop_front();
+            dirtyTileSet.erase(key);
+            out.push_back(key);
+        }
+        hasMore = !dirtyTileQueue.empty();
+        return out;
+    }
+
     bool SampleColorFromSnapshot(
         const std::unordered_map<TileKey, std::shared_ptr<const std::vector<uint8_t>>, TileKeyHasher>& snapshot,
         double latDeg,
         double lonDeg,
         int targetZoom,
         std::array<uint8_t, 4>& outColor,
-        int& outSampleZoom) {
+        int& outSampleZoom) const {
         const double lat = ClampLatDeg(latDeg);
         const double lonWrapped = WrapLonDeg(lonDeg);
         outSampleZoom = -1;
@@ -709,42 +865,114 @@ struct SatelliteStreamer::Impl {
         return false;
     }
 
-    RingTexture ComposeRing(
-        double centerLatDeg,
-        double centerLonDeg,
-        const RingParams& params,
-        const std::unordered_map<TileKey, std::shared_ptr<const std::vector<uint8_t>>, TileKeyHasher>& snapshot) {
-        RingTexture out{};
-        out.zoom = params.zoom;
-        out.width = static_cast<uint32_t>(params.textureSize);
-        out.height = static_cast<uint32_t>(params.textureSize);
-        out.rgbaPixels.resize(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4u, 0u);
-
+    DirectX::XMFLOAT4 ComputeRingBounds(double centerLatDeg, double centerLonDeg, const RingParams& params) const {
         const double latRad = flight::DegToRad(centerLatDeg);
         const double radiusMeters = params.radiusKm * 1000.0;
         const double dLatDeg = flight::RadToDeg(radiusMeters / kEarthRadiusMeters);
         const double cosLat = std::max(0.15, std::cos(latRad));
         const double dLonDeg = flight::RadToDeg(radiusMeters / (kEarthRadiusMeters * cosLat));
-
         const double lonW = centerLonDeg - dLonDeg;
         const double lonE = centerLonDeg + dLonDeg;
         const double latS = std::clamp(centerLatDeg - dLatDeg, -85.0, 85.0);
         const double latN = std::clamp(centerLatDeg + dLatDeg, -85.0, 85.0);
-        out.boundsLonLat = {
+        return {
             static_cast<float>(lonW),
             static_cast<float>(lonE),
             static_cast<float>(latS),
             static_cast<float>(latN),
         };
+    }
 
-        const double invW = 1.0 / static_cast<double>(out.width);
-        const double invH = 1.0 / static_cast<double>(out.height);
-        size_t validPixelCount = 0;
+    bool DirtyTileToPixelRect(
+        const RingTexture& ring,
+        const TileKey& key,
+        uint32_t& outX0,
+        uint32_t& outY0,
+        uint32_t& outX1Exclusive,
+        uint32_t& outY1Exclusive) const {
+        if (ring.width == 0 || ring.height == 0 || ring.boundsLonLat.x >= ring.boundsLonLat.y ||
+            ring.boundsLonLat.z >= ring.boundsLonLat.w) {
+            return false;
+        }
+
+        const int n = 1 << key.z;
+        const double tileLonWBase = (static_cast<double>(key.x) / static_cast<double>(n)) * 360.0 - 180.0;
+        const double tileLonEBase = (static_cast<double>(key.x + 1) / static_cast<double>(n)) * 360.0 - 180.0;
+        const double tileLatN = TileYToLatDeg(static_cast<double>(key.y), key.z);
+        const double tileLatS = TileYToLatDeg(static_cast<double>(key.y + 1), key.z);
+
+        const double ringLonW = ring.boundsLonLat.x;
+        const double ringLonE = ring.boundsLonLat.y;
+        const double ringLatS = ring.boundsLonLat.z;
+        const double ringLatN = ring.boundsLonLat.w;
+        const double ringLonCenter = 0.5 * (ringLonW + ringLonE);
+        const double tileLonCenterBase = 0.5 * (tileLonWBase + tileLonEBase);
+        const double wrapShift = std::round((ringLonCenter - tileLonCenterBase) / 360.0) * 360.0;
+        const double tileLonW = tileLonWBase + wrapShift;
+        const double tileLonE = tileLonEBase + wrapShift;
+
+        const double interLonW = std::max(ringLonW, tileLonW);
+        const double interLonE = std::min(ringLonE, tileLonE);
+        const double interLatS = std::max(ringLatS, tileLatS);
+        const double interLatN = std::min(ringLatN, tileLatN);
+        if (interLonW >= interLonE || interLatS >= interLatN) {
+            return false;
+        }
+
+        const double lonSpan = ringLonE - ringLonW;
+        const double latSpan = ringLatN - ringLatS;
+        if (lonSpan <= 1e-9 || latSpan <= 1e-9) {
+            return false;
+        }
+
+        constexpr int kPad = 2;
+        const double u0 = (interLonW - ringLonW) / lonSpan;
+        const double u1 = (interLonE - ringLonW) / lonSpan;
+        const double v0 = (ringLatN - interLatN) / latSpan;
+        const double v1 = (ringLatN - interLatS) / latSpan;
+
+        int x0 = static_cast<int>(std::floor(u0 * static_cast<double>(ring.width))) - kPad;
+        int x1 = static_cast<int>(std::ceil(u1 * static_cast<double>(ring.width))) + kPad;
+        int y0 = static_cast<int>(std::floor(v0 * static_cast<double>(ring.height))) - kPad;
+        int y1 = static_cast<int>(std::ceil(v1 * static_cast<double>(ring.height))) + kPad;
+
+        x0 = std::clamp(x0, 0, static_cast<int>(ring.width));
+        x1 = std::clamp(x1, 0, static_cast<int>(ring.width));
+        y0 = std::clamp(y0, 0, static_cast<int>(ring.height));
+        y1 = std::clamp(y1, 0, static_cast<int>(ring.height));
+        if (x0 >= x1 || y0 >= y1) {
+            return false;
+        }
+
+        outX0 = static_cast<uint32_t>(x0);
+        outY0 = static_cast<uint32_t>(y0);
+        outX1Exclusive = static_cast<uint32_t>(x1);
+        outY1Exclusive = static_cast<uint32_t>(y1);
+        return true;
+    }
+
+    void UpdateRingPixels(
+        RingTexture& ring,
+        const RingParams& params,
+        const std::unordered_map<TileKey, std::shared_ptr<const std::vector<uint8_t>>, TileKeyHasher>& snapshot,
+        uint32_t xBegin,
+        uint32_t yBegin,
+        uint32_t xEndExclusive,
+        uint32_t yEndExclusive) const {
+        if (xBegin >= xEndExclusive || yBegin >= yEndExclusive || ring.width == 0 || ring.height == 0) {
+            return;
+        }
+        const double lonW = ring.boundsLonLat.x;
+        const double lonE = ring.boundsLonLat.y;
+        const double latS = ring.boundsLonLat.z;
+        const double latN = ring.boundsLonLat.w;
+        const double invW = 1.0 / static_cast<double>(ring.width);
+        const double invH = 1.0 / static_cast<double>(ring.height);
         constexpr double kEdgeFeather = 0.08;
-        for (uint32_t y = 0; y < out.height; ++y) {
+        for (uint32_t y = yBegin; y < yEndExclusive; ++y) {
             const double v = (static_cast<double>(y) + 0.5) * invH;
             const double lat = latN + (latS - latN) * v;
-            for (uint32_t x = 0; x < out.width; ++x) {
+            for (uint32_t x = xBegin; x < xEndExclusive; ++x) {
                 const double u = (static_cast<double>(x) + 0.5) * invW;
                 const double lon = lonW + (lonE - lonW) * u;
                 std::array<uint8_t, 4> color{0, 0, 0, 0};
@@ -753,29 +981,73 @@ struct SatelliteStreamer::Impl {
                     const int zoomDelta = std::max(0, params.zoom - sampledZoom);
                     float lodQuality = 1.0f - static_cast<float>(zoomDelta) * 0.18f;
                     lodQuality = std::clamp(lodQuality, 0.30f, 1.0f);
-
                     const double edgeU = std::min(u, 1.0 - u);
                     const double edgeV = std::min(v, 1.0 - v);
                     const double edgeDist = std::min(edgeU, edgeV);
                     const float edgeFade = static_cast<float>(std::clamp(edgeDist / kEdgeFeather, 0.0, 1.0));
-
                     const float alphaF = std::clamp(lodQuality * edgeFade, 0.0f, 1.0f);
-                    const uint8_t alpha = static_cast<uint8_t>(std::round(alphaF * 255.0f));
-                    color[3] = alpha;
-                    if (alpha > 0) {
-                        validPixelCount += 1;
-                    }
+                    color[3] = static_cast<uint8_t>(std::round(alphaF * 255.0f));
                 }
-                const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(out.width) + static_cast<size_t>(x)) * 4u;
-                out.rgbaPixels[idx + 0] = color[0];
-                out.rgbaPixels[idx + 1] = color[1];
-                out.rgbaPixels[idx + 2] = color[2];
-                out.rgbaPixels[idx + 3] = color[3];
+                const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(ring.width) + static_cast<size_t>(x)) * 4u;
+                ring.rgbaPixels[idx + 0] = color[0];
+                ring.rgbaPixels[idx + 1] = color[1];
+                ring.rgbaPixels[idx + 2] = color[2];
+                ring.rgbaPixels[idx + 3] = color[3];
             }
         }
+    }
 
-        out.valid = (validPixelCount > 0u);
-        return out;
+    bool ComposeRing(
+        double centerLatDeg,
+        double centerLonDeg,
+        const RingParams& params,
+        const std::unordered_map<TileKey, std::shared_ptr<const std::vector<uint8_t>>, TileKeyHasher>& snapshot,
+        const std::vector<TileKey>* dirtyTiles,
+        const RingTexture* previous,
+        RingTexture& out) {
+        out.zoom = params.zoom;
+        out.width = static_cast<uint32_t>(params.textureSize);
+        out.height = static_cast<uint32_t>(params.textureSize);
+        out.boundsLonLat = ComputeRingBounds(centerLatDeg, centerLonDeg, params);
+
+        const bool canIncremental =
+            dirtyTiles &&
+            previous &&
+            previous->zoom == out.zoom &&
+            previous->width == out.width &&
+            previous->height == out.height &&
+            previous->rgbaPixels.size() == static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4u &&
+            std::abs(previous->boundsLonLat.x - out.boundsLonLat.x) < 1e-5f &&
+            std::abs(previous->boundsLonLat.y - out.boundsLonLat.y) < 1e-5f &&
+            std::abs(previous->boundsLonLat.z - out.boundsLonLat.z) < 1e-5f &&
+            std::abs(previous->boundsLonLat.w - out.boundsLonLat.w) < 1e-5f;
+
+        if (canIncremental) {
+            out.rgbaPixels = previous->rgbaPixels;
+            for (const TileKey& key : *dirtyTiles) {
+                uint32_t x0 = 0;
+                uint32_t y0 = 0;
+                uint32_t x1 = 0;
+                uint32_t y1 = 0;
+                if (!DirtyTileToPixelRect(out, key, x0, y0, x1, y1)) {
+                    continue;
+                }
+                UpdateRingPixels(out, params, snapshot, x0, y0, x1, y1);
+            }
+        } else {
+            out.rgbaPixels.assign(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4u, 0u);
+            UpdateRingPixels(out, params, snapshot, 0, 0, out.width, out.height);
+        }
+
+        bool hasAlpha = false;
+        for (size_t idx = 3; idx < out.rgbaPixels.size(); idx += 4) {
+            if (out.rgbaPixels[idx] > 0) {
+                hasAlpha = true;
+                break;
+            }
+        }
+        out.valid = hasAlpha;
+        return true;
     }
 
     bool ComposeLodRings(
@@ -790,56 +1062,151 @@ struct SatelliteStreamer::Impl {
             return false;
         }
 
-        const auto rings = ComputeRingParams(altitudeMeters);
-        bool zoomChanged = false;
-        if (hasComposeState) {
-            for (int i = 0; i < 3; ++i) {
-                if (lastComposeZooms[i] != rings[i].zoom) {
-                    zoomChanged = true;
-                    break;
-                }
-            }
-        } else {
-            zoomChanged = true;
-        }
+        auto pickCenter = [](double sourceLatDeg, double sourceLonDeg, double snapMeters, double& outLatDeg, double& outLonDeg) {
+            const double stepLatDeg = flight::RadToDeg(snapMeters / kEarthRadiusMeters);
+            outLatDeg = std::clamp(SnapToStep(sourceLatDeg, stepLatDeg), -85.0, 85.0);
+            const double cosLat = std::max(0.20, std::cos(flight::DegToRad(outLatDeg)));
+            const double stepLonDeg = flight::RadToDeg(snapMeters / (kEarthRadiusMeters * cosLat));
+            outLonDeg = WrapLonDeg(SnapToStep(sourceLonDeg, stepLonDeg));
+        };
 
-        bool movedEnough = true;
-        if (hasComposeState) {
-            const double d = DistanceMeters(lastComposeLatDeg, lastComposeLonDeg, latDeg, lonDeg);
-            const double recenterMeters = std::clamp(rings[0].radiusKm * 1000.0 * 0.35, 2500.0, 20000.0);
-            movedEnough = d > recenterMeters;
-        }
+        const auto targetRings = ComputeRingParams(altitudeMeters);
+        RingParams composeRings[3] = {targetRings[0], targetRings[1], targetRings[2]};
 
         const bool dirty = dirtySinceLastCompose.load();
-        if (!force && !zoomChanged && !dirty && !movedEnough) {
+        const bool hasNearState = hasComposeState && hasComposedRing[0];
+        const bool hasMidState = hasComposeState && hasComposedRing[1];
+        const bool hasFarState = hasComposeState && hasComposedRing[2];
+        const bool hasMidFarState = hasMidState && hasFarState;
+
+        const bool nearZoomTargetChanged = !hasNearState || (lastComposeZooms[0] != targetRings[0].zoom);
+        const bool midZoomChanged = !hasMidState || (lastComposeZooms[1] != targetRings[1].zoom);
+        const bool farZoomChanged = !hasFarState || (lastComposeZooms[2] != targetRings[2].zoom);
+        const bool nearRadiusChanged =
+            !hasNearState || std::abs(lastComposeRadiusKm[0] - targetRings[0].radiusKm) > std::max(5.0, targetRings[0].radiusKm * 0.20);
+        const bool midRadiusChanged =
+            !hasMidState || std::abs(lastComposeRadiusKm[1] - targetRings[1].radiusKm) > std::max(8.0, targetRings[1].radiusKm * 0.15);
+        const bool farRadiusChanged =
+            !hasFarState || std::abs(lastComposeRadiusKm[2] - targetRings[2].radiusKm) > std::max(15.0, targetRings[2].radiusKm * 0.12);
+
+        const double nearRecenterMeters = std::clamp(targetRings[0].radiusKm * 1000.0 * 0.65, 9000.0, 65000.0);
+        const double nearSnapMeters = std::clamp(nearRecenterMeters * 0.30, 3000.0, 22000.0);
+        const double midFarRecenterMeters = std::clamp(targetRings[1].radiusKm * 1000.0 * 0.30, 3500.0, 32000.0);
+        const double midFarSnapMeters = std::clamp(midFarRecenterMeters * 0.55, 2000.0, 16000.0);
+
+        const bool nearMoved =
+            !hasNearState || DistanceMeters(lastNearComposeLatDeg, lastNearComposeLonDeg, latDeg, lonDeg) > nearRecenterMeters;
+        const bool midFarMoved =
+            !hasMidFarState || DistanceMeters(lastMidFarComposeLatDeg, lastMidFarComposeLonDeg, latDeg, lonDeg) > midFarRecenterMeters;
+
+        const bool allowNearZoomChange = force || nearMoved || nearRadiusChanged || !hasNearState;
+        if (!allowNearZoomChange && hasNearState) {
+            composeRings[0].zoom = lastComposeZooms[0];
+        }
+
+        const bool needsNearCompose =
+            force || !hasNearState || dirty || nearMoved || nearRadiusChanged || (nearZoomTargetChanged && allowNearZoomChange);
+        const bool needsMidFarCompose =
+            force || !hasMidFarState || dirty || midFarMoved || midZoomChanged || farZoomChanged || midRadiusChanged || farRadiusChanged;
+
+        if (!needsNearCompose && !needsMidFarCompose) {
             return false;
         }
 
-        double composeLatDeg = latDeg;
-        double composeLonDeg = WrapLonDeg(lonDeg);
-        const double recenterMeters = std::clamp(rings[0].radiusKm * 1000.0 * 0.20, 1500.0, 12000.0);
-        const double stepLatDeg = flight::RadToDeg(recenterMeters / kEarthRadiusMeters);
-        if (hasComposeState && !zoomChanged && !movedEnough) {
-            // Tile arrivals can dirty the stream frequently; keep center stable until we actually need a recenter.
-            composeLatDeg = lastComposeLatDeg;
-            composeLonDeg = lastComposeLonDeg;
+        double nearLatDeg = latDeg;
+        double nearLonDeg = WrapLonDeg(lonDeg);
+        if (hasNearState && !force && !nearMoved) {
+            nearLatDeg = lastNearComposeLatDeg;
+            nearLonDeg = lastNearComposeLonDeg;
         } else {
-            composeLatDeg = std::clamp(SnapToStep(latDeg, stepLatDeg), -85.0, 85.0);
-            const double cosLat = std::max(0.20, std::cos(flight::DegToRad(composeLatDeg)));
-            const double stepLonDeg = flight::RadToDeg(recenterMeters / (kEarthRadiusMeters * cosLat));
-            composeLonDeg = WrapLonDeg(SnapToStep(lonDeg, stepLonDeg));
+            pickCenter(latDeg, lonDeg, nearSnapMeters, nearLatDeg, nearLonDeg);
         }
 
+        double midFarLatDeg = latDeg;
+        double midFarLonDeg = WrapLonDeg(lonDeg);
+        if (hasMidFarState && !force && !midFarMoved) {
+            midFarLatDeg = lastMidFarComposeLatDeg;
+            midFarLonDeg = lastMidFarComposeLonDeg;
+        } else {
+            pickCenter(latDeg, lonDeg, midFarSnapMeters, midFarLatDeg, midFarLonDeg);
+        }
+
+        bool dirtyTilesRemaining = false;
+        std::vector<TileKey> dirtyTilesForCompose;
+        if (dirty) {
+            size_t dirtyBacklog = 0;
+            {
+                std::scoped_lock<std::mutex> lock(mutex);
+                dirtyBacklog = dirtyTileQueue.size();
+            }
+            const size_t dirtyBatchBudget = std::clamp<size_t>(dirtyBacklog + 192, 512, 4096);
+            dirtyTilesForCompose = ConsumeDirtyTiles(dirtyBatchBudget, dirtyTilesRemaining);
+        }
+        const std::vector<TileKey>* dirtyTilesPtr = dirtyTilesForCompose.empty() ? nullptr : &dirtyTilesForCompose;
         const auto snapshot = CacheSnapshot();
-        outRings[0] = ComposeRing(composeLatDeg, composeLonDeg, rings[0], snapshot);
-        outRings[1] = ComposeRing(composeLatDeg, composeLonDeg, rings[1], snapshot);
-        outRings[2] = ComposeRing(composeLatDeg, composeLonDeg, rings[2], snapshot);
+        if (needsNearCompose) {
+            const RingTexture* prevNear = hasComposedRing[0] ? &lastComposedRings[0] : nullptr;
+            ComposeRing(
+                nearLatDeg,
+                nearLonDeg,
+                composeRings[0],
+                snapshot,
+                dirtyTilesPtr,
+                prevNear,
+                outRings[0]);
+            lastComposedRings[0] = outRings[0];
+            hasComposedRing[0] = true;
+            lastNearComposeLatDeg = nearLatDeg;
+            lastNearComposeLonDeg = nearLonDeg;
+            lastComposeZooms[0] = composeRings[0].zoom;
+            lastComposeRadiusKm[0] = composeRings[0].radiusKm;
+        } else {
+            outRings[0] = lastComposedRings[0];
+        }
+
+        if (needsMidFarCompose) {
+            const RingTexture* prevMid = hasComposedRing[1] ? &lastComposedRings[1] : nullptr;
+            const RingTexture* prevFar = hasComposedRing[2] ? &lastComposedRings[2] : nullptr;
+            ComposeRing(
+                midFarLatDeg,
+                midFarLonDeg,
+                composeRings[1],
+                snapshot,
+                dirtyTilesPtr,
+                prevMid,
+                outRings[1]);
+            ComposeRing(
+                midFarLatDeg,
+                midFarLonDeg,
+                composeRings[2],
+                snapshot,
+                dirtyTilesPtr,
+                prevFar,
+                outRings[2]);
+            lastComposedRings[1] = outRings[1];
+            lastComposedRings[2] = outRings[2];
+            hasComposedRing[1] = true;
+            hasComposedRing[2] = true;
+            lastMidFarComposeLatDeg = midFarLatDeg;
+            lastMidFarComposeLonDeg = midFarLonDeg;
+            lastComposeZooms[1] = composeRings[1].zoom;
+            lastComposeZooms[2] = composeRings[2].zoom;
+            lastComposeRadiusKm[1] = composeRings[1].radiusKm;
+            lastComposeRadiusKm[2] = composeRings[2].radiusKm;
+        } else {
+            outRings[1] = lastComposedRings[1];
+            outRings[2] = lastComposedRings[2];
+        }
 
         hasComposeState = true;
-        lastComposeLatDeg = composeLatDeg;
-        lastComposeLonDeg = composeLonDeg;
-        lastComposeZooms = {rings[0].zoom, rings[1].zoom, rings[2].zoom};
-        dirtySinceLastCompose = false;
+        lastComposeLatDeg = nearLatDeg;
+        lastComposeLonDeg = nearLonDeg;
+        bool stillDirty = dirtyTilesRemaining;
+        if (!stillDirty) {
+            std::scoped_lock<std::mutex> lock(mutex);
+            stillDirty = !dirtyTileQueue.empty();
+        }
+        dirtySinceLastCompose = stillDirty;
         return true;
     }
 

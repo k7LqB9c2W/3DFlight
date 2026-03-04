@@ -417,6 +417,7 @@ void D3D12Renderer::Shutdown() {
     m_earthPso.Reset();
     m_skyboxPso.Reset();
     m_terrainPso.Reset();
+    m_terrainBlendPso.Reset();
     m_transmittanceLutPso.Reset();
     m_skyViewLutPso.Reset();
     m_multiScatteringLutPso.Reset();
@@ -433,10 +434,17 @@ void D3D12Renderer::Shutdown() {
     for (auto& tex : m_satelliteLodTextures) {
         tex.Reset();
     }
+    for (auto& tex : m_satellitePrevLodTextures) {
+        tex.Reset();
+    }
     for (auto& upload : m_satelliteLodUploads) {
         upload.Reset();
     }
+    for (auto& upload : m_satellitePrevLodUploads) {
+        upload.Reset();
+    }
     m_satelliteLodValid = {0.0f, 0.0f, 0.0f};
+    m_satellitePrevLodValid = {0.0f, 0.0f, 0.0f};
     m_modelAlbedoTexture.Reset();
     m_modelAlbedoUpload.Reset();
     m_hasModelAlbedoTexture = false;
@@ -445,6 +453,8 @@ void D3D12Renderer::Shutdown() {
     m_multipleScatteringLut.Reset();
     m_aerialPerspectiveLut.Reset();
     m_hasTerrainMesh = false;
+    m_hasPrevTerrainMesh = false;
+    m_terrainTransitionActive = false;
 
     m_srvHeap.Reset();
     m_rtvHeap.Reset();
@@ -735,11 +745,19 @@ bool D3D12Renderer::SetTerrainMesh(
     const UINT64 uploadFence = ++m_fenceValue;
     m_commandQueue->Signal(m_fence.Get(), uploadFence);
 
+    if (m_hasPrevTerrainMesh && m_prevTerrainMesh.IsValid()) {
+        DeferredTerrainMesh retiredPrev{};
+        retiredPrev.mesh = std::move(m_prevTerrainMesh);
+        retiredPrev.safeFenceValue = std::max(oldFenceSnapshot, m_terrainUploadFenceValue);
+        m_retiredTerrainMeshes.push_back(std::move(retiredPrev));
+        m_hasPrevTerrainMesh = false;
+    }
+
     if (m_hasTerrainMesh && m_terrainMesh.IsValid()) {
-        DeferredTerrainMesh retired{};
-        retired.mesh = std::move(m_terrainMesh);
-        retired.safeFenceValue = std::max(oldFenceSnapshot, m_terrainUploadFenceValue);
-        m_retiredTerrainMeshes.push_back(std::move(retired));
+        m_prevTerrainMesh = std::move(m_terrainMesh);
+        m_prevTerrainAnchorEcef = m_terrainAnchorEcef;
+        m_prevTerrainRenderParams = m_terrainRenderParams;
+        m_hasPrevTerrainMesh = true;
     }
 
     m_terrainMesh = std::move(updated);
@@ -747,6 +765,14 @@ bool D3D12Renderer::SetTerrainMesh(
     m_terrainAnchorEcef = anchorEcef;
     m_terrainRenderParams = renderParams;
     m_hasTerrainMesh = true;
+    if (m_hasPrevTerrainMesh) {
+        m_terrainTransitionStart = std::chrono::steady_clock::now();
+        m_terrainTransitionT = 0.0f;
+        m_terrainTransitionActive = true;
+    } else {
+        m_terrainTransitionT = 1.0f;
+        m_terrainTransitionActive = false;
+    }
     return true;
 }
 
@@ -1020,16 +1046,38 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         m_earthMesh.Draw(m_commandList.Get());
     }
 
-    // Draw primary terrain patch from ETOPO samples.
-    if (m_hasTerrainMesh && m_terrainMesh.IsValid()) {
-        const Double3 terrainOffsetD = m_terrainAnchorEcef - anchor;
+    // Draw primary terrain patch from ETOPO samples (with transition crossfade on patch rebuilds).
+    if (m_terrainTransitionActive) {
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_terrainTransitionStart).count();
+        const double dur = std::max(0.05, static_cast<double>(m_terrainTransitionDurationSeconds));
+        m_terrainTransitionT = static_cast<float>(std::clamp(elapsed / dur, 0.0, 1.0));
+        if (m_terrainTransitionT >= 1.0f) {
+            m_terrainTransitionT = 1.0f;
+            m_terrainTransitionActive = false;
+            if (m_hasPrevTerrainMesh && m_prevTerrainMesh.IsValid()) {
+                DeferredTerrainMesh retiredPrev{};
+                retiredPrev.mesh = std::move(m_prevTerrainMesh);
+                retiredPrev.safeFenceValue = std::max(m_fenceValue, m_terrainUploadFenceValue);
+                m_retiredTerrainMeshes.push_back(std::move(retiredPrev));
+                m_hasPrevTerrainMesh = false;
+            }
+        }
+    } else {
+        m_terrainTransitionT = 1.0f;
+    }
+
+    auto drawTerrainLayer = [&](const GpuMesh& mesh, const Double3& meshAnchor, const DirectX::XMFLOAT4& meshParams, float layerAlpha, bool useBlendPso) {
+        if (!mesh.IsValid() || layerAlpha <= 1e-3f) {
+            return;
+        }
+        const Double3 terrainOffsetD = meshAnchor - anchor;
         ObjectConstants obj{};
         const DirectX::XMMATRIX model = DirectX::XMMatrixTranslation(
             static_cast<float>(terrainOffsetD.x),
             static_cast<float>(terrainOffsetD.y),
             static_cast<float>(terrainOffsetD.z));
         DirectX::XMStoreFloat4x4(&obj.model, DirectX::XMMatrixTranspose(model));
-        DirectX::XMFLOAT4 params = m_terrainRenderParams;
+        DirectX::XMFLOAT4 params = meshParams;
         params.y = m_terrainVisualSettings.colorHeightMaxMeters;
         params.z = m_terrainVisualSettings.lodTransitionWidthMeters;
         obj.colorAndFlags = params;
@@ -1060,11 +1108,22 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning9 = m_satellitePrevLodBounds[1];
         obj.tuning10 = m_satellitePrevLodBounds[2];
         obj.tuning11 = {m_satellitePrevLodValid[0], m_satellitePrevLodValid[1], m_satellitePrevLodValid[2], m_satelliteTransitionT};
+        obj.tuning12 = {layerAlpha, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
-        m_commandList->SetPipelineState(m_terrainPso.Get());
-        m_terrainMesh.Draw(m_commandList.Get());
+        m_commandList->SetPipelineState(useBlendPso ? m_terrainBlendPso.Get() : m_terrainPso.Get());
+        mesh.Draw(m_commandList.Get());
+    };
+
+    if (m_hasTerrainMesh && m_terrainMesh.IsValid()) {
+        if (m_terrainTransitionActive && m_hasPrevTerrainMesh && m_prevTerrainMesh.IsValid()) {
+            // Keep depth stable by drawing current terrain opaque, then fading previous terrain out on top.
+            drawTerrainLayer(m_terrainMesh, m_terrainAnchorEcef, m_terrainRenderParams, 1.0f, false);
+            drawTerrainLayer(m_prevTerrainMesh, m_prevTerrainAnchorEcef, m_prevTerrainRenderParams, 1.0f - m_terrainTransitionT, true);
+        } else {
+            drawTerrainLayer(m_terrainMesh, m_terrainAnchorEcef, m_terrainRenderParams, 1.0f, false);
+        }
     }
 
     // Draw plane.
@@ -1682,6 +1741,22 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     hr = m_device->CreateGraphicsPipelineState(&terrainPso, IID_PPV_ARGS(m_terrainPso.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
         error = HrMessage("CreateGraphicsPipelineState(terrain) failed", hr);
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC terrainBlendPso = terrainPso;
+    terrainBlendPso.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    terrainBlendPso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    terrainBlendPso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    terrainBlendPso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    terrainBlendPso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    terrainBlendPso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    terrainBlendPso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    terrainBlendPso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    terrainBlendPso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    hr = m_device->CreateGraphicsPipelineState(&terrainBlendPso, IID_PPV_ARGS(m_terrainBlendPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(terrain blend) failed", hr);
         return false;
     }
 

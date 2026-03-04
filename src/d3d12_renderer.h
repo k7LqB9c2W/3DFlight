@@ -181,6 +181,7 @@ private:
         DirectX::XMFLOAT4 tuning9{};
         DirectX::XMFLOAT4 tuning10{};
         DirectX::XMFLOAT4 tuning11{};
+        DirectX::XMFLOAT4 tuning12{};
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -289,6 +290,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_earthPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_skyboxPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_terrainPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_terrainBlendPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_transmittanceLutPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_skyViewLutPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_multiScatteringLutPso;
@@ -298,6 +300,7 @@ private:
     GpuMesh m_planeMesh;
     GpuMesh m_skyboxMesh;
     GpuMesh m_terrainMesh;
+    GpuMesh m_prevTerrainMesh;
     struct DeferredTerrainMesh {
         GpuMesh mesh;
         UINT64 safeFenceValue = 0;
@@ -311,9 +314,16 @@ private:
     UINT64 m_terrainUploadFenceValue = 0;
     UINT64 m_satelliteUploadFenceValue = 0;
     Double3 m_terrainAnchorEcef{};
+    Double3 m_prevTerrainAnchorEcef{};
     DirectX::XMFLOAT4 m_terrainRenderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
+    DirectX::XMFLOAT4 m_prevTerrainRenderParams{40000.0f, 6000.0f, 5000.0f, 900000.0f};
     TerrainVisualSettings m_terrainVisualSettings{};
     bool m_hasTerrainMesh = false;
+    bool m_hasPrevTerrainMesh = false;
+    bool m_terrainTransitionActive = false;
+    float m_terrainTransitionT = 1.0f;
+    float m_terrainTransitionDurationSeconds = 0.55f;
+    std::chrono::steady_clock::time_point m_terrainTransitionStart{};
     bool m_renderOldEarthSphere = true;
 
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_sceneCb;
