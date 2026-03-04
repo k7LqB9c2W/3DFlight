@@ -16,6 +16,7 @@
 #include "d3d12_renderer.h"
 #include "gltf_loader.h"
 #include "mesh.h"
+#include "satellite/satellite_streamer.h"
 #include "sim.h"
 #include "terrain/terrain_mesh.h"
 #include "terrain/terrain_system.h"
@@ -26,6 +27,8 @@ using flight::FlightStart;
 using flight::GlbMaterialTexture;
 using flight::InputState;
 using flight::MeshData;
+using flight::satellite::SatelliteStreamer;
+using flight::satellite::StreamStats;
 using flight::terrain::TerrainPatchBuildResult;
 using flight::terrain::TerrainPatchSettings;
 using flight::terrain::TerrainSampleDebug;
@@ -760,6 +763,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         terrainSystemReady = true;
     }
 
+    SatelliteStreamer satelliteStreamer;
+    bool satelliteStreamerReady = false;
+    std::string satelliteInitStatus;
+    {
+        SatelliteStreamer::Config satCfg;
+        satCfg.diskCacheDirectory = std::filesystem::path("cache") / "satellite" / "s2cloudless-2024_3857";
+        satCfg.urlTemplate =
+            "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg";
+        std::string satError;
+        if (satelliteStreamer.Initialize(satCfg, satError)) {
+            satelliteStreamerReady = true;
+            satelliteInitStatus = "Sentinel stream ready";
+        } else {
+            satelliteInitStatus = "Sentinel stream init failed: " + satError;
+        }
+    }
+
     TerrainPatchSettings patchSettings{};
     GraphicsTuningConfig graphicsTuning = MakeRealisticTuningPreset();
     const std::filesystem::path graphicsConfigPath = std::filesystem::path("config") / "graphics_tuning.json";
@@ -817,8 +837,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     std::string terrainRuntimeError;
     std::string vehicleModeStatus;
     std::string vehicleTextureStatus = airplaneTextureStatus;
+    StreamStats satelliteStats{};
+    std::string satelliteRuntimeStatus;
+    double satelliteComposeCooldownSeconds = 0.0;
     bool terrainBuildInFlight = false;
     std::future<TerrainBuildAsyncResult> terrainBuildFuture;
+
+    auto uploadSatelliteRings = [&](const std::array<flight::satellite::RingTexture, 3>& rings) {
+        std::array<D3D12Renderer::SatelliteLodTexture, 3> uploads{};
+        bool anyValid = false;
+        for (size_t i = 0; i < rings.size(); ++i) {
+            uploads[i].rgbaPixels = rings[i].rgbaPixels.data();
+            uploads[i].width = rings[i].width;
+            uploads[i].height = rings[i].height;
+            uploads[i].boundsLonLat = rings[i].boundsLonLat;
+            uploads[i].valid = rings[i].valid && !rings[i].rgbaPixels.empty();
+            anyValid = anyValid || uploads[i].valid;
+        }
+        if (!anyValid) {
+            return false;
+        }
+        std::string uploadError;
+        if (!renderer.SetSatelliteLodTextures(uploads, uploadError)) {
+            satelliteRuntimeStatus = "Satellite upload failed: " + uploadError;
+            return false;
+        }
+        satelliteRuntimeStatus = "Satellite rings uploaded";
+        return true;
+    };
 
     auto applyVehicleZoomRange = [&](VehicleMode mode) {
         constexpr float kPlaneZoomMinMeters = 45.0f;
@@ -859,6 +905,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         vehicleModeStatus = (mode == VehicleMode::Missile) ? "Switched to missile vehicle view" : "Switched to airplane vehicle view";
     };
     applyVehicleZoomRange(vehicleMode);
+
+    if (satelliteStreamerReady) {
+        satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters());
+        const auto preloadStart = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(4)) {
+            satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters());
+            std::array<flight::satellite::RingTexture, 3> rings{};
+            std::string composeError;
+            const bool composed =
+                satelliteStreamer.ComposeLodRings(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), false, rings, composeError);
+            if (composed && uploadSatelliteRings(rings)) {
+                satelliteRuntimeStatus = "Satellite preload complete";
+                break;
+            }
+            if (!composeError.empty()) {
+                satelliteRuntimeStatus = "Satellite preload compose failed: " + composeError;
+            }
+            satelliteStats = satelliteStreamer.GetStats();
+            Sleep(60);
+        }
+    }
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -960,6 +1027,33 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             const double terrainLookaheadSpeed = activeSim.SpeedMps() * std::clamp(static_cast<double>(simTimeScale), 1.0, 20.0);
             const int prefetchRadius = (simTimeScale >= 12.0f) ? 3 : 2;
             terrainSystem.PrefetchAround(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.HeadingDeg(), terrainLookaheadSpeed, prefetchRadius);
+        }
+
+        if (satelliteStreamerReady) {
+            satelliteStreamer.PrefetchForView(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
+            satelliteComposeCooldownSeconds = std::max(0.0, satelliteComposeCooldownSeconds - dt);
+            if (satelliteComposeCooldownSeconds <= 0.0) {
+                std::array<flight::satellite::RingTexture, 3> rings{};
+                std::string composeError;
+                const bool composed = satelliteStreamer.ComposeLodRings(
+                    activeSim.LatitudeDeg(),
+                    activeSim.LongitudeDeg(),
+                    activeSim.AltitudeMeters(),
+                    false,
+                    rings,
+                    composeError);
+                if (composed) {
+                    if (uploadSatelliteRings(rings)) {
+                        satelliteComposeCooldownSeconds = 0.75;
+                    } else {
+                        satelliteComposeCooldownSeconds = 1.0;
+                    }
+                } else if (!composeError.empty()) {
+                    satelliteRuntimeStatus = "Satellite compose failed: " + composeError;
+                    satelliteComposeCooldownSeconds = 1.0;
+                }
+            }
+            satelliteStats = satelliteStreamer.GetStats();
         }
 
         if (terrainSystemReady) {
@@ -1111,6 +1205,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         const bool satInCoverage = lonInCoverage && latInCoverage;
         ImGui::Text("Satellite wraps lon: %s", satWrapsLon ? "yes" : "no");
         ImGui::Text("Satellite sample at plane: %s", satInCoverage ? "in coverage" : "out of coverage");
+        ImGui::Text("Sentinel stream: %s", satelliteStreamerReady ? "enabled" : "disabled");
+        if (!satelliteInitStatus.empty()) {
+            ImGui::TextWrapped("%s", satelliteInitStatus.c_str());
+        }
+        if (satelliteStreamerReady) {
+            ImGui::Text(
+                "Sentinel zooms N/M/F: %d / %d / %d",
+                satelliteStats.activeZooms[0],
+                satelliteStats.activeZooms[1],
+                satelliteStats.activeZooms[2]);
+            ImGui::Text(
+                "Sentinel cache tiles: %zu, queued: %zu",
+                satelliteStats.memoryTileCount,
+                satelliteStats.queuedRequests);
+            ImGui::Text(
+                "Sentinel hits disk/net: %llu / %llu",
+                static_cast<unsigned long long>(satelliteStats.diskHits),
+                static_cast<unsigned long long>(satelliteStats.networkHits));
+            ImGui::Text(
+                "Sentinel fails net/decode: %llu / %llu",
+                static_cast<unsigned long long>(satelliteStats.networkFailures),
+                static_cast<unsigned long long>(satelliteStats.decodeFailures));
+            if (!satelliteRuntimeStatus.empty()) {
+                ImGui::TextWrapped("%s", satelliteRuntimeStatus.c_str());
+            }
+        }
 
         bool atmosphereEnabled = renderer.IsAtmosphereEnabled();
         if (ImGui::Checkbox("Atmosphere Enabled", &atmosphereEnabled)) {

@@ -7,6 +7,9 @@ Texture2D<float4> gSkyViewLut : register(t3);
 Texture2D<float4> gMultipleScatteringLut : register(t4);
 Texture3D<float4> gAerialPerspectiveLut : register(t5);
 Texture2D<float4> gEarthAlbedo : register(t6);
+Texture2D<float4> gSatelliteNear : register(t8);
+Texture2D<float4> gSatelliteMid : register(t9);
+Texture2D<float4> gSatelliteFar : register(t10);
 
 SamplerState gWrapSampler : register(s0);
 SamplerState gClampSampler : register(s1);
@@ -17,8 +20,12 @@ cbuffer ObjectCB : register(b1)
     float4 gColorAndFlags;
     float4 gTuning0; // x midRingMul, y farRingMul, z hazeStrength, w hazeAltitudeRangeMeters
     float4 gTuning1; // x contrast, y slopeBoost, z specularStrength, w lodSeamBlendStrength
-    float4 gTuning2; // x satelliteEnabled, y satelliteBlend, z/w unused
+    float4 gTuning2; // x satelliteEnabled, y satelliteBlend, z fallbackWrapLon, w streamedAnyValid
     float4 gTuning3; // x lonWest, y lonEast, z latSouth, w latNorth (degrees)
+    float4 gTuning4; // streamed near  bounds lonWest/lonEast/latSouth/latNorth
+    float4 gTuning5; // streamed mid   bounds lonWest/lonEast/latSouth/latNorth
+    float4 gTuning6; // streamed far   bounds lonWest/lonEast/latSouth/latNorth
+    float4 gTuning7; // x nearValid, y midValid, z farValid, w unused
 };
 
 struct VSInput
@@ -67,6 +74,32 @@ float3 TerrainColor(float heightMeters)
     return (h01 < 0.55) ? lerp(low, mid, h01 / 0.55) : lerp(mid, high, (h01 - 0.55) / 0.45);
 }
 
+float2 MapLonLatToRingUv(float lonDeg, float latDeg, float4 boundsLonLat, out bool inside)
+{
+    inside = false;
+    const float lonSpan = boundsLonLat.y - boundsLonLat.x;
+    const float latSpan = boundsLonLat.w - boundsLonLat.z;
+    if (abs(lonSpan) < 1e-5 || abs(latSpan) < 1e-5)
+    {
+        return float2(0.0, 0.0);
+    }
+
+    float lonAdj = lonDeg;
+    if (lonAdj < boundsLonLat.x)
+    {
+        lonAdj += 360.0;
+    }
+    if (lonAdj > boundsLonLat.y)
+    {
+        lonAdj -= 360.0;
+    }
+
+    const float u = (lonAdj - boundsLonLat.x) / lonSpan;
+    const float v = (boundsLonLat.w - latDeg) / latSpan;
+    inside = (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0);
+    return float2(u, v);
+}
+
 float4 PSMain(VSOutput input) : SV_Target
 {
     float clampedHeight = input.heightData.x;
@@ -82,6 +115,12 @@ float4 PSMain(VSOutput input) : SV_Target
     float diffuse = 0.80 * ndl;
     float3 H = normalize(V + L);
     float spec = pow(saturate(dot(N, H)), 48.0) * gTuning1.z;
+    const float distMeters = length(input.worldPos);
+    const float nearLodRadius = max(gColorAndFlags.x, 1000.0);
+    const float transitionWidth = max(gColorAndFlags.z, 500.0);
+    const float boundary0 = nearLodRadius;
+    const float boundary1 = nearLodRadius * max(gTuning0.x, 1.1);
+    const float boundary2 = boundary1 * max(gTuning0.y, 1.1);
 
     float3 baseColor = TerrainColor(clampedHeight);
     if (gTuning2.x > 0.5)
@@ -91,8 +130,10 @@ float4 PSMain(VSOutput input) : SV_Target
         float3 dir = normalize(input.worldPos - PlanetCenter());
         float lat = asin(clamp(dir.y, -1.0, 1.0));
         float lon = atan2(dir.z, dir.x);
+        const float latDeg = lat * (180.0 / kPi);
+        const float lonDeg = lon * (180.0 / kPi);
 
-        // Prefer GeoTIFF bounds mapping if available. gTuning2.z indicates whether longitude wrapping is desired.
+        // Base fallback from local GeoTIFF bounds.
         const float lonWest = gTuning3.x;
         const float lonEast = gTuning3.y;
         const float latSouth = gTuning3.z;
@@ -100,25 +141,83 @@ float4 PSMain(VSOutput input) : SV_Target
         const float lonSpan = max(1e-6, lonEast - lonWest);
         const float latSpan = max(1e-6, latNorth - latSouth);
 
-        float u = (lon * (180.0 / kPi) - lonWest) / lonSpan;
-        float v = (latNorth - lat * (180.0 / kPi)) / latSpan;
+        float u = (lonDeg - lonWest) / lonSpan;
+        float v = (latNorth - latDeg) / latSpan;
 
         const bool wrapLon = (gTuning2.z > 0.5);
+        float3 satelliteColor = baseColor;
+        bool haveFallback = false;
         if (wrapLon)
         {
             u = frac(u);
             v = saturate(v);
-            float3 albedo = gEarthAlbedo.Sample(gWrapSampler, float2(u, v)).rgb;
-            baseColor = lerp(baseColor, albedo, saturate(gTuning2.y));
+            satelliteColor = gEarthAlbedo.Sample(gWrapSampler, float2(u, v)).rgb;
+            haveFallback = true;
         }
         else
         {
             // For regional datasets, avoid smearing edges by skipping samples outside the covered bounds.
             if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0)
             {
-                float3 albedo = gEarthAlbedo.Sample(gClampSampler, float2(u, v)).rgb;
-                baseColor = lerp(baseColor, albedo, saturate(gTuning2.y));
+                satelliteColor = gEarthAlbedo.Sample(gClampSampler, float2(u, v)).rgb;
+                haveFallback = true;
             }
+        }
+
+        if (gTuning2.w > 0.5)
+        {
+            const float nearWeight = 1.0 - saturate(smoothstep(boundary0 - transitionWidth, boundary1 + transitionWidth, distMeters));
+            const float farWeight = saturate(smoothstep(boundary1 - transitionWidth, boundary2 + transitionWidth, distMeters));
+            const float midWeight = saturate(1.0 - nearWeight - farWeight);
+
+            float3 streamAccum = 0.0;
+            float streamW = 0.0;
+
+            if (gTuning7.x > 0.5 && nearWeight > 1e-4)
+            {
+                bool inNear = false;
+                const float2 uvNear = MapLonLatToRingUv(lonDeg, latDeg, gTuning4, inNear);
+                if (inNear)
+                {
+                    const float4 s = gSatelliteNear.Sample(gClampSampler, uvNear);
+                    streamAccum += s.rgb * (nearWeight * s.a);
+                    streamW += nearWeight * s.a;
+                }
+            }
+            if (gTuning7.y > 0.5 && midWeight > 1e-4)
+            {
+                bool inMid = false;
+                const float2 uvMid = MapLonLatToRingUv(lonDeg, latDeg, gTuning5, inMid);
+                if (inMid)
+                {
+                    const float4 s = gSatelliteMid.Sample(gClampSampler, uvMid);
+                    streamAccum += s.rgb * (midWeight * s.a);
+                    streamW += midWeight * s.a;
+                }
+            }
+            if (gTuning7.z > 0.5 && farWeight > 1e-4)
+            {
+                bool inFar = false;
+                const float2 uvFar = MapLonLatToRingUv(lonDeg, latDeg, gTuning6, inFar);
+                if (inFar)
+                {
+                    const float4 s = gSatelliteFar.Sample(gClampSampler, uvFar);
+                    streamAccum += s.rgb * (farWeight * s.a);
+                    streamW += farWeight * s.a;
+                }
+            }
+
+            if (streamW > 1e-4)
+            {
+                const float3 streamed = streamAccum / streamW;
+                satelliteColor = haveFallback ? lerp(satelliteColor, streamed, saturate(streamW)) : streamed;
+                haveFallback = true;
+            }
+        }
+
+        if (haveFallback)
+        {
+            baseColor = lerp(baseColor, satelliteColor, saturate(gTuning2.y));
         }
     }
     const float slopeTerm = saturate(1.0 - abs(dot(N, normalize(gCameraUpAndTime.xyz))));
@@ -126,13 +225,6 @@ float4 PSMain(VSOutput input) : SV_Target
     baseColor *= slopeBoost;
     float3 color = baseColor * (ambient + diffuse) + spec.xxx;
     color = pow(max(color, 1e-4), 1.0 / max(gTuning1.x, 0.05));
-
-    const float distMeters = length(input.worldPos);
-    const float nearLodRadius = max(gColorAndFlags.x, 1000.0);
-    const float transitionWidth = max(gColorAndFlags.z, 500.0);
-    const float boundary0 = nearLodRadius;
-    const float boundary1 = nearLodRadius * max(gTuning0.x, 1.1);
-    const float boundary2 = boundary1 * max(gTuning0.y, 1.1);
 
     const float frameId = floor(gCameraUpAndTime.w * 10.0);
     const float dither = InterleavedGradientNoise(floor(input.position.xy), frameId) - 0.5;

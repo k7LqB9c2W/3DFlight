@@ -28,6 +28,8 @@ add_executable(3DFlight WIN32
     src/terrain/terrain_system.h
     src/terrain/terrain_mesh.cpp
     src/terrain/terrain_mesh.h
+    src/satellite/satellite_streamer.cpp
+    src/satellite/satellite_streamer.h
     third_party/cgltf/cgltf.c
 )
 
@@ -56,6 +58,7 @@ target_link_libraries(3DFlight PRIVATE
     dxguid
     d3dcompiler
     windowscodecs
+    winhttp
 )
 
 if(TARGET unofficial::gdal::gdal)

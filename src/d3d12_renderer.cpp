@@ -249,6 +249,42 @@ bool D3D12Renderer::Initialize(
         return false;
     }
     {
+        constexpr uint8_t kTransparent[4] = {0, 0, 0, 0};
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                kSatelliteNearSrvIndex,
+                m_satelliteLodTextures[0],
+                m_satelliteLodUploads[0],
+                kTransparent,
+                1,
+                1,
+                error)) {
+            return false;
+        }
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                kSatelliteMidSrvIndex,
+                m_satelliteLodTextures[1],
+                m_satelliteLodUploads[1],
+                kTransparent,
+                1,
+                1,
+                error)) {
+            return false;
+        }
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                kSatelliteFarSrvIndex,
+                m_satelliteLodTextures[2],
+                m_satelliteLodUploads[2],
+                kTransparent,
+                1,
+                1,
+                error)) {
+            return false;
+        }
+    }
+    {
         constexpr uint8_t kDefaultWhite[4] = {255, 255, 255, 255};
         if (!CreatePlaneTextureFromPixels(m_commandList.Get(), kDefaultWhite, 1, 1, error)) {
             return false;
@@ -271,6 +307,9 @@ bool D3D12Renderer::Initialize(
     m_landmaskUpload.Reset();
     m_skyboxUpload.Reset();
     m_earthAlbedoUpload.Reset();
+    for (auto& upload : m_satelliteLodUploads) {
+        upload.Reset();
+    }
     m_modelAlbedoUpload.Reset();
 
     IMGUI_CHECKVERSION();
@@ -350,6 +389,13 @@ void D3D12Renderer::Shutdown() {
     m_skyboxUpload.Reset();
     m_earthAlbedoTexture.Reset();
     m_earthAlbedoUpload.Reset();
+    for (auto& tex : m_satelliteLodTextures) {
+        tex.Reset();
+    }
+    for (auto& upload : m_satelliteLodUploads) {
+        upload.Reset();
+    }
+    m_satelliteLodValid = {0.0f, 0.0f, 0.0f};
     m_modelAlbedoTexture.Reset();
     m_modelAlbedoUpload.Reset();
     m_hasModelAlbedoTexture = false;
@@ -495,6 +541,58 @@ bool D3D12Renderer::SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, u
     m_commandQueue->ExecuteCommandLists(1, lists);
     WaitForGpu();
     m_modelAlbedoUpload.Reset();
+
+    return true;
+}
+
+bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture, 3>& lods, std::string& error) {
+    constexpr uint8_t kTransparent[4] = {0, 0, 0, 0};
+
+    WaitForGpu();
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    FrameContext& frame = m_frames[m_frameIndex];
+    if (FAILED(frame.allocator->Reset())) {
+        error = "SetSatelliteLodTextures allocator reset failed";
+        return false;
+    }
+    if (FAILED(m_commandList->Reset(frame.allocator.Get(), nullptr))) {
+        error = "SetSatelliteLodTextures command list reset failed";
+        return false;
+    }
+
+    for (size_t i = 0; i < lods.size(); ++i) {
+        const SatelliteLodTexture& lod = lods[i];
+        const uint8_t* pixels = lod.valid ? lod.rgbaPixels : kTransparent;
+        const uint32_t width = (lod.valid && lod.width > 0) ? lod.width : 1;
+        const uint32_t height = (lod.valid && lod.height > 0) ? lod.height : 1;
+        const UINT srvIndex = (i == 0) ? kSatelliteNearSrvIndex : (i == 1 ? kSatelliteMidSrvIndex : kSatelliteFarSrvIndex);
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                srvIndex,
+                m_satelliteLodTextures[i],
+                m_satelliteLodUploads[i],
+                pixels,
+                width,
+                height,
+                error)) {
+            return false;
+        }
+        m_satelliteLodBounds[i] = lod.boundsLonLat;
+        m_satelliteLodValid[i] = lod.valid ? 1.0f : 0.0f;
+    }
+
+    if (FAILED(m_commandList->Close())) {
+        error = "SetSatelliteLodTextures command list close failed";
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+    for (auto& upload : m_satelliteLodUploads) {
+        upload.Reset();
+    }
 
     return true;
 }
@@ -778,6 +876,11 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning2 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning3 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning4 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning5 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning6 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning7 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 0), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 0);
@@ -797,6 +900,11 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning2 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning3 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning4 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning5 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning6 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning7 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 1), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 1);
@@ -833,9 +941,13 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             m_terrainVisualSettings.satelliteEnabled ? 1.0f : 0.0f,
             m_terrainVisualSettings.satelliteBlend,
             m_earthAlbedoWrapLon,
-            0.0f,
+            m_satelliteLodValid[0] + m_satelliteLodValid[1] + m_satelliteLodValid[2],
         };
         obj.tuning3 = m_earthAlbedoBoundsLonLat;
+        obj.tuning4 = m_satelliteLodBounds[0];
+        obj.tuning5 = m_satelliteLodBounds[1];
+        obj.tuning6 = m_satelliteLodBounds[2];
+        obj.tuning7 = {m_satelliteLodValid[0], m_satelliteLodValid[1], m_satelliteLodValid[2], 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
@@ -870,6 +982,11 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning0 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning1 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning2 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning3 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning4 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning5 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning6 = {0.0f, 0.0f, 0.0f, 0.0f};
+        obj.tuning7 = {0.0f, 0.0f, 0.0f, 0.0f};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
@@ -1142,7 +1259,7 @@ bool D3D12Renderer::CompileShader(
 bool D3D12Renderer::CreatePipeline(std::string& error) {
     D3D12_DESCRIPTOR_RANGE graphicsSrvRange{};
     graphicsSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    graphicsSrvRange.NumDescriptors = 8; // t0..t7
+    graphicsSrvRange.NumDescriptors = 12; // t0..t11
     graphicsSrvRange.BaseShaderRegister = 0;
     graphicsSrvRange.RegisterSpace = 0;
     graphicsSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1220,7 +1337,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
 
     D3D12_DESCRIPTOR_RANGE computeSrvRange{};
     computeSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    computeSrvRange.NumDescriptors = 8; // t0..t7 (t6/t7 unused by LUT compute, but present in shared SRV heap table)
+    computeSrvRange.NumDescriptors = 12; // t0..t11 (higher slots unused by LUT compute, present in shared SRV heap table)
     computeSrvRange.BaseShaderRegister = 0;
     computeSrvRange.RegisterSpace = 0;
     computeSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1883,14 +2000,17 @@ bool D3D12Renderer::LoadColorPixels(
     return true;
 }
 
-bool D3D12Renderer::CreatePlaneTextureFromPixels(
+bool D3D12Renderer::CreateSatelliteTextureFromPixels(
     ID3D12GraphicsCommandList* commandList,
+    UINT srvIndex,
+    ComPtr<ID3D12Resource>& outTexture,
+    ComPtr<ID3D12Resource>& outUpload,
     const uint8_t* rgbaPixels,
     uint32_t width,
     uint32_t height,
     std::string& error) {
     if (rgbaPixels == nullptr || width == 0 || height == 0) {
-        error = "CreatePlaneTextureFromPixels received invalid pixel data";
+        error = "CreateSatelliteTextureFromPixels received invalid pixel data";
         return false;
     }
 
@@ -1993,10 +2113,30 @@ bool D3D12Renderer::CreatePlaneTextureFromPixels(
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    m_device->CreateShaderResourceView(texture.Get(), &srv, CpuSrv(kModelAlbedoSrvIndex));
+    m_device->CreateShaderResourceView(texture.Get(), &srv, CpuSrv(srvIndex));
 
-    m_modelAlbedoTexture = std::move(texture);
-    m_modelAlbedoUpload = std::move(upload);
+    outTexture = std::move(texture);
+    outUpload = std::move(upload);
+    return true;
+}
+
+bool D3D12Renderer::CreatePlaneTextureFromPixels(
+    ID3D12GraphicsCommandList* commandList,
+    const uint8_t* rgbaPixels,
+    uint32_t width,
+    uint32_t height,
+    std::string& error) {
+    if (!CreateSatelliteTextureFromPixels(
+            commandList,
+            kModelAlbedoSrvIndex,
+            m_modelAlbedoTexture,
+            m_modelAlbedoUpload,
+            rgbaPixels,
+            width,
+            height,
+            error)) {
+        return false;
+    }
     m_hasModelAlbedoTexture = true;
     return true;
 }

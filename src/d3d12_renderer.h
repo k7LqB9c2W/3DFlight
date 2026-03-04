@@ -23,6 +23,15 @@ namespace flight {
 
 class D3D12Renderer {
 public:
+    struct SatelliteLodTexture {
+        const uint8_t* rgbaPixels = nullptr;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        // Unwrapped lon/lat bounds: x=lonW, y=lonE, z=latS, w=latN.
+        DirectX::XMFLOAT4 boundsLonLat{0.0f, 0.0f, 0.0f, 0.0f};
+        bool valid = false;
+    };
+
     struct TerrainVisualSettings {
         float colorHeightMaxMeters = 6000.0f;
         float lodTransitionWidthMeters = 5000.0f;
@@ -55,6 +64,7 @@ public:
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
     bool SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
+    bool SetSatelliteLodTextures(const std::array<SatelliteLodTexture, 3>& lods, std::string& error);
     bool SetTerrainMesh(const MeshData& mesh, const Double3& anchorEcef, const DirectX::XMFLOAT4& renderParams, std::string& error);
     void SetTerrainVisualSettings(const TerrainVisualSettings& settings);
     [[nodiscard]] const TerrainVisualSettings& GetTerrainVisualSettings() const { return m_terrainVisualSettings; }
@@ -92,7 +102,10 @@ private:
     static constexpr UINT kMultipleScatteringSrvIndex = 5;
     static constexpr UINT kAerialPerspectiveSrvIndex = 6;
     static constexpr UINT kEarthAlbedoSrvIndex = 7;
-    static constexpr UINT kModelAlbedoSrvIndex = 8;
+    static constexpr UINT kSatelliteNearSrvIndex = 8;
+    static constexpr UINT kSatelliteMidSrvIndex = 9;
+    static constexpr UINT kSatelliteFarSrvIndex = 10;
+    static constexpr UINT kModelAlbedoSrvIndex = 11;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
@@ -147,6 +160,10 @@ private:
         DirectX::XMFLOAT4 tuning1{};
         DirectX::XMFLOAT4 tuning2{};
         DirectX::XMFLOAT4 tuning3{};
+        DirectX::XMFLOAT4 tuning4{};
+        DirectX::XMFLOAT4 tuning5{};
+        DirectX::XMFLOAT4 tuning6{};
+        DirectX::XMFLOAT4 tuning7{};
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -161,6 +178,15 @@ private:
     bool CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandList, std::string& error);
     bool CreatePlaneTextureFromPixels(
         ID3D12GraphicsCommandList* commandList,
+        const uint8_t* rgbaPixels,
+        uint32_t width,
+        uint32_t height,
+        std::string& error);
+    bool CreateSatelliteTextureFromPixels(
+        ID3D12GraphicsCommandList* commandList,
+        UINT srvIndex,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& outTexture,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& outUpload,
         const uint8_t* rgbaPixels,
         uint32_t width,
         uint32_t height,
@@ -278,9 +304,16 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyboxUpload;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_earthAlbedoTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_earthAlbedoUpload;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> m_satelliteLodTextures;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> m_satelliteLodUploads;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoUpload;
     bool m_hasModelAlbedoTexture = false;
+    std::array<DirectX::XMFLOAT4, 3> m_satelliteLodBounds{
+        DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f},
+        DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f},
+        DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f}};
+    std::array<float, 3> m_satelliteLodValid{0.0f, 0.0f, 0.0f};
     std::filesystem::path m_earthAlbedoSourcePath;
     bool m_hasEarthAlbedoSourceFile = false;
     DirectX::XMFLOAT4 m_earthAlbedoBoundsLonLat = {-180.0f, 180.0f, -90.0f, 90.0f}; // lonW, lonE, latS, latN
