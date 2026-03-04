@@ -802,7 +802,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         satCfg.midTextureSize = 512;
         satCfg.farTextureSize = 384;
         satCfg.maxMemoryTiles = 2048;
-        satCfg.workerCount = 12;
+        satCfg.workerCount = 8;
         std::string satError;
         if (satelliteStreamer.Initialize(satCfg, satError)) {
             satelliteStreamerReady = true;
@@ -893,6 +893,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     double satelliteLastComposeMs = 0.0;
     double satelliteLastUploadMs = 0.0;
     double satelliteComposeCooldownSeconds = 0.0;
+    double satellitePrefetchCooldownSeconds = 0.0;
+    double frameTimeEmaMs = 16.67;
     struct SatelliteComposeAsyncResult {
         bool composed = false;
         std::array<flight::satellite::RingTexture, 3> rings{};
@@ -1036,6 +1038,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         double dt = std::chrono::duration<double>(now - lastTime).count();
         lastTime = now;
         dt = std::clamp(dt, 0.0, 0.1);
+        frameTimeEmaMs = std::clamp(frameTimeEmaMs * 0.94 + (dt * 1000.0) * 0.06, 5.0, 80.0);
         terrainBuildCooldownSeconds = std::max(0.0, terrainBuildCooldownSeconds - dt);
 
         graphicsHotReloadAccumulator += dt;
@@ -1118,7 +1121,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         if (satelliteStreamerReady) {
-            satelliteStreamer.PrefetchForView(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
+            const double prefetchCadenceSeconds =
+                (frameTimeEmaMs > 30.0) ? 0.20 : ((frameTimeEmaMs > 22.0) ? 0.12 : 0.06);
+            satellitePrefetchCooldownSeconds = std::max(0.0, satellitePrefetchCooldownSeconds - dt);
+            if (satellitePrefetchCooldownSeconds <= 0.0) {
+                satelliteStreamer.PrefetchForView(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
+                satellitePrefetchCooldownSeconds = prefetchCadenceSeconds;
+            }
             satelliteComposeCooldownSeconds = std::max(0.0, satelliteComposeCooldownSeconds - dt);
             if (satelliteComposeInFlight &&
                 satelliteComposeFuture.valid() &&
@@ -1133,7 +1142,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 if (result.composed) {
                     satelliteComposeGeneration += 1;
                     if (uploadSatelliteRings(result.rings)) {
-                        satelliteComposeCooldownSeconds = 0.08;
+                        satelliteComposeCooldownSeconds =
+                            (frameTimeEmaMs > 30.0) ? 0.22 : ((frameTimeEmaMs > 22.0) ? 0.14 : 0.08);
                     } else {
                         satelliteComposeCooldownSeconds = 0.25;
                     }
@@ -1156,7 +1166,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     out.composed = satelliteStreamer.ComposeLodRings(satLat, satLon, satAlt, false, out.rings, out.error);
                     return out;
                 });
-                satelliteComposeCooldownSeconds = 0.04;
+                satelliteComposeCooldownSeconds =
+                    (frameTimeEmaMs > 30.0) ? 0.12 : ((frameTimeEmaMs > 22.0) ? 0.08 : 0.04);
             }
             satelliteStats = satelliteStreamer.GetStats();
         }

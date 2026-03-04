@@ -1139,7 +1139,7 @@ struct SatelliteStreamer::Impl {
                 std::scoped_lock<std::mutex> lock(mutex);
                 dirtyBacklog = dirtyTileQueue.size();
             }
-            const size_t dirtyBatchBudget = std::clamp<size_t>(dirtyBacklog + 192, 512, 4096);
+            const size_t dirtyBatchBudget = std::clamp<size_t>(dirtyBacklog + 128, 384, 2048);
             dirtyTilesForCompose = ConsumeDirtyTiles(dirtyBatchBudget, dirtyTilesRemaining);
         }
         const std::vector<TileKey>* dirtyTilesPtr = dirtyTilesForCompose.empty() ? nullptr : &dirtyTilesForCompose;
