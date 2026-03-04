@@ -238,10 +238,10 @@ struct SatelliteStreamer::Impl {
                                          (kEarthRadiusMeters * kEarthRadiusMeters))) *
             0.001;
 
-        // Scale stream coverage with altitude so cruising flight still sees streamed imagery instead of only fallback albedo.
-        const double farRadiusKm = std::clamp(horizonKm * 0.65, 80.0, 520.0);
-        const double midRadiusKm = std::clamp(farRadiusKm * 0.32, 20.0, 220.0);
-        const double nearRadiusKm = std::clamp(midRadiusKm * 0.26, 4.0, 70.0);
+        // Scale stream coverage with altitude so cruising flight keeps high-res imagery farther toward the horizon.
+        const double farRadiusKm = std::clamp(horizonKm * 0.90, 140.0, 900.0);
+        const double midRadiusKm = std::clamp(farRadiusKm * 0.42, 30.0, 300.0);
+        const double nearRadiusKm = std::clamp(midRadiusKm * 0.28, 6.0, 95.0);
 
         rings[0].radiusKm = nearRadiusKm;
         rings[1].radiusKm = midRadiusKm;
@@ -666,9 +666,11 @@ struct SatelliteStreamer::Impl {
         double latDeg,
         double lonDeg,
         int targetZoom,
-        std::array<uint8_t, 4>& outColor) {
+        std::array<uint8_t, 4>& outColor,
+        int& outSampleZoom) {
         const double lat = ClampLatDeg(latDeg);
         const double lonWrapped = WrapLonDeg(lonDeg);
+        outSampleZoom = -1;
 
         for (int z = targetZoom; z >= 0; --z) {
             const int n = 1 << z;
@@ -693,7 +695,8 @@ struct SatelliteStreamer::Impl {
             outColor[0] = (*found->second)[idx + 0];
             outColor[1] = (*found->second)[idx + 1];
             outColor[2] = (*found->second)[idx + 2];
-            outColor[3] = 255;
+            outColor[3] = 0;
+            outSampleZoom = z;
             return true;
         }
         return false;
@@ -730,6 +733,7 @@ struct SatelliteStreamer::Impl {
         const double invW = 1.0 / static_cast<double>(out.width);
         const double invH = 1.0 / static_cast<double>(out.height);
         size_t validPixelCount = 0;
+        constexpr double kEdgeFeather = 0.08;
         for (uint32_t y = 0; y < out.height; ++y) {
             const double v = (static_cast<double>(y) + 0.5) * invH;
             const double lat = latN + (latS - latN) * v;
@@ -737,8 +741,23 @@ struct SatelliteStreamer::Impl {
                 const double u = (static_cast<double>(x) + 0.5) * invW;
                 const double lon = lonW + (lonE - lonW) * u;
                 std::array<uint8_t, 4> color{0, 0, 0, 0};
-                if (SampleColorFromSnapshot(snapshot, lat, lon, params.zoom, color)) {
-                    validPixelCount += 1;
+                int sampledZoom = -1;
+                if (SampleColorFromSnapshot(snapshot, lat, lon, params.zoom, color, sampledZoom)) {
+                    const int zoomDelta = std::max(0, params.zoom - sampledZoom);
+                    float lodQuality = 1.0f - static_cast<float>(zoomDelta) * 0.18f;
+                    lodQuality = std::clamp(lodQuality, 0.30f, 1.0f);
+
+                    const double edgeU = std::min(u, 1.0 - u);
+                    const double edgeV = std::min(v, 1.0 - v);
+                    const double edgeDist = std::min(edgeU, edgeV);
+                    const float edgeFade = static_cast<float>(std::clamp(edgeDist / kEdgeFeather, 0.0, 1.0));
+
+                    const float alphaF = std::clamp(lodQuality * edgeFade, 0.0f, 1.0f);
+                    const uint8_t alpha = static_cast<uint8_t>(std::round(alphaF * 255.0f));
+                    color[3] = alpha;
+                    if (alpha > 0) {
+                        validPixelCount += 1;
+                    }
                 }
                 const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(out.width) + static_cast<size_t>(x)) * 4u;
                 out.rgbaPixels[idx + 0] = color[0];
@@ -780,7 +799,8 @@ struct SatelliteStreamer::Impl {
         bool movedEnough = true;
         if (hasComposeState) {
             const double d = DistanceMeters(lastComposeLatDeg, lastComposeLonDeg, latDeg, lonDeg);
-            movedEnough = d > 2500.0;
+            const double recenterMeters = std::clamp(rings[0].radiusKm * 1000.0 * 0.35, 2500.0, 20000.0);
+            movedEnough = d > recenterMeters;
         }
 
         const bool dirty = dirtySinceLastCompose.load();
