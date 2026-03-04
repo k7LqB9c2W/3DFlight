@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -283,6 +284,39 @@ bool D3D12Renderer::Initialize(
                 error)) {
             return false;
         }
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                kSatellitePrevNearSrvIndex,
+                m_satellitePrevLodTextures[0],
+                m_satellitePrevLodUploads[0],
+                kTransparent,
+                1,
+                1,
+                error)) {
+            return false;
+        }
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                kSatellitePrevMidSrvIndex,
+                m_satellitePrevLodTextures[1],
+                m_satellitePrevLodUploads[1],
+                kTransparent,
+                1,
+                1,
+                error)) {
+            return false;
+        }
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                kSatellitePrevFarSrvIndex,
+                m_satellitePrevLodTextures[2],
+                m_satellitePrevLodUploads[2],
+                kTransparent,
+                1,
+                1,
+                error)) {
+            return false;
+        }
     }
     {
         constexpr uint8_t kDefaultWhite[4] = {255, 255, 255, 255};
@@ -308,6 +342,9 @@ bool D3D12Renderer::Initialize(
     m_skyboxUpload.Reset();
     m_earthAlbedoUpload.Reset();
     for (auto& upload : m_satelliteLodUploads) {
+        upload.Reset();
+    }
+    for (auto& upload : m_satellitePrevLodUploads) {
         upload.Reset();
     }
     m_modelAlbedoUpload.Reset();
@@ -570,8 +607,11 @@ bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture
 
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> newTextures;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> newUploads;
+    std::array<DirectX::XMFLOAT4, 3> newBounds{};
+    std::array<float, 3> newValid{0.0f, 0.0f, 0.0f};
 
     const UINT64 oldFenceSnapshot = m_fenceValue;
+    const bool hadCurrentValid = (m_satelliteLodValid[0] + m_satelliteLodValid[1] + m_satelliteLodValid[2]) > 0.5f;
 
     for (size_t i = 0; i < lods.size(); ++i) {
         const SatelliteLodTexture& lod = lods[i];
@@ -590,8 +630,8 @@ bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture
                 error)) {
             return false;
         }
-        m_satelliteLodBounds[i] = lod.boundsLonLat;
-        m_satelliteLodValid[i] = lod.valid ? 1.0f : 0.0f;
+        newBounds[i] = lod.boundsLonLat;
+        newValid[i] = lod.valid ? 1.0f : 0.0f;
     }
 
     if (FAILED(m_satelliteUploadCommandList->Close())) {
@@ -606,22 +646,49 @@ bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture
     m_commandQueue->Signal(m_fence.Get(), uploadFence);
 
     for (size_t i = 0; i < m_satelliteLodTextures.size(); ++i) {
-        if (m_satelliteLodTextures[i]) {
-            DeferredResource retired{};
-            retired.resource = std::move(m_satelliteLodTextures[i]);
-            retired.safeFenceValue = oldFenceSnapshot;
-            m_retiredResources.push_back(std::move(retired));
+        if (m_satellitePrevLodTextures[i]) {
+            DeferredResource retiredPrev{};
+            retiredPrev.resource = std::move(m_satellitePrevLodTextures[i]);
+            retiredPrev.safeFenceValue = oldFenceSnapshot;
+            m_retiredResources.push_back(std::move(retiredPrev));
         }
-        if (m_satelliteLodUploads[i]) {
-            DeferredResource retiredUpload{};
-            retiredUpload.resource = std::move(m_satelliteLodUploads[i]);
-            retiredUpload.safeFenceValue = oldFenceSnapshot;
-            m_retiredResources.push_back(std::move(retiredUpload));
+        if (m_satellitePrevLodUploads[i]) {
+            DeferredResource retiredPrevUpload{};
+            retiredPrevUpload.resource = std::move(m_satellitePrevLodUploads[i]);
+            retiredPrevUpload.safeFenceValue = oldFenceSnapshot;
+            m_retiredResources.push_back(std::move(retiredPrevUpload));
         }
+
+        m_satellitePrevLodTextures[i] = std::move(m_satelliteLodTextures[i]);
+        m_satellitePrevLodUploads[i] = std::move(m_satelliteLodUploads[i]);
+        m_satellitePrevLodBounds[i] = m_satelliteLodBounds[i];
+        m_satellitePrevLodValid[i] = m_satelliteLodValid[i];
+
         m_satelliteLodTextures[i] = std::move(newTextures[i]);
         m_satelliteLodUploads[i] = std::move(newUploads[i]);
+        m_satelliteLodBounds[i] = newBounds[i];
+        m_satelliteLodValid[i] = newValid[i];
+    }
+    if (m_satellitePrevLodTextures[0]) {
+        CreateSatelliteSrvForResource(m_satellitePrevLodTextures[0].Get(), kSatellitePrevNearSrvIndex);
+    }
+    if (m_satellitePrevLodTextures[1]) {
+        CreateSatelliteSrvForResource(m_satellitePrevLodTextures[1].Get(), kSatellitePrevMidSrvIndex);
+    }
+    if (m_satellitePrevLodTextures[2]) {
+        CreateSatelliteSrvForResource(m_satellitePrevLodTextures[2].Get(), kSatellitePrevFarSrvIndex);
     }
     m_satelliteUploadFenceValue = uploadFence;
+
+    const bool hasNewValid = (newValid[0] + newValid[1] + newValid[2]) > 0.5f;
+    if (hadCurrentValid && hasNewValid) {
+        m_satelliteTransitionStart = std::chrono::steady_clock::now();
+        m_satelliteTransitionT = 0.0f;
+        m_satelliteTransitionActive = true;
+    } else {
+        m_satelliteTransitionT = 1.0f;
+        m_satelliteTransitionActive = false;
+    }
 
     return true;
 }
@@ -886,6 +953,18 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     };
     std::memcpy(m_sceneCbMapped[m_frameIndex], &sceneCb, sizeof(sceneCb));
 
+    if (m_satelliteTransitionActive) {
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_satelliteTransitionStart).count();
+        const double dur = std::max(0.05, static_cast<double>(m_satelliteTransitionDurationSeconds));
+        m_satelliteTransitionT = static_cast<float>(std::clamp(elapsed / dur, 0.0, 1.0));
+        if (m_satelliteTransitionT >= 1.0f) {
+            m_satelliteTransitionT = 1.0f;
+            m_satelliteTransitionActive = false;
+        }
+    } else {
+        m_satelliteTransitionT = 1.0f;
+    }
+
     const D3D12_GPU_VIRTUAL_ADDRESS sceneCbGpu = m_sceneCb[m_frameIndex]->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS objectCbGpuBase = m_objectCb[m_frameIndex]->GetGPUVirtualAddress();
 
@@ -977,6 +1056,10 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning5 = m_satelliteLodBounds[1];
         obj.tuning6 = m_satelliteLodBounds[2];
         obj.tuning7 = {m_satelliteLodValid[0], m_satelliteLodValid[1], m_satelliteLodValid[2], 0.0f};
+        obj.tuning8 = m_satellitePrevLodBounds[0];
+        obj.tuning9 = m_satellitePrevLodBounds[1];
+        obj.tuning10 = m_satellitePrevLodBounds[2];
+        obj.tuning11 = {m_satellitePrevLodValid[0], m_satellitePrevLodValid[1], m_satellitePrevLodValid[2], m_satelliteTransitionT};
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 2);
@@ -1308,7 +1391,7 @@ bool D3D12Renderer::CompileShader(
 bool D3D12Renderer::CreatePipeline(std::string& error) {
     D3D12_DESCRIPTOR_RANGE graphicsSrvRange{};
     graphicsSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    graphicsSrvRange.NumDescriptors = 12; // t0..t11
+    graphicsSrvRange.NumDescriptors = 15; // t0..t14
     graphicsSrvRange.BaseShaderRegister = 0;
     graphicsSrvRange.RegisterSpace = 0;
     graphicsSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1386,7 +1469,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
 
     D3D12_DESCRIPTOR_RANGE computeSrvRange{};
     computeSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    computeSrvRange.NumDescriptors = 12; // t0..t11 (higher slots unused by LUT compute, present in shared SRV heap table)
+    computeSrvRange.NumDescriptors = 15; // t0..t14 (higher slots unused by LUT compute, present in shared SRV heap table)
     computeSrvRange.BaseShaderRegister = 0;
     computeSrvRange.RegisterSpace = 0;
     computeSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -2167,6 +2250,15 @@ bool D3D12Renderer::CreateSatelliteTextureFromPixels(
     outTexture = std::move(texture);
     outUpload = std::move(upload);
     return true;
+}
+
+void D3D12Renderer::CreateSatelliteSrvForResource(ID3D12Resource* texture, UINT srvIndex) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(texture, &srv, CpuSrv(srvIndex));
 }
 
 bool D3D12Renderer::CreatePlaneTextureFromPixels(

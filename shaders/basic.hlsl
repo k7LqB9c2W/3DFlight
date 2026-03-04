@@ -7,7 +7,7 @@ Texture2D<float4> gSkyViewLut : register(t3);
 Texture2D<float4> gMultipleScatteringLut : register(t4);
 Texture3D<float4> gAerialPerspectiveLut : register(t5);
 Texture2D<float4> gEarthAlbedo : register(t6);
-Texture2D<float4> gModelAlbedo : register(t11);
+Texture2D<float4> gModelAlbedo : register(t14);
 
 SamplerState gWrapSampler : register(s0);
 SamplerState gClampSampler : register(s1);

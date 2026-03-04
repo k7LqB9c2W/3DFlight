@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -108,10 +109,16 @@ private:
     //   t9  -> descriptor 10
     //   t10 -> descriptor 11
     //   t11 -> descriptor 12
+    //   t12 -> descriptor 13
+    //   t13 -> descriptor 14
+    //   t14 -> descriptor 15
     static constexpr UINT kSatelliteNearSrvIndex = 9;
     static constexpr UINT kSatelliteMidSrvIndex = 10;
     static constexpr UINT kSatelliteFarSrvIndex = 11;
-    static constexpr UINT kModelAlbedoSrvIndex = 12;
+    static constexpr UINT kSatellitePrevNearSrvIndex = 12;
+    static constexpr UINT kSatellitePrevMidSrvIndex = 13;
+    static constexpr UINT kSatellitePrevFarSrvIndex = 14;
+    static constexpr UINT kModelAlbedoSrvIndex = 15;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
@@ -170,6 +177,10 @@ private:
         DirectX::XMFLOAT4 tuning5{};
         DirectX::XMFLOAT4 tuning6{};
         DirectX::XMFLOAT4 tuning7{};
+        DirectX::XMFLOAT4 tuning8{};
+        DirectX::XMFLOAT4 tuning9{};
+        DirectX::XMFLOAT4 tuning10{};
+        DirectX::XMFLOAT4 tuning11{};
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -223,6 +234,7 @@ private:
         uint32_t width,
         uint32_t height,
         std::string& error);
+    void CreateSatelliteSrvForResource(ID3D12Resource* texture, UINT srvIndex);
 
     bool CompileShader(
         const std::filesystem::path& path,
@@ -320,6 +332,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_earthAlbedoUpload;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> m_satelliteLodTextures;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> m_satelliteLodUploads;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> m_satellitePrevLodTextures;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3> m_satellitePrevLodUploads;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoUpload;
     bool m_hasModelAlbedoTexture = false;
@@ -328,6 +342,15 @@ private:
         DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f},
         DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f}};
     std::array<float, 3> m_satelliteLodValid{0.0f, 0.0f, 0.0f};
+    std::array<DirectX::XMFLOAT4, 3> m_satellitePrevLodBounds{
+        DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f},
+        DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f},
+        DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f}};
+    std::array<float, 3> m_satellitePrevLodValid{0.0f, 0.0f, 0.0f};
+    std::chrono::steady_clock::time_point m_satelliteTransitionStart{};
+    float m_satelliteTransitionDurationSeconds = 0.55f;
+    float m_satelliteTransitionT = 1.0f;
+    bool m_satelliteTransitionActive = false;
     std::filesystem::path m_earthAlbedoSourcePath;
     bool m_hasEarthAlbedoSourceFile = false;
     DirectX::XMFLOAT4 m_earthAlbedoBoundsLonLat = {-180.0f, 180.0f, -90.0f, 90.0f}; // lonW, lonE, latS, latN

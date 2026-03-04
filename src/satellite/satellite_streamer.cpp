@@ -80,6 +80,13 @@ double DistanceMeters(double latA, double lonA, double latB, double lonB) {
     return kEarthRadiusMeters * c;
 }
 
+double SnapToStep(double value, double step) {
+    if (step <= 1e-9) {
+        return value;
+    }
+    return std::round(value / step) * step;
+}
+
 std::wstring Utf8ToWide(const std::string& in) {
     if (in.empty()) {
         return {};
@@ -808,14 +815,29 @@ struct SatelliteStreamer::Impl {
             return false;
         }
 
+        double composeLatDeg = latDeg;
+        double composeLonDeg = WrapLonDeg(lonDeg);
+        const double recenterMeters = std::clamp(rings[0].radiusKm * 1000.0 * 0.20, 1500.0, 12000.0);
+        const double stepLatDeg = flight::RadToDeg(recenterMeters / kEarthRadiusMeters);
+        if (hasComposeState && !zoomChanged && !movedEnough) {
+            // Tile arrivals can dirty the stream frequently; keep center stable until we actually need a recenter.
+            composeLatDeg = lastComposeLatDeg;
+            composeLonDeg = lastComposeLonDeg;
+        } else {
+            composeLatDeg = std::clamp(SnapToStep(latDeg, stepLatDeg), -85.0, 85.0);
+            const double cosLat = std::max(0.20, std::cos(flight::DegToRad(composeLatDeg)));
+            const double stepLonDeg = flight::RadToDeg(recenterMeters / (kEarthRadiusMeters * cosLat));
+            composeLonDeg = WrapLonDeg(SnapToStep(lonDeg, stepLonDeg));
+        }
+
         const auto snapshot = CacheSnapshot();
-        outRings[0] = ComposeRing(latDeg, lonDeg, rings[0], snapshot);
-        outRings[1] = ComposeRing(latDeg, lonDeg, rings[1], snapshot);
-        outRings[2] = ComposeRing(latDeg, lonDeg, rings[2], snapshot);
+        outRings[0] = ComposeRing(composeLatDeg, composeLonDeg, rings[0], snapshot);
+        outRings[1] = ComposeRing(composeLatDeg, composeLonDeg, rings[1], snapshot);
+        outRings[2] = ComposeRing(composeLatDeg, composeLonDeg, rings[2], snapshot);
 
         hasComposeState = true;
-        lastComposeLatDeg = latDeg;
-        lastComposeLonDeg = lonDeg;
+        lastComposeLatDeg = composeLatDeg;
+        lastComposeLonDeg = composeLonDeg;
         lastComposeZooms = {rings[0].zoom, rings[1].zoom, rings[2].zoom};
         dirtySinceLastCompose = false;
         return true;

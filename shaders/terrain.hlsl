@@ -10,6 +10,9 @@ Texture2D<float4> gEarthAlbedo : register(t6);
 Texture2D<float4> gSatelliteNear : register(t8);
 Texture2D<float4> gSatelliteMid : register(t9);
 Texture2D<float4> gSatelliteFar : register(t10);
+Texture2D<float4> gSatellitePrevNear : register(t11);
+Texture2D<float4> gSatellitePrevMid : register(t12);
+Texture2D<float4> gSatellitePrevFar : register(t13);
 
 SamplerState gWrapSampler : register(s0);
 SamplerState gClampSampler : register(s1);
@@ -26,6 +29,10 @@ cbuffer ObjectCB : register(b1)
     float4 gTuning5; // streamed mid   bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning6; // streamed far   bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning7; // x nearValid, y midValid, z farValid, w unused
+    float4 gTuning8; // previous streamed near bounds lonWest/lonEast/latSouth/latNorth
+    float4 gTuning9; // previous streamed mid  bounds lonWest/lonEast/latSouth/latNorth
+    float4 gTuning10; // previous streamed far bounds lonWest/lonEast/latSouth/latNorth
+    float4 gTuning11; // x prevNearValid, y prevMidValid, z prevFarValid, w transition [0..1] old->new
 };
 
 struct VSInput
@@ -172,6 +179,8 @@ float4 PSMain(VSOutput input) : SV_Target
 
             float3 streamAccum = 0.0;
             float streamW = 0.0;
+            float3 prevAccum = 0.0;
+            float prevW = 0.0;
 
             if (gTuning7.x > 0.5 && nearWeight > 1e-4)
             {
@@ -182,6 +191,17 @@ float4 PSMain(VSOutput input) : SV_Target
                     const float4 s = gSatelliteNear.Sample(gClampSampler, uvNear);
                     streamAccum += s.rgb * (nearWeight * s.a);
                     streamW += nearWeight * s.a;
+                }
+            }
+            if (gTuning11.x > 0.5 && nearWeight > 1e-4)
+            {
+                bool inNear = false;
+                const float2 uvNear = MapLonLatToRingUv(lonDeg, latDeg, gTuning8, inNear);
+                if (inNear)
+                {
+                    const float4 s = gSatellitePrevNear.Sample(gClampSampler, uvNear);
+                    prevAccum += s.rgb * (nearWeight * s.a);
+                    prevW += nearWeight * s.a;
                 }
             }
             if (gTuning7.y > 0.5 && midWeight > 1e-4)
@@ -195,6 +215,17 @@ float4 PSMain(VSOutput input) : SV_Target
                     streamW += midWeight * s.a;
                 }
             }
+            if (gTuning11.y > 0.5 && midWeight > 1e-4)
+            {
+                bool inMid = false;
+                const float2 uvMid = MapLonLatToRingUv(lonDeg, latDeg, gTuning9, inMid);
+                if (inMid)
+                {
+                    const float4 s = gSatellitePrevMid.Sample(gClampSampler, uvMid);
+                    prevAccum += s.rgb * (midWeight * s.a);
+                    prevW += midWeight * s.a;
+                }
+            }
             if (gTuning7.z > 0.5 && farWeight > 1e-4)
             {
                 bool inFar = false;
@@ -206,11 +237,28 @@ float4 PSMain(VSOutput input) : SV_Target
                     streamW += farWeight * s.a;
                 }
             }
-
-            if (streamW > 1e-4)
+            if (gTuning11.z > 0.5 && farWeight > 1e-4)
             {
-                const float3 streamed = streamAccum / streamW;
-                satelliteColor = haveFallback ? lerp(satelliteColor, streamed, saturate(streamW)) : streamed;
+                bool inFar = false;
+                const float2 uvFar = MapLonLatToRingUv(lonDeg, latDeg, gTuning10, inFar);
+                if (inFar)
+                {
+                    const float4 s = gSatellitePrevFar.Sample(gClampSampler, uvFar);
+                    prevAccum += s.rgb * (farWeight * s.a);
+                    prevW += farWeight * s.a;
+                }
+            }
+
+            const bool hasCurrent = streamW > 1e-4;
+            const bool hasPrev = prevW > 1e-4;
+            if (hasCurrent || hasPrev)
+            {
+                const float3 currentColor = hasCurrent ? (streamAccum / streamW) : (hasPrev ? (prevAccum / prevW) : satelliteColor);
+                const float3 prevColor = hasPrev ? (prevAccum / prevW) : currentColor;
+                const float transition = saturate(gTuning11.w);
+                const float3 streamed = lerp(prevColor, currentColor, transition);
+                const float streamAlpha = saturate(max(streamW, prevW));
+                satelliteColor = haveFallback ? lerp(satelliteColor, streamed, streamAlpha) : streamed;
                 haveFallback = true;
             }
         }
