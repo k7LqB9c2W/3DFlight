@@ -219,10 +219,6 @@ void WorldTileSystem::SetFrameTimeMs(double frameTimeMs) {
     m_lastFrameTimeMs = std::clamp(frameTimeMs, 5.0, 80.0);
 }
 
-void WorldTileSystem::SetShaderProbeBudget(uint32_t budget) {
-    m_config.shaderProbeBudget = std::clamp<uint32_t>(budget, 1u, 16u);
-}
-
 int WorldTileSystem::ComputeDesiredZoomBand(double altitudeMeters) {
     if (altitudeMeters < kBandBoundariesMeters[0]) {
         return 0;

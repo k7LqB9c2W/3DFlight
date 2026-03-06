@@ -1305,10 +1305,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     std::string worldTileRuntimeStatus;
     double worldLastUploadAlphaCoverage = 0.0;
     size_t worldLastUploadPageCount = 0;
-    int worldDebugViewMode = 0;
-    bool worldDebugForceMipZero = false;
-    bool worldDebugDisableHeadingBias = false;
-    int worldDebugShaderProbeBudget = 8;
     struct SatelliteRingDebugInfo {
         bool valid = false;
         bool hasPixels = false;
@@ -1430,12 +1426,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     applyVehicleZoomRange(vehicleMode);
 
     if (satelliteStreamerReady) {
-        const double startupHeadingDeg = worldDebugDisableHeadingBias ? 0.0 : sim.HeadingDeg();
-        satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), startupHeadingDeg);
+        satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
         if (!renderer.IsWorldLockedSatelliteEnabled()) {
             const auto preloadStart = std::chrono::steady_clock::now();
             while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(3)) {
-                satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), startupHeadingDeg);
+                satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
                 std::array<flight::satellite::RingTexture, 3> rings{};
                 std::string composeError;
                 const bool composed =
@@ -1541,14 +1536,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         const FlightSim& activeSim = (vehicleMode == VehicleMode::Missile) ? missileViewSim : sim;
-        const double worldStreamingHeadingDeg = worldDebugDisableHeadingBias ? 0.0 : activeSim.HeadingDeg();
-        worldDebugShaderProbeBudget = std::clamp(worldDebugShaderProbeBudget, 1, 16);
-        renderer.SetWorldShaderProbeBudget(static_cast<uint32_t>(worldDebugShaderProbeBudget));
-        renderer.SetWorldForceMipZero(worldDebugForceMipZero);
-        renderer.SetWorldDebugViewMode(worldDebugViewMode);
-        if (worldTileSystemReady) {
-            worldTileSystem.SetShaderProbeBudget(static_cast<uint32_t>(worldDebugShaderProbeBudget));
-        }
 
         if (autoTimeOfDay) {
             AdvanceLocalSolarClock(localSolarTimeHours, dayOfYear, static_cast<double>(timeOfDayRateHoursPerSecond) * dt);
@@ -1576,7 +1563,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     activeSim.LatitudeDeg(),
                     activeSim.LongitudeDeg(),
                     activeSim.AltitudeMeters(),
-                    worldStreamingHeadingDeg);
+                    activeSim.HeadingDeg());
                 satellitePrefetchCooldownSeconds = prefetchCadenceSeconds;
             }
             const bool useLegacyRingCompose = !renderer.IsWorldLockedSatelliteEnabled();
@@ -1644,7 +1631,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 view.latDeg = activeSim.LatitudeDeg();
                 view.lonDeg = activeSim.LongitudeDeg();
                 view.altitudeMeters = activeSim.AltitudeMeters();
-                view.headingDeg = worldStreamingHeadingDeg;
+                view.headingDeg = activeSim.HeadingDeg();
                 worldTileSystem.Tick(view, satelliteStreamer);
 
                 std::vector<flight::satellite::WorldAtlasUpload> atlasUploads;
@@ -2455,14 +2442,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             "World last upload pages/alpha: %zu / %.1f%%",
             worldLastUploadPageCount,
             worldLastUploadAlphaCoverage * 100.0);
-        ImGui::Separator();
-        ImGui::Text("World Debug");
-        ImGui::Checkbox("Disable Heading Bias", &worldDebugDisableHeadingBias);
-        ImGui::Checkbox("Force World Atlas Mip 0", &worldDebugForceMipZero);
-        ImGui::SliderInt("World Shader Probe Budget", &worldDebugShaderProbeBudget, 1, 16);
-        ImGui::Combo("World Debug Overlay", &worldDebugViewMode, "Off\0Winning Zoom\0Atlas Mip\0Tile Edge\0");
-        ImGui::TextWrapped(
-            "If forcing mip 0 removes the grid, the bug is in batch 4 atlas mip selection. If disabling heading bias removes it, the bug is in batch 3 tile selection/prefetch.");
         if (!satelliteRuntimeStatus.empty()) {
             ImGui::TextWrapped("Status: %s", satelliteRuntimeStatus.c_str());
         }

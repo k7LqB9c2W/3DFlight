@@ -133,7 +133,6 @@ public:
     void SetEnabled(bool enabled) { m_enabled = enabled; }
     [[nodiscard]] bool IsEnabled() const { return m_enabled; }
     void SetFrameTimeMs(double frameTimeMs);
-    void SetShaderProbeBudget(uint32_t budget);
 
     void Tick(const ViewState& view, SatelliteStreamer& streamer);
     void ConsumeGpuUpdates(std::vector<WorldAtlasUpload>& outAtlas, std::vector<WorldPageTableUpdate>& outPageTable);

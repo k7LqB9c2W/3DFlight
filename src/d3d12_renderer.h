@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -137,12 +136,6 @@ public:
     void SetWorldSamplingZooms(int nearZoom, int midZoom, int farZoom) {
         m_worldSamplingZooms = {nearZoom, midZoom, farZoom};
     }
-    void SetWorldShaderProbeBudget(uint32_t budget) { m_worldShaderProbeBudget = std::clamp<uint32_t>(budget, 1u, 16u); }
-    [[nodiscard]] uint32_t WorldShaderProbeBudget() const { return m_worldShaderProbeBudget; }
-    void SetWorldForceMipZero(bool enabled) { m_worldForceMipZero = enabled; }
-    [[nodiscard]] bool IsWorldForceMipZeroEnabled() const { return m_worldForceMipZero; }
-    void SetWorldDebugViewMode(int mode) { m_worldDebugViewMode = std::clamp(mode, 0, 3); }
-    [[nodiscard]] int WorldDebugViewMode() const { return m_worldDebugViewMode; }
     [[nodiscard]] WorldStreamingStats GetWorldStreamingStats() const { return m_worldStreamingStats; }
 
 private:
@@ -455,9 +448,6 @@ private:
     bool m_worldStreamingResourcesReady = false;
     bool m_worldLockedSatelliteEnabled = false;
     std::array<int, 3> m_worldSamplingZooms{13, 12, 10};
-    uint32_t m_worldShaderProbeBudget = 8;
-    bool m_worldForceMipZero = false;
-    int m_worldDebugViewMode = 0;
     WorldStreamingStats m_worldStreamingStats{};
     Microsoft::WRL::ComPtr<ID3D12Resource> m_transmittanceLut;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_skyViewLut;

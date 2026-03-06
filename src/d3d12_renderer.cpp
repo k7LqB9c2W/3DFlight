@@ -1362,21 +1362,13 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning4 = m_satelliteLodBounds[0];
         obj.tuning5 = m_satelliteLodBounds[1];
         obj.tuning6 = m_satelliteLodBounds[2];
-        obj.tuning7 = {
-            m_satelliteLodValid[0],
-            m_satelliteLodValid[1],
-            m_satelliteLodValid[2],
-            m_worldForceMipZero ? 1.0f : 0.0f};
+        obj.tuning7 = {m_satelliteLodValid[0], m_satelliteLodValid[1], m_satelliteLodValid[2], 0.0f};
         obj.tuning8 = m_satellitePrevLodBounds[0];
         obj.tuning9 = m_satellitePrevLodBounds[1];
         obj.tuning10 = m_satellitePrevLodBounds[2];
         obj.tuning11 = {m_satellitePrevLodValid[0], m_satellitePrevLodValid[1], m_satellitePrevLodValid[2], m_satelliteTransitionT};
         const bool worldSamplingEnabled = m_worldLockedSatelliteEnabled && m_worldStreamingResourcesReady;
-        obj.tuning12 = {
-            layerAlpha,
-            worldSamplingEnabled ? 1.0f : 0.0f,
-            1.0f,
-            static_cast<float>(m_worldDebugViewMode)};
+        obj.tuning12 = {layerAlpha, worldSamplingEnabled ? 1.0f : 0.0f, 1.0f, 0.0f};
         obj.tuning13 = {
             static_cast<float>(kWorldSatelliteAtlasPagesX),
             static_cast<float>(kWorldSatelliteAtlasPagesY),
@@ -1387,7 +1379,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(std::clamp(m_worldSamplingZooms[0], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[1], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[2], 0, 22)),
-            static_cast<float>(m_worldShaderProbeBudget),
+            8.0f,
         };
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
