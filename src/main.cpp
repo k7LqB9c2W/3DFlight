@@ -1221,7 +1221,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         worldCfg.maxUploadsPerFrame = 16;
         worldCfg.minProtectedRequestsPerFrame = 72;
         worldCfg.minProtectedUploadsPerFrame = 6;
-        worldCfg.nearResidentReservePages = 192;
+        worldCfg.nearResidentReservePages = 96;
         worldCfg.requestCooldownFrames = 2;
         worldCfg.zoomSwitchHoldFrames = 45;
         worldCfg.altitudeBandHysteresisMeters = 180.0;
@@ -1426,8 +1426,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     applyVehicleZoomRange(vehicleMode);
 
     if (satelliteStreamerReady) {
-        satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
         if (!renderer.IsWorldLockedSatelliteEnabled()) {
+            satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
             const auto preloadStart = std::chrono::steady_clock::now();
             while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(3)) {
                 satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
@@ -1446,7 +1446,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 Sleep(60);
             }
         } else {
-            satelliteRuntimeStatus = "World-locked mode active: ring compose preload skipped";
+            satelliteRuntimeStatus = "World-locked mode active: world tile scheduler owns prefetch";
         }
     }
 
@@ -1555,19 +1555,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         if (satelliteStreamerReady) {
-            const double prefetchCadenceSeconds =
-                (frameTimeEmaMs > 30.0) ? 0.20 : ((frameTimeEmaMs > 22.0) ? 0.12 : 0.06);
-            satellitePrefetchCooldownSeconds = std::max(0.0, satellitePrefetchCooldownSeconds - dt);
-            if (satellitePrefetchCooldownSeconds <= 0.0) {
-                satelliteStreamer.PrefetchForView(
-                    activeSim.LatitudeDeg(),
-                    activeSim.LongitudeDeg(),
-                    activeSim.AltitudeMeters(),
-                    activeSim.HeadingDeg());
-                satellitePrefetchCooldownSeconds = prefetchCadenceSeconds;
-            }
             const bool useLegacyRingCompose = !renderer.IsWorldLockedSatelliteEnabled();
             if (useLegacyRingCompose) {
+                const double prefetchCadenceSeconds =
+                    (frameTimeEmaMs > 30.0) ? 0.20 : ((frameTimeEmaMs > 22.0) ? 0.12 : 0.06);
+                satellitePrefetchCooldownSeconds = std::max(0.0, satellitePrefetchCooldownSeconds - dt);
+                if (satellitePrefetchCooldownSeconds <= 0.0) {
+                    satelliteStreamer.PrefetchForView(
+                        activeSim.LatitudeDeg(),
+                        activeSim.LongitudeDeg(),
+                        activeSim.AltitudeMeters(),
+                        activeSim.HeadingDeg());
+                    satellitePrefetchCooldownSeconds = prefetchCadenceSeconds;
+                }
                 satelliteComposeCooldownSeconds = std::max(0.0, satelliteComposeCooldownSeconds - dt);
                 if (satelliteComposeInFlight &&
                     satelliteComposeFuture.valid() &&
@@ -1610,6 +1610,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                         (frameTimeEmaMs > 30.0) ? 0.12 : ((frameTimeEmaMs > 22.0) ? 0.08 : 0.04);
                 }
             } else {
+                satellitePrefetchCooldownSeconds = 0.0;
                 satelliteComposeCooldownSeconds = 0.0;
                 // If user switched modes while a compose task was running, drain it once and ignore results.
                 if (satelliteComposeInFlight &&
@@ -1631,6 +1632,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 view.latDeg = activeSim.LatitudeDeg();
                 view.lonDeg = activeSim.LongitudeDeg();
                 view.altitudeMeters = activeSim.AltitudeMeters();
+                view.speedMps = activeSim.SpeedMps();
                 view.headingDeg = activeSim.HeadingDeg();
                 worldTileSystem.Tick(view, satelliteStreamer);
 

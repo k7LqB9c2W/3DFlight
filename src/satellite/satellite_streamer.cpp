@@ -172,7 +172,12 @@ struct SatelliteStreamer::Impl {
     mutable std::mutex mutex;
     std::condition_variable cv;
     std::deque<TileKey> requestQueue;
-    std::unordered_set<TileKey, TileKeyHasher> queuedSet;
+    struct QueuedRequestState {
+        uint64_t touchSerial = 0;
+        bool highPriority = false;
+    };
+    std::unordered_map<TileKey, QueuedRequestState, TileKeyHasher> queuedRequests;
+    uint64_t requestTouchSerial = 0;
 
     std::unordered_map<TileKey, CachedTile, TileKeyHasher> tileCache;
     std::list<TileKey> lru;
@@ -247,7 +252,7 @@ struct SatelliteStreamer::Impl {
             std::scoped_lock<std::mutex> lock(mutex);
             stopWorkers = true;
             requestQueue.clear();
-            queuedSet.clear();
+            queuedRequests.clear();
         }
         cv.notify_all();
         for (auto& w : workers) {
@@ -341,7 +346,20 @@ struct SatelliteStreamer::Impl {
             TouchLru(key);
             return false;
         }
-        if (queuedSet.find(key) != queuedSet.end()) {
+        const uint64_t touchSerial = ++requestTouchSerial;
+        const auto queuedIt = queuedRequests.find(key);
+        if (queuedIt != queuedRequests.end()) {
+            queuedIt->second.touchSerial = touchSerial;
+            if (highPriority && !queuedIt->second.highPriority) {
+                queuedIt->second.highPriority = true;
+                const auto queueIt = std::find(requestQueue.begin(), requestQueue.end(), key);
+                if (queueIt != requestQueue.end() && queueIt != requestQueue.begin()) {
+                    const TileKey promoted = *queueIt;
+                    requestQueue.erase(queueIt);
+                    requestQueue.push_front(promoted);
+                }
+                cv.notify_one();
+            }
             return false;
         }
         if (highPriority) {
@@ -349,7 +367,7 @@ struct SatelliteStreamer::Impl {
         } else {
             requestQueue.push_back(key);
         }
-        queuedSet.insert(key);
+        queuedRequests.emplace(key, QueuedRequestState{touchSerial, highPriority});
         cv.notify_one();
         return true;
     }
@@ -458,7 +476,7 @@ struct SatelliteStreamer::Impl {
         size_t queued = 0;
         {
             std::scoped_lock<std::mutex> lock(mutex);
-            queued = requestQueue.size();
+            queued = queuedRequests.size();
         }
 
         if (queued > 12000) {
@@ -811,6 +829,8 @@ struct SatelliteStreamer::Impl {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         HttpWorkerContext httpCtx{};
         WicWorkerContext wicCtx{};
+        constexpr size_t kStaleQueuePressureThreshold = 1024;
+        constexpr uint64_t kMinStaleTouchDistance = 768;
         while (true) {
             TileKey key{};
             {
@@ -821,10 +841,25 @@ struct SatelliteStreamer::Impl {
                 }
                 key = requestQueue.front();
                 requestQueue.pop_front();
-                queuedSet.erase(key);
-                if (tileCache.find(key) != tileCache.end()) {
+                const auto queuedIt = queuedRequests.find(key);
+                if (queuedIt == queuedRequests.end()) {
                     continue;
                 }
+                if (tileCache.find(key) != tileCache.end()) {
+                    queuedRequests.erase(queuedIt);
+                    continue;
+                }
+                const size_t backlog = requestQueue.size();
+                const uint64_t touchAge = requestTouchSerial - queuedIt->second.touchSerial;
+                const bool staleLowPriority =
+                    !queuedIt->second.highPriority &&
+                    backlog >= kStaleQueuePressureThreshold &&
+                    touchAge > std::max<uint64_t>(kMinStaleTouchDistance, static_cast<uint64_t>(backlog));
+                if (staleLowPriority) {
+                    queuedRequests.erase(queuedIt);
+                    continue;
+                }
+                queuedRequests.erase(queuedIt);
             }
             (void)FetchAndDecodeTile(key, httpCtx, wicCtx);
         }
@@ -1306,7 +1341,7 @@ struct SatelliteStreamer::Impl {
         {
             std::scoped_lock<std::mutex> lock(mutex);
             s.memoryTileCount = tileCache.size();
-            s.queuedRequests = requestQueue.size();
+            s.queuedRequests = queuedRequests.size();
         }
         return s;
     }

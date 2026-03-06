@@ -123,6 +123,7 @@ public:
         double latDeg = 0.0;
         double lonDeg = 0.0;
         double altitudeMeters = 0.0;
+        double speedMps = 0.0;
         double headingDeg = 0.0;
     };
 
@@ -155,6 +156,7 @@ private:
 
     struct VisibleTileCandidate {
         WorldTileKey key{};
+        uint8_t bandIndex = 0;
         bool nearProtected = false;
         bool highPriority = false;
         float priority = 0.0f;
@@ -168,7 +170,7 @@ private:
     void UpdateFrameTimeGovernor();
     void TouchResident(const WorldTileKey& key, TileState& state);
     std::optional<int> AllocateAtlasPage(const WorldTileKey& forKey, bool protectedRequest);
-    void EvictResident(const WorldTileKey& key, TileState& state);
+    void EvictResident(const WorldTileKey& key, TileState& state, bool returnPageToFreeList = true);
     std::optional<uint32_t> AssignPageTableSlot(const WorldTileKey& key);
     void ReleasePageTableSlot(const WorldTileKey& key);
     static uint32_t PackPageTableKey0(const WorldTileKey& key);

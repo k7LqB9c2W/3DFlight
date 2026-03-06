@@ -10,8 +10,12 @@ namespace flight::satellite {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kEarthRadiusMeters = 6371000.0;
 constexpr uint32_t kPageTableTombstoneValue = 0x40000000u;
 constexpr std::array<double, 3> kBandBoundariesMeters{500.0, 2000.0, 6000.0};
+constexpr std::array<double, 3> kBandLookaheadFractions{0.12, 0.22, 0.34};
+constexpr std::array<double, 3> kBandLookaheadSeconds{1.5, 3.0, 5.0};
+constexpr std::array<double, 3> kBandLookaheadCapFractions{0.20, 0.35, 0.48};
 
 constexpr std::array<std::array<int, 3>, 4> kBandZoomTriplets{{
     {{16, 15, 13}},
@@ -60,6 +64,27 @@ int WrapTileX(int x, int n) {
         r += n;
     }
     return r;
+}
+
+void OffsetLatLonByHeading(double latDeg, double lonDeg, double headingDeg, double distanceMeters, double& outLatDeg, double& outLonDeg) {
+    const double lat1 = ClampLatDeg(latDeg) * (kPi / 180.0);
+    const double lon1 = WrapLonDeg(lonDeg) * (kPi / 180.0);
+    const double bearing = headingDeg * (kPi / 180.0);
+    const double delta = distanceMeters / kEarthRadiusMeters;
+
+    const double sinLat1 = std::sin(lat1);
+    const double cosLat1 = std::cos(lat1);
+    const double sinDelta = std::sin(delta);
+    const double cosDelta = std::cos(delta);
+
+    const double sinLat2 = std::clamp(sinLat1 * cosDelta + cosLat1 * sinDelta * std::cos(bearing), -1.0, 1.0);
+    const double lat2 = std::asin(sinLat2);
+    const double y = std::sin(bearing) * sinDelta * cosLat1;
+    const double x = cosDelta - sinLat1 * sinLat2;
+    const double lon2 = lon1 + std::atan2(y, x);
+
+    outLatDeg = ClampLatDeg(lat2 * (180.0 / kPi));
+    outLonDeg = WrapLonDeg(lon2 * (180.0 / kPi));
 }
 
 bool HasDecodedTilePixels(const std::shared_ptr<const std::vector<uint8_t>>& pixels) {
@@ -357,10 +382,16 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
         double radiusKm = 0.0;
         bool nearProtected = false;
         float basePriority = 0.0f;
+        double centerLatDeg = 0.0;
+        double centerLonDeg = 0.0;
     };
 
     const int bandIndex = std::clamp(m_activeZoomBand, 0, 3);
     const auto& radii = kBandRadiusKm[static_cast<size_t>(bandIndex)];
+    const double lat = ClampLatDeg(view.latDeg);
+    const double lon = WrapLonDeg(view.lonDeg);
+    const double speedMps = std::clamp(std::abs(view.speedMps), 0.0, 450.0);
+    const double headingDeg = view.headingDeg;
 
     std::array<ZoomBand, 3> bands{};
     for (size_t i = 0; i < bands.size(); ++i) {
@@ -368,26 +399,36 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
         bands[i].radiusKm = radii[i];
         bands[i].nearProtected = (i == 0);
         bands[i].basePriority = static_cast<float>(i);
+        bands[i].centerLatDeg = lat;
+        bands[i].centerLonDeg = lon;
+
+        const double radiusMeters = bands[i].radiusKm * 1000.0;
+        const double lookaheadMeters = std::clamp(
+            speedMps * kBandLookaheadSeconds[i] + radiusMeters * kBandLookaheadFractions[i],
+            0.0,
+            radiusMeters * kBandLookaheadCapFractions[i]);
+        if (lookaheadMeters > 1.0) {
+            OffsetLatLonByHeading(lat, lon, headingDeg, lookaheadMeters, bands[i].centerLatDeg, bands[i].centerLonDeg);
+        }
     }
 
     struct CandidateState {
+        uint8_t bandIndex = 0;
         bool nearProtected = false;
         bool highPriority = false;
         float priority = std::numeric_limits<float>::max();
     };
     std::unordered_map<WorldTileKey, CandidateState, WorldTileKeyHasher> unique;
 
-    const double lat = ClampLatDeg(view.latDeg);
-    const double lon = WrapLonDeg(view.lonDeg);
-    const double headingDeg = view.headingDeg;
-    for (const auto& band : bands) {
+    for (size_t bandIdx = 0; bandIdx < bands.size(); ++bandIdx) {
+        const auto& band = bands[bandIdx];
         const int z = band.zoom;
         const int n = 1 << z;
-        const double centerX = LonToTileXUnwrapped(lon, z);
-        const double centerY = LatToTileY(lat, z);
+        const double centerX = LonToTileXUnwrapped(band.centerLonDeg, z);
+        const double centerY = LatToTileY(band.centerLatDeg, z);
         const int centerXi = static_cast<int>(std::floor(centerX));
         const int centerYi = static_cast<int>(std::floor(centerY));
-        const double kmPerTile = std::max(0.02, ApproxKmPerTile(lat, z));
+        const double kmPerTile = std::max(0.02, ApproxKmPerTile(band.centerLatDeg, z));
         const int radiusTiles = std::clamp(static_cast<int>(std::ceil(band.radiusKm / kmPerTile)) + 1, 2, 80);
 
         for (int y = centerYi - radiusTiles; y <= centerYi + radiusTiles; ++y) {
@@ -411,7 +452,10 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
                 const float forwardBias = std::max(0.0f, forwardNorm);
                 const float priority = band.basePriority + distNorm - forwardBias * (band.nearProtected ? 0.34f : 0.22f);
                 auto& s = unique[key];
-                s.priority = std::min(s.priority, priority);
+                if (priority < s.priority) {
+                    s.priority = priority;
+                    s.bandIndex = static_cast<uint8_t>(std::min<size_t>(bandIdx, 2));
+                }
                 const bool nearProtect =
                     band.nearProtected &&
                     (distNorm <= kNearProtectionDistNorm || (distNorm <= 0.72f && forwardNorm >= 0.18f));
@@ -426,6 +470,7 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
     for (const auto& [key, state] : unique) {
         VisibleTileCandidate c{};
         c.key = key;
+        c.bandIndex = state.bandIndex;
         c.nearProtected = state.nearProtected;
         c.highPriority = state.highPriority;
         c.priority = state.priority;
@@ -444,7 +489,68 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
         return a.priority < b.priority;
     });
     if (out.size() > m_config.maxVisibleTilesPerFrame) {
-        out.resize(m_config.maxVisibleTilesPerFrame);
+        std::array<std::vector<VisibleTileCandidate>, 3> byBand{};
+        for (const VisibleTileCandidate& candidate : out) {
+            const size_t band = std::min<size_t>(candidate.bandIndex, byBand.size() - 1u);
+            byBand[band].push_back(candidate);
+        }
+
+        std::array<float, 3> bandShare{0.45f, 0.33f, 0.22f};
+        switch (m_activeZoomBand) {
+            case 0:
+                bandShare = {0.52f, 0.30f, 0.18f};
+                break;
+            case 1:
+                bandShare = {0.46f, 0.32f, 0.22f};
+                break;
+            case 2:
+                bandShare = {0.38f, 0.33f, 0.29f};
+                break;
+            default:
+                bandShare = {0.30f, 0.33f, 0.37f};
+                break;
+        }
+
+        const size_t cap = m_config.maxVisibleTilesPerFrame;
+        std::array<size_t, 3> takeCount{};
+        size_t taken = 0;
+        for (size_t i = 0; i < byBand.size(); ++i) {
+            takeCount[i] = std::min<size_t>(
+                byBand[i].size(),
+                static_cast<size_t>(std::floor(static_cast<double>(cap) * static_cast<double>(bandShare[i]))));
+            taken += takeCount[i];
+        }
+
+        std::vector<VisibleTileCandidate> limited;
+        limited.reserve(cap);
+        std::array<size_t, 3> nextIndex{};
+        for (size_t i = 0; i < byBand.size(); ++i) {
+            for (size_t j = 0; j < takeCount[i]; ++j) {
+                limited.push_back(byBand[i][j]);
+            }
+            nextIndex[i] = takeCount[i];
+        }
+
+        while (limited.size() < cap) {
+            size_t bestBand = byBand.size();
+            float bestPriority = std::numeric_limits<float>::max();
+            for (size_t i = 0; i < byBand.size(); ++i) {
+                if (nextIndex[i] >= byBand[i].size()) {
+                    continue;
+                }
+                const float priority = byBand[i][nextIndex[i]].priority;
+                if (bestBand == byBand.size() || priority < bestPriority) {
+                    bestBand = i;
+                    bestPriority = priority;
+                }
+            }
+            if (bestBand == byBand.size()) {
+                break;
+            }
+            limited.push_back(byBand[bestBand][nextIndex[bestBand]]);
+            nextIndex[bestBand] += 1;
+        }
+        out.swap(limited);
     }
     return out;
 }
@@ -546,7 +652,7 @@ uint32_t WorldTileSystem::PackPageTableValue(const WorldTileKey& key, int atlasP
     return 0x80000000u | pageBits;
 }
 
-void WorldTileSystem::EvictResident(const WorldTileKey& key, TileState& state) {
+void WorldTileSystem::EvictResident(const WorldTileKey& key, TileState& state, bool returnPageToFreeList) {
     if (!state.resident || state.atlasPageIndex < 0) {
         return;
     }
@@ -558,7 +664,9 @@ void WorldTileSystem::EvictResident(const WorldTileKey& key, TileState& state) {
     const int page = state.atlasPageIndex;
     if (page >= 0 && static_cast<size_t>(page) < m_pageToKey.size()) {
         m_pageToKey[static_cast<size_t>(page)].reset();
-        m_freeAtlasPages.push_back(page);
+        if (returnPageToFreeList) {
+            m_freeAtlasPages.push_back(page);
+        }
     }
     state.resident = false;
     state.atlasPageIndex = -1;
@@ -569,8 +677,20 @@ void WorldTileSystem::EvictResident(const WorldTileKey& key, TileState& state) {
 
 std::optional<int> WorldTileSystem::AllocateAtlasPage(const WorldTileKey& forKey, bool protectedRequest) {
     if (!m_freeAtlasPages.empty()) {
-        if (!protectedRequest && m_freeAtlasPages.size() <= m_config.nearResidentReservePages) {
-            return std::nullopt;
+        if (!protectedRequest) {
+            size_t protectedResidentCount = 0;
+            for (const auto& [_, state] : m_tiles) {
+                if (state.resident && state.protectedNear) {
+                    protectedResidentCount += 1;
+                }
+            }
+            const size_t reserveShortfall =
+                (protectedResidentCount >= m_config.nearResidentReservePages)
+                ? 0u
+                : (m_config.nearResidentReservePages - protectedResidentCount);
+            if (m_freeAtlasPages.size() <= reserveShortfall) {
+                return std::nullopt;
+            }
         }
         const int page = m_freeAtlasPages.back();
         m_freeAtlasPages.pop_back();
@@ -594,7 +714,7 @@ std::optional<int> WorldTileSystem::AllocateAtlasPage(const WorldTileKey& forKey
             continue;
         }
         const int page = state.atlasPageIndex;
-        EvictResident(evictKey, state);
+        EvictResident(evictKey, state, false);
         if (page >= 0) {
             return page;
         }
