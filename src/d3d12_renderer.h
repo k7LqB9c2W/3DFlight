@@ -164,13 +164,23 @@ private:
     static constexpr UINT kMultipleScatteringUavIndex = kUavTableStartIndex + 2;
     static constexpr UINT kAerialPerspectiveUavIndex = kUavTableStartIndex + 3;
     static constexpr uint32_t kWorldSatelliteTileSize = 256;
-    static constexpr uint32_t kWorldSatelliteAtlasPagesX = 16;
-    static constexpr uint32_t kWorldSatelliteAtlasPagesY = 16;
+    static constexpr uint32_t kWorldSatelliteAtlasPagesX = 24;
+    static constexpr uint32_t kWorldSatelliteAtlasPagesY = 24;
     static constexpr uint32_t kWorldSatellitePageTableWidth = 1024;
     static constexpr uint32_t kWorldSatellitePageTableHeight = 1024;
+    static constexpr uint32_t kWorldUploadSlotCount = 3;
+    static constexpr UINT64 kWorldUploadBufferSizeBytes = 32ull * 1024ull * 1024ull;
 
     struct FrameContext {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+        UINT64 fenceValue = 0;
+    };
+    struct WorldUploadSlot {
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList;
+        Microsoft::WRL::ComPtr<ID3D12Resource> uploadBuffer;
+        uint8_t* mapped = nullptr;
+        UINT64 cursor = 0;
         UINT64 fenceValue = 0;
     };
 
@@ -315,8 +325,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_uploadCommandList;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_satelliteUploadAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_satelliteUploadCommandList;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_worldUploadAllocator;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_worldUploadCommandList;
+    std::array<WorldUploadSlot, kWorldUploadSlotCount> m_worldUploadSlots{};
+    uint32_t m_worldUploadSlotIndex = 0;
 
     std::array<FrameContext, kFrameCount> m_frames;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> m_renderTargets;

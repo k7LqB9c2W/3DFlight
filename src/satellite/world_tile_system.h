@@ -87,19 +87,22 @@ public:
     struct Config {
         int minZoom = 9;
         int maxZoom = 16;
-        int atlasPagesX = 16;
-        int atlasPagesY = 16;
+        int atlasPagesX = 24;
+        int atlasPagesY = 24;
         int pageTableWidth = 1024;
         int pageTableHeight = 1024;
         size_t maxVisibleTilesPerFrame = 1600;
         size_t maxRequestsPerFrame = 300;
         size_t maxUploadsPerFrame = 12;
+        size_t minProtectedRequestsPerFrame = 48;
+        size_t minProtectedUploadsPerFrame = 3;
+        size_t nearResidentReservePages = 96;
         uint64_t requestCooldownFrames = 2;
         uint64_t staleNonResidentFrames = 240;
         uint64_t zoomSwitchHoldFrames = 45;
         double altitudeBandHysteresisMeters = 180.0;
         uint64_t governorRecoveryHoldFrames = 45;
-        uint32_t shaderProbeBudget = 4;
+        uint32_t shaderProbeBudget = 8;
         uint64_t residentStickinessFrames = 180;
     };
 
@@ -151,7 +154,7 @@ private:
     void UpdateZoomBandWithHysteresis(double altitudeMeters);
     void UpdateFrameTimeGovernor();
     void TouchResident(const WorldTileKey& key, TileState& state);
-    std::optional<int> AllocateAtlasPage(const WorldTileKey& forKey);
+    std::optional<int> AllocateAtlasPage(const WorldTileKey& forKey, bool protectedRequest);
     void EvictResident(const WorldTileKey& key, TileState& state);
     std::optional<uint32_t> AssignPageTableSlot(const WorldTileKey& key);
     void ReleasePageTableSlot(const WorldTileKey& key);

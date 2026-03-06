@@ -85,12 +85,14 @@ bool WorldTileSystem::Initialize(const Config& config, std::string& error) {
     cfg.maxVisibleTilesPerFrame = std::clamp<size_t>(cfg.maxVisibleTilesPerFrame, 64, 10000);
     cfg.maxRequestsPerFrame = std::clamp<size_t>(cfg.maxRequestsPerFrame, 16, 2000);
     cfg.maxUploadsPerFrame = std::clamp<size_t>(cfg.maxUploadsPerFrame, 1, 256);
+    cfg.minProtectedRequestsPerFrame = std::clamp<size_t>(cfg.minProtectedRequestsPerFrame, 8, cfg.maxRequestsPerFrame);
+    cfg.minProtectedUploadsPerFrame = std::clamp<size_t>(cfg.minProtectedUploadsPerFrame, 1, cfg.maxUploadsPerFrame);
     cfg.requestCooldownFrames = std::clamp<uint64_t>(cfg.requestCooldownFrames, 1, 60);
     cfg.staleNonResidentFrames = std::clamp<uint64_t>(cfg.staleNonResidentFrames, 30, 2000);
     cfg.zoomSwitchHoldFrames = std::clamp<uint64_t>(cfg.zoomSwitchHoldFrames, 5, 300);
     cfg.altitudeBandHysteresisMeters = std::clamp(cfg.altitudeBandHysteresisMeters, 20.0, 2000.0);
     cfg.governorRecoveryHoldFrames = std::clamp<uint64_t>(cfg.governorRecoveryHoldFrames, 15, 300);
-    cfg.shaderProbeBudget = std::clamp<uint32_t>(cfg.shaderProbeBudget, 1u, 8u);
+    cfg.shaderProbeBudget = std::clamp<uint32_t>(cfg.shaderProbeBudget, 1u, 16u);
     cfg.residentStickinessFrames = std::clamp<uint64_t>(cfg.residentStickinessFrames, 0, 900);
 
     const size_t atlasPageCount = static_cast<size_t>(cfg.atlasPagesX) * static_cast<size_t>(cfg.atlasPagesY);
@@ -101,6 +103,10 @@ bool WorldTileSystem::Initialize(const Config& config, std::string& error) {
     // Prevent permanent over-subscription (visible set far larger than resident atlas).
     const size_t visibleCapFromAtlas = std::max<size_t>(64, (atlasPageCount * 3u) / 2u);
     cfg.maxVisibleTilesPerFrame = std::min(cfg.maxVisibleTilesPerFrame, visibleCapFromAtlas);
+    cfg.nearResidentReservePages = std::clamp<size_t>(
+        cfg.nearResidentReservePages,
+        std::min<size_t>(8, atlasPageCount),
+        std::max<size_t>(8, atlasPageCount - 1u));
     m_config = cfg;
 
     m_pageToKey.assign(atlasPageCount, std::nullopt);
@@ -282,12 +288,16 @@ void WorldTileSystem::UpdateFrameTimeGovernor() {
     const float upMul = uploadScale[static_cast<size_t>(std::clamp(m_governorLevel, 0, 3))];
 
     m_effectiveRequestBudget = std::clamp<size_t>(
-        static_cast<size_t>(std::llround(static_cast<double>(m_config.maxRequestsPerFrame) * reqMul)),
-        16,
+        std::max<size_t>(
+            m_config.minProtectedRequestsPerFrame,
+            static_cast<size_t>(std::llround(static_cast<double>(m_config.maxRequestsPerFrame) * reqMul))),
+        m_config.minProtectedRequestsPerFrame,
         m_config.maxRequestsPerFrame);
     m_effectiveUploadBudget = std::clamp<size_t>(
-        static_cast<size_t>(std::llround(static_cast<double>(m_config.maxUploadsPerFrame) * upMul)),
-        1,
+        std::max<size_t>(
+            m_config.minProtectedUploadsPerFrame,
+            static_cast<size_t>(std::llround(static_cast<double>(m_config.maxUploadsPerFrame) * upMul))),
+        m_config.minProtectedUploadsPerFrame,
         m_config.maxUploadsPerFrame);
 }
 
@@ -429,9 +439,10 @@ std::optional<uint32_t> WorldTileSystem::AssignPageTableSlot(const WorldTileKey&
     }
 
     const size_t count = m_pageTableSlots.size();
+    const size_t maxProbeCount = std::min<size_t>(count, std::max<size_t>(1u, m_config.shaderProbeBudget));
     size_t slot = static_cast<size_t>(HashTileKeyForPageTable(key)) % count;
     std::optional<size_t> firstTombstone;
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < maxProbeCount; ++i) {
         const size_t probe = (slot + i) % count;
         if (!m_pageTableSlots[probe].has_value()) {
             if (probe < m_pageTableEverUsed.size() && m_pageTableEverUsed[probe] != 0u) {
@@ -504,8 +515,11 @@ void WorldTileSystem::EvictResident(const WorldTileKey& key, TileState& state) {
     m_evictions += 1;
 }
 
-std::optional<int> WorldTileSystem::AllocateAtlasPage(const WorldTileKey& forKey) {
+std::optional<int> WorldTileSystem::AllocateAtlasPage(const WorldTileKey& forKey, bool protectedRequest) {
     if (!m_freeAtlasPages.empty()) {
+        if (!protectedRequest && m_freeAtlasPages.size() <= m_config.nearResidentReservePages) {
+            return std::nullopt;
+        }
         const int page = m_freeAtlasPages.back();
         m_freeAtlasPages.pop_back();
         return page;
@@ -596,6 +610,8 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
 
     size_t requestBudget = m_effectiveRequestBudget;
     size_t uploadBudget = m_effectiveUploadBudget;
+    size_t protectedRequestBudget = std::min(requestBudget, m_config.minProtectedRequestsPerFrame);
+    size_t protectedUploadBudget = std::min(uploadBudget, m_config.minProtectedUploadsPerFrame);
     for (const VisibleTileCandidate& candidate : visible) {
         TileState& state = m_tiles[candidate.key];
         state.visibleThisFrame = true;
@@ -624,53 +640,90 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
                 m_streamerCacheMisses += 1;
             }
         }
+    }
 
-        if (!state.pendingUpload && requestBudget > 0) {
+    auto tryQueueRequests = [&](bool protectedOnly, size_t& phaseBudget) {
+        for (const VisibleTileCandidate& candidate : visible) {
+            if (phaseBudget == 0 || requestBudget == 0) {
+                break;
+            }
+            if (protectedOnly && !candidate.nearProtected) {
+                continue;
+            }
+            auto found = m_tiles.find(candidate.key);
+            if (found == m_tiles.end()) {
+                continue;
+            }
+            TileState& state = found->second;
+            if (state.resident || state.pendingUpload) {
+                continue;
+            }
             const bool allowRequest = (m_frameId - state.lastRequestFrame) >= m_config.requestCooldownFrames;
-            if (allowRequest && streamer.QueueTileRequest(candidate.key.z, candidate.key.x, candidate.key.y, candidate.highPriority)) {
+            if (!allowRequest) {
+                continue;
+            }
+            if (streamer.QueueTileRequest(candidate.key.z, candidate.key.x, candidate.key.y, candidate.highPriority)) {
                 state.lastRequestFrame = m_frameId;
+                phaseBudget -= 1;
                 requestBudget -= 1;
                 m_streamerRequests += 1;
             }
         }
+    };
+
+    tryQueueRequests(true, protectedRequestBudget);
+    if (requestBudget > 0) {
+        size_t remainingRequestBudget = requestBudget;
+        tryQueueRequests(false, remainingRequestBudget);
+        requestBudget = remainingRequestBudget;
     }
 
-    for (const VisibleTileCandidate& candidate : visible) {
-        if (uploadBudget == 0) {
-            break;
-        }
-        auto found = m_tiles.find(candidate.key);
-        if (found == m_tiles.end()) {
-            continue;
-        }
-        TileState& state = found->second;
-        if (!state.pendingUpload || !state.decodedPixels || state.decodedPixels->size() < (256u * 256u * 4u)) {
-            continue;
-        }
+    auto tryUploadVisible = [&](bool protectedOnly, size_t& phaseBudget) {
+        for (const VisibleTileCandidate& candidate : visible) {
+            if (phaseBudget == 0 || uploadBudget == 0) {
+                break;
+            }
+            if (protectedOnly && !candidate.nearProtected) {
+                continue;
+            }
+            auto found = m_tiles.find(candidate.key);
+            if (found == m_tiles.end()) {
+                continue;
+            }
+            TileState& state = found->second;
+            if (!state.pendingUpload || !state.decodedPixels || state.decodedPixels->size() < (256u * 256u * 4u)) {
+                continue;
+            }
 
-        const auto pageOpt = AllocateAtlasPage(candidate.key);
-        if (!pageOpt.has_value()) {
-            m_uploadSkipsNoPage += 1;
-            continue;
-        }
+            const auto pageOpt = AllocateAtlasPage(candidate.key, candidate.nearProtected);
+            if (!pageOpt.has_value()) {
+                m_uploadSkipsNoPage += 1;
+                continue;
+            }
 
-        const int page = *pageOpt;
-        state.resident = true;
-        state.pendingUpload = false;
-        state.atlasPageIndex = page;
-        m_pageToKey[static_cast<size_t>(page)] = candidate.key;
-        TouchResident(candidate.key, state);
+            const auto slotOpt = AssignPageTableSlot(candidate.key);
+            if (!slotOpt.has_value()) {
+                m_freeAtlasPages.push_back(*pageOpt);
+                m_uploadSkipsNoPage += 1;
+                continue;
+            }
 
-        WorldAtlasUpload upload{};
-        upload.key = candidate.key;
-        upload.atlasPageX = static_cast<uint32_t>(page % m_config.atlasPagesX);
-        upload.atlasPageY = static_cast<uint32_t>(page / m_config.atlasPagesX);
-        upload.rgbaPixels = state.decodedPixels;
-        m_pendingAtlasUploads.push_back(std::move(upload));
-        m_atlasUploads += 1;
-
-        if (const auto slotOpt = AssignPageTableSlot(candidate.key); slotOpt.has_value()) {
+            const int page = *pageOpt;
             const uint32_t slot = *slotOpt;
+            state.resident = true;
+            state.pendingUpload = false;
+            state.atlasPageIndex = page;
+            m_pageToKey[static_cast<size_t>(page)] = candidate.key;
+            TouchResident(candidate.key, state);
+
+            WorldAtlasUpload upload{};
+            upload.key = candidate.key;
+            upload.atlasPageX = static_cast<uint32_t>(page % m_config.atlasPagesX);
+            upload.atlasPageY = static_cast<uint32_t>(page / m_config.atlasPagesX);
+            upload.rgbaPixels = state.decodedPixels;
+            m_pendingAtlasUploads.push_back(std::move(upload));
+            m_atlasUploads += 1;
+
             const size_t tableCount = static_cast<size_t>(m_config.pageTableWidth) * static_cast<size_t>(m_config.pageTableHeight);
             const size_t hashSlot = (tableCount > 0)
                 ? (static_cast<size_t>(HashTileKeyForPageTable(candidate.key)) % tableCount)
@@ -685,9 +738,17 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
             const uint32_t key1 = PackPageTableKey1(candidate.key);
             m_pendingPageUpdates.push_back(WorldPageTableUpdate{x, y, key0, key1, value});
             m_pageTableWrites += 1;
-        }
 
-        uploadBudget -= 1;
+            phaseBudget -= 1;
+            uploadBudget -= 1;
+        }
+    };
+
+    tryUploadVisible(true, protectedUploadBudget);
+    if (uploadBudget > 0) {
+        size_t remainingUploadBudget = uploadBudget;
+        tryUploadVisible(false, remainingUploadBudget);
+        uploadBudget = remainingUploadBudget;
     }
 
     if (m_debugVisibleResidentCount > 0) {

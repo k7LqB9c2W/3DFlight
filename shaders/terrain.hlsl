@@ -166,7 +166,7 @@ bool LookupWorldAtlasPage(uint z, uint x, uint y, out uint atlasPageIndex)
     const uint key0 = PackWorldKey0(z, x);
     const uint key1 = PackWorldKey1(y);
     const uint start = WorldHashTileKey(z, x, y) % slotCount;
-    const uint maxProbe = min(max(uint(gTuning14.w), 1u), 4u);
+    const uint maxProbe = min(max(uint(gTuning14.w), 1u), 16u);
     [loop]
     for (uint p = 0u; p < maxProbe; ++p)
     {

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <d3dcompiler.h>
@@ -409,8 +410,18 @@ void D3D12Renderer::Shutdown() {
     m_uploadAllocator.Reset();
     m_satelliteUploadCommandList.Reset();
     m_satelliteUploadAllocator.Reset();
-    m_worldUploadCommandList.Reset();
-    m_worldUploadAllocator.Reset();
+    for (auto& slot : m_worldUploadSlots) {
+        if (slot.uploadBuffer && slot.mapped != nullptr) {
+            slot.uploadBuffer->Unmap(0, nullptr);
+        }
+        slot.commandList.Reset();
+        slot.allocator.Reset();
+        slot.uploadBuffer.Reset();
+        slot.mapped = nullptr;
+        slot.cursor = 0;
+        slot.fenceValue = 0;
+    }
+    m_worldUploadSlotIndex = 0;
     for (auto& frame : m_frames) {
         frame.allocator.Reset();
         frame.fenceValue = 0;
@@ -1148,7 +1159,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(std::clamp(m_worldSamplingZooms[0], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[1], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[2], 0, 22)),
-            4.0f,
+            8.0f,
         };
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
@@ -1349,25 +1360,59 @@ bool D3D12Renderer::CreateDeviceResources(std::string& error) {
     }
     m_satelliteUploadCommandList->Close();
 
-    hr = m_device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        IID_PPV_ARGS(m_worldUploadAllocator.ReleaseAndGetAddressOf()));
-    if (FAILED(hr)) {
-        error = HrMessage("CreateCommandAllocator(world upload) failed", hr);
-        return false;
-    }
+    for (uint32_t i = 0; i < kWorldUploadSlotCount; ++i) {
+        auto& slot = m_worldUploadSlots[i];
+        hr = m_device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(slot.allocator.ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage("CreateCommandAllocator(world upload) failed", hr);
+            return false;
+        }
 
-    hr = m_device->CreateCommandList(
-        0,
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        m_worldUploadAllocator.Get(),
-        nullptr,
-        IID_PPV_ARGS(m_worldUploadCommandList.ReleaseAndGetAddressOf()));
-    if (FAILED(hr)) {
-        error = HrMessage("CreateCommandList(world upload) failed", hr);
-        return false;
+        hr = m_device->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            slot.allocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(slot.commandList.ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage("CreateCommandList(world upload) failed", hr);
+            return false;
+        }
+        slot.commandList->Close();
+
+        D3D12_HEAP_PROPERTIES uploadHeap{};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC uploadDesc{};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = kWorldUploadBufferSizeBytes;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hr = m_device->CreateCommittedResource(
+            &uploadHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &uploadDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(slot.uploadBuffer.ReleaseAndGetAddressOf()));
+        if (FAILED(hr)) {
+            error = HrMessage("CreateCommittedResource(world upload staging) failed", hr);
+            return false;
+        }
+
+        D3D12_RANGE readRange{};
+        hr = slot.uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&slot.mapped));
+        if (FAILED(hr) || slot.mapped == nullptr) {
+            error = HrMessage("Map(world upload staging) failed", hr);
+            return false;
+        }
+        slot.cursor = 0;
+        slot.fenceValue = 0;
     }
-    m_worldUploadCommandList->Close();
 
     hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_fence.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
@@ -3254,7 +3299,7 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
         m_worldStreamingStats.uploadFailures += 1;
         return false;
     }
-    if (!m_worldUploadAllocator || !m_worldUploadCommandList || !m_fence) {
+    if (!m_fence) {
         error = "World upload command resources are not initialized";
         m_worldStreamingStats.uploadFailures += 1;
         return false;
@@ -3263,23 +3308,42 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
         return true;
     }
 
-    WaitForFenceValue(m_worldUploadFenceValue);
     CleanupDeferredTerrainResources();
+    WorldUploadSlot& slot = m_worldUploadSlots[m_worldUploadSlotIndex];
+    m_worldUploadSlotIndex = (m_worldUploadSlotIndex + 1u) % kWorldUploadSlotCount;
+    WaitForFenceValue(slot.fenceValue);
+    if (!slot.allocator || !slot.commandList || !slot.uploadBuffer || slot.mapped == nullptr) {
+        error = "World upload slot is not initialized";
+        m_worldStreamingStats.uploadFailures += 1;
+        return false;
+    }
+    slot.cursor = 0;
 
-    if (FAILED(m_worldUploadAllocator->Reset())) {
+    if (FAILED(slot.allocator->Reset())) {
         error = "World upload allocator reset failed";
         m_worldStreamingStats.uploadFailures += 1;
         return false;
     }
-    if (FAILED(m_worldUploadCommandList->Reset(m_worldUploadAllocator.Get(), nullptr))) {
+    if (FAILED(slot.commandList->Reset(slot.allocator.Get(), nullptr))) {
         error = "World upload command list reset failed";
         m_worldStreamingStats.uploadFailures += 1;
         return false;
     }
 
-    std::vector<ComPtr<ID3D12Resource>> transientUploads;
-    transientUploads.reserve(pageUploads.size() + 4);
     uint64_t uploadedBytes = 0;
+    auto alignUp = [](UINT64 value, UINT64 alignment) -> UINT64 {
+        return ((value + alignment - 1ull) / alignment) * alignment;
+    };
+    auto allocUpload = [&](UINT64 size, UINT64 alignment, UINT64& outOffset, uint8_t*& outMapped) -> bool {
+        const UINT64 start = alignUp(slot.cursor, alignment);
+        if ((start + size) > kWorldUploadBufferSizeBytes) {
+            return false;
+        }
+        outOffset = start;
+        outMapped = slot.mapped + start;
+        slot.cursor = start + size;
+        return true;
+    };
 
     if (!pageUploads.empty()) {
         D3D12_RESOURCE_BARRIER toCopy{};
@@ -3288,7 +3352,7 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
         toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        m_worldUploadCommandList->ResourceBarrier(1, &toCopy);
+        slot.commandList->ResourceBarrier(1, &toCopy);
 
         for (const WorldAtlasPageUpload& upload : pageUploads) {
             if (!upload.rgbaPixels) {
@@ -3302,38 +3366,10 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
             const UINT rowPitch =
                 ((rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
             const UINT64 uploadBytes = static_cast<UINT64>(rowPitch) * static_cast<UINT64>(kWorldSatelliteTileSize);
-
-            D3D12_HEAP_PROPERTIES uploadHeap{};
-            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-            D3D12_RESOURCE_DESC uploadDesc{};
-            uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            uploadDesc.Width = uploadBytes;
-            uploadDesc.Height = 1;
-            uploadDesc.DepthOrArraySize = 1;
-            uploadDesc.MipLevels = 1;
-            uploadDesc.SampleDesc.Count = 1;
-            uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-            ComPtr<ID3D12Resource> uploadBuffer;
-            HRESULT hr = m_device->CreateCommittedResource(
-                &uploadHeap,
-                D3D12_HEAP_FLAG_NONE,
-                &uploadDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                IID_PPV_ARGS(uploadBuffer.ReleaseAndGetAddressOf()));
-            if (FAILED(hr)) {
-                error = HrMessage("CreateCommittedResource(world atlas upload) failed", hr);
-                m_worldStreamingStats.uploadFailures += 1;
-                return false;
-            }
-
+            UINT64 uploadOffset = 0;
             uint8_t* mapped = nullptr;
-            D3D12_RANGE readRange{};
-            hr = uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
-            if (FAILED(hr) || mapped == nullptr) {
-                error = HrMessage("Map(world atlas upload) failed", hr);
+            if (!allocUpload(uploadBytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, uploadOffset, mapped)) {
+                error = "World upload staging buffer exhausted while uploading atlas pages";
                 m_worldStreamingStats.uploadFailures += 1;
                 return false;
             }
@@ -3341,7 +3377,6 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
                 const uint8_t* src = upload.rgbaPixels + static_cast<size_t>(row) * static_cast<size_t>(rowBytes);
                 std::memcpy(mapped + static_cast<size_t>(row) * static_cast<size_t>(rowPitch), src, rowBytes);
             }
-            uploadBuffer->Unmap(0, nullptr);
 
             D3D12_TEXTURE_COPY_LOCATION dstLoc{};
             dstLoc.pResource = m_worldSatelliteAtlasTexture.Get();
@@ -3349,9 +3384,9 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
             dstLoc.SubresourceIndex = 0;
 
             D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-            srcLoc.pResource = uploadBuffer.Get();
+            srcLoc.pResource = slot.uploadBuffer.Get();
             srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            srcLoc.PlacedFootprint.Offset = 0;
+            srcLoc.PlacedFootprint.Offset = uploadOffset;
             srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
             srcLoc.PlacedFootprint.Footprint.Width = kWorldSatelliteTileSize;
             srcLoc.PlacedFootprint.Footprint.Height = kWorldSatelliteTileSize;
@@ -3360,10 +3395,9 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
 
             const UINT dstX = upload.atlasPageX * kWorldSatelliteTileSize;
             const UINT dstY = upload.atlasPageY * kWorldSatelliteTileSize;
-            m_worldUploadCommandList->CopyTextureRegion(&dstLoc, dstX, dstY, 0, &srcLoc, nullptr);
+            slot.commandList->CopyTextureRegion(&dstLoc, dstX, dstY, 0, &srcLoc, nullptr);
 
             uploadedBytes += uploadBytes;
-            transientUploads.push_back(std::move(uploadBuffer));
         }
 
         D3D12_RESOURCE_BARRIER toShader{};
@@ -3372,32 +3406,25 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
         toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        m_worldUploadCommandList->ResourceBarrier(1, &toShader);
+        slot.commandList->ResourceBarrier(1, &toShader);
     }
 
     if (!pageTableUpdates.empty()) {
-        bool anyValid = false;
-        uint32_t minX = kWorldSatellitePageTableWidth;
-        uint32_t minY = kWorldSatellitePageTableHeight;
-        uint32_t maxX = 0;
-        uint32_t maxY = 0;
+        std::unordered_map<uint32_t, std::vector<uint32_t>> changedXsByRow;
+        changedXsByRow.reserve(pageTableUpdates.size());
         for (const WorldPageTableUpdate& u : pageTableUpdates) {
             if (u.x >= kWorldSatellitePageTableWidth || u.y >= kWorldSatellitePageTableHeight) {
                 continue;
             }
-            anyValid = true;
-            minX = std::min(minX, u.x);
-            minY = std::min(minY, u.y);
-            maxX = std::max(maxX, u.x);
-            maxY = std::max(maxY, u.y);
             const size_t idx = static_cast<size_t>(u.y) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(u.x);
             m_worldSatellitePageTableCpu[idx] = u.value;
             const size_t keyIdx = idx * 2u;
             m_worldSatellitePageKeyCpu[keyIdx + 0] = u.key0;
             m_worldSatellitePageKeyCpu[keyIdx + 1] = u.key1;
+            changedXsByRow[u.y].push_back(u.x);
         }
 
-        if (anyValid) {
+        if (!changedXsByRow.empty()) {
             D3D12_RESOURCE_BARRIER toCopy[2]{};
             toCopy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             toCopy[0].Transition.pResource = m_worldSatellitePageTableTexture.Get();
@@ -3409,144 +3436,99 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
             toCopy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             toCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
             toCopy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            m_worldUploadCommandList->ResourceBarrier(2, toCopy);
+            slot.commandList->ResourceBarrier(2, toCopy);
 
-            const uint32_t rectW = (maxX - minX) + 1u;
-            const uint32_t rectH = (maxY - minY) + 1u;
-            const UINT pageRowBytes = rectW * sizeof(uint32_t);
-            const UINT pageRowPitch =
-                ((pageRowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
-                D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-            const UINT64 pageUploadBytes = static_cast<UINT64>(pageRowPitch) * static_cast<UINT64>(rectH);
+            for (auto& [rowY, xs] : changedXsByRow) {
+                std::sort(xs.begin(), xs.end());
+                xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+                size_t runStart = 0;
+                while (runStart < xs.size()) {
+                    size_t runEnd = runStart + 1;
+                    while (runEnd < xs.size() && xs[runEnd] == (xs[runEnd - 1] + 1u)) {
+                        ++runEnd;
+                    }
 
-            D3D12_HEAP_PROPERTIES uploadHeap{};
-            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-            D3D12_RESOURCE_DESC uploadDesc{};
-            uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            uploadDesc.Width = pageUploadBytes;
-            uploadDesc.Height = 1;
-            uploadDesc.DepthOrArraySize = 1;
-            uploadDesc.MipLevels = 1;
-            uploadDesc.SampleDesc.Count = 1;
-            uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    const uint32_t x0 = xs[runStart];
+                    const uint32_t runWidth = static_cast<uint32_t>(runEnd - runStart);
 
-            ComPtr<ID3D12Resource> uploadBuffer;
-            HRESULT hr = m_device->CreateCommittedResource(
-                &uploadHeap,
-                D3D12_HEAP_FLAG_NONE,
-                &uploadDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                IID_PPV_ARGS(uploadBuffer.ReleaseAndGetAddressOf()));
-            if (FAILED(hr)) {
-                error = HrMessage("CreateCommittedResource(world page table rect upload) failed", hr);
-                m_worldStreamingStats.uploadFailures += 1;
-                return false;
+                    const UINT pageRowBytes = runWidth * sizeof(uint32_t);
+                    const UINT pageRowPitch =
+                        ((pageRowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
+                        D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+                    const UINT64 pageUploadBytes = static_cast<UINT64>(pageRowPitch);
+                    UINT64 pageOffset = 0;
+                    uint8_t* pageMapped = nullptr;
+                    if (!allocUpload(pageUploadBytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, pageOffset, pageMapped)) {
+                        error = "World upload staging buffer exhausted while uploading page-table rows";
+                        m_worldStreamingStats.uploadFailures += 1;
+                        return false;
+                    }
+                    const uint32_t* pageSrc = m_worldSatellitePageTableCpu.data() +
+                        static_cast<size_t>(rowY) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(x0);
+                    std::memcpy(pageMapped, pageSrc, static_cast<size_t>(pageRowBytes));
+
+                    D3D12_TEXTURE_COPY_LOCATION pageDstLoc{};
+                    pageDstLoc.pResource = m_worldSatellitePageTableTexture.Get();
+                    pageDstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    pageDstLoc.SubresourceIndex = 0;
+
+                    D3D12_TEXTURE_COPY_LOCATION pageSrcLoc{};
+                    pageSrcLoc.pResource = slot.uploadBuffer.Get();
+                    pageSrcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    pageSrcLoc.PlacedFootprint.Offset = pageOffset;
+                    pageSrcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_UINT;
+                    pageSrcLoc.PlacedFootprint.Footprint.Width = runWidth;
+                    pageSrcLoc.PlacedFootprint.Footprint.Height = 1;
+                    pageSrcLoc.PlacedFootprint.Footprint.Depth = 1;
+                    pageSrcLoc.PlacedFootprint.Footprint.RowPitch = pageRowPitch;
+
+                    D3D12_BOX pageSrcBox{};
+                    pageSrcBox.left = 0;
+                    pageSrcBox.top = 0;
+                    pageSrcBox.front = 0;
+                    pageSrcBox.right = runWidth;
+                    pageSrcBox.bottom = 1;
+                    pageSrcBox.back = 1;
+                    slot.commandList->CopyTextureRegion(&pageDstLoc, x0, rowY, 0, &pageSrcLoc, &pageSrcBox);
+                    uploadedBytes += pageUploadBytes;
+
+                    const UINT keyRowBytes = runWidth * sizeof(uint32_t) * 2u;
+                    const UINT keyRowPitch =
+                        ((keyRowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
+                        D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+                    const UINT64 keyUploadBytes = static_cast<UINT64>(keyRowPitch);
+                    UINT64 keyOffset = 0;
+                    uint8_t* keyMapped = nullptr;
+                    if (!allocUpload(keyUploadBytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, keyOffset, keyMapped)) {
+                        error = "World upload staging buffer exhausted while uploading page-key rows";
+                        m_worldStreamingStats.uploadFailures += 1;
+                        return false;
+                    }
+                    const uint32_t* keySrc = m_worldSatellitePageKeyCpu.data() +
+                        ((static_cast<size_t>(rowY) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(x0)) * 2u);
+                    std::memcpy(keyMapped, keySrc, static_cast<size_t>(keyRowBytes));
+
+                    D3D12_TEXTURE_COPY_LOCATION keyDstLoc{};
+                    keyDstLoc.pResource = m_worldSatellitePageKeyTexture.Get();
+                    keyDstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    keyDstLoc.SubresourceIndex = 0;
+
+                    D3D12_TEXTURE_COPY_LOCATION keySrcLoc{};
+                    keySrcLoc.pResource = slot.uploadBuffer.Get();
+                    keySrcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    keySrcLoc.PlacedFootprint.Offset = keyOffset;
+                    keySrcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32_UINT;
+                    keySrcLoc.PlacedFootprint.Footprint.Width = runWidth;
+                    keySrcLoc.PlacedFootprint.Footprint.Height = 1;
+                    keySrcLoc.PlacedFootprint.Footprint.Depth = 1;
+                    keySrcLoc.PlacedFootprint.Footprint.RowPitch = keyRowPitch;
+
+                    slot.commandList->CopyTextureRegion(&keyDstLoc, x0, rowY, 0, &keySrcLoc, &pageSrcBox);
+                    uploadedBytes += keyUploadBytes;
+
+                    runStart = runEnd;
+                }
             }
-
-            uint8_t* mapped = nullptr;
-            D3D12_RANGE readRange{};
-            hr = uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
-            if (FAILED(hr) || mapped == nullptr) {
-                error = HrMessage("Map(world page table rect upload) failed", hr);
-                m_worldStreamingStats.uploadFailures += 1;
-                return false;
-            }
-            for (uint32_t row = 0; row < rectH; ++row) {
-                const uint32_t srcY = minY + row;
-                const uint32_t* src = m_worldSatellitePageTableCpu.data() +
-                    static_cast<size_t>(srcY) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(minX);
-                std::memcpy(mapped + static_cast<size_t>(row) * static_cast<size_t>(pageRowPitch), src, static_cast<size_t>(pageRowBytes));
-            }
-            uploadBuffer->Unmap(0, nullptr);
-
-            D3D12_TEXTURE_COPY_LOCATION dstLoc{};
-            dstLoc.pResource = m_worldSatellitePageTableTexture.Get();
-            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dstLoc.SubresourceIndex = 0;
-
-            D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-            srcLoc.pResource = uploadBuffer.Get();
-            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            srcLoc.PlacedFootprint.Offset = 0;
-            srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_UINT;
-            srcLoc.PlacedFootprint.Footprint.Width = rectW;
-            srcLoc.PlacedFootprint.Footprint.Height = rectH;
-            srcLoc.PlacedFootprint.Footprint.Depth = 1;
-            srcLoc.PlacedFootprint.Footprint.RowPitch = pageRowPitch;
-
-            D3D12_BOX srcBox{};
-            srcBox.left = 0;
-            srcBox.top = 0;
-            srcBox.front = 0;
-            srcBox.right = rectW;
-            srcBox.bottom = rectH;
-            srcBox.back = 1;
-            m_worldUploadCommandList->CopyTextureRegion(&dstLoc, minX, minY, 0, &srcLoc, &srcBox);
-
-            uploadedBytes += pageUploadBytes;
-            transientUploads.push_back(std::move(uploadBuffer));
-
-            const UINT keyRowBytes = rectW * sizeof(uint32_t) * 2u;
-            const UINT keyRowPitch =
-                ((keyRowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
-                D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-            const UINT64 keyUploadBytes = static_cast<UINT64>(keyRowPitch) * static_cast<UINT64>(rectH);
-
-            D3D12_RESOURCE_DESC keyUploadDesc{};
-            keyUploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            keyUploadDesc.Width = keyUploadBytes;
-            keyUploadDesc.Height = 1;
-            keyUploadDesc.DepthOrArraySize = 1;
-            keyUploadDesc.MipLevels = 1;
-            keyUploadDesc.SampleDesc.Count = 1;
-            keyUploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-            ComPtr<ID3D12Resource> keyUploadBuffer;
-            hr = m_device->CreateCommittedResource(
-                &uploadHeap,
-                D3D12_HEAP_FLAG_NONE,
-                &keyUploadDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                IID_PPV_ARGS(keyUploadBuffer.ReleaseAndGetAddressOf()));
-            if (FAILED(hr)) {
-                error = HrMessage("CreateCommittedResource(world page key rect upload) failed", hr);
-                m_worldStreamingStats.uploadFailures += 1;
-                return false;
-            }
-
-            uint8_t* keyMapped = nullptr;
-            hr = keyUploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&keyMapped));
-            if (FAILED(hr) || keyMapped == nullptr) {
-                error = HrMessage("Map(world page key rect upload) failed", hr);
-                m_worldStreamingStats.uploadFailures += 1;
-                return false;
-            }
-            for (uint32_t row = 0; row < rectH; ++row) {
-                const uint32_t srcY = minY + row;
-                const uint32_t* src = m_worldSatellitePageKeyCpu.data() +
-                    ((static_cast<size_t>(srcY) * static_cast<size_t>(kWorldSatellitePageTableWidth) + static_cast<size_t>(minX)) * 2u);
-                std::memcpy(keyMapped + static_cast<size_t>(row) * static_cast<size_t>(keyRowPitch), src, static_cast<size_t>(keyRowBytes));
-            }
-            keyUploadBuffer->Unmap(0, nullptr);
-
-            D3D12_TEXTURE_COPY_LOCATION keyDstLoc{};
-            keyDstLoc.pResource = m_worldSatellitePageKeyTexture.Get();
-            keyDstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            keyDstLoc.SubresourceIndex = 0;
-
-            D3D12_TEXTURE_COPY_LOCATION keySrcLoc{};
-            keySrcLoc.pResource = keyUploadBuffer.Get();
-            keySrcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            keySrcLoc.PlacedFootprint.Offset = 0;
-            keySrcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32_UINT;
-            keySrcLoc.PlacedFootprint.Footprint.Width = rectW;
-            keySrcLoc.PlacedFootprint.Footprint.Height = rectH;
-            keySrcLoc.PlacedFootprint.Footprint.Depth = 1;
-            keySrcLoc.PlacedFootprint.Footprint.RowPitch = keyRowPitch;
-
-            m_worldUploadCommandList->CopyTextureRegion(&keyDstLoc, minX, minY, 0, &keySrcLoc, &srcBox);
 
             D3D12_RESOURCE_BARRIER toShader[2]{};
             toShader[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3559,31 +3541,22 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
             toShader[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             toShader[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             toShader[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            m_worldUploadCommandList->ResourceBarrier(2, toShader);
-
-            uploadedBytes += keyUploadBytes;
-            transientUploads.push_back(std::move(keyUploadBuffer));
+            slot.commandList->ResourceBarrier(2, toShader);
         }
     }
 
-    if (FAILED(m_worldUploadCommandList->Close())) {
+    if (FAILED(slot.commandList->Close())) {
         error = "World upload command list close failed";
         m_worldStreamingStats.uploadFailures += 1;
         return false;
     }
 
-    ID3D12CommandList* lists[] = {m_worldUploadCommandList.Get()};
+    ID3D12CommandList* lists[] = {slot.commandList.Get()};
     m_commandQueue->ExecuteCommandLists(1, lists);
     const UINT64 uploadFence = ++m_fenceValue;
     m_commandQueue->Signal(m_fence.Get(), uploadFence);
     m_worldUploadFenceValue = uploadFence;
-
-    for (auto& res : transientUploads) {
-        DeferredResource d{};
-        d.resource = std::move(res);
-        d.safeFenceValue = uploadFence;
-        m_retiredResources.push_back(std::move(d));
-    }
+    slot.fenceValue = uploadFence;
 
     m_worldStreamingStats.resourcesReady = true;
     m_worldStreamingStats.uploadBatches += 1;
