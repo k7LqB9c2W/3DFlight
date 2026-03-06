@@ -2,6 +2,7 @@
 #include <dbghelp.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -607,9 +608,62 @@ void CityPresetLatLon(int index, double& outLatDeg, double& outLonDeg) {
 }
 
 enum class VehicleMode {
-    Plane = 0,
-    Missile = 1,
+    Airplane = 0,
+    F35 = 1,
+    B2 = 2,
+    Missile = 3,
 };
+
+constexpr size_t kVehicleModeCount = 4;
+const char* kVehicleModeComboItems = "Airplane\0F-35 Lightning II\0B-2 Spirit\0AIM-120D Missile\0";
+
+const char* VehicleModeDisplayName(VehicleMode mode) {
+    switch (mode) {
+        case VehicleMode::Airplane:
+            return "Airplane";
+        case VehicleMode::F35:
+            return "F-35";
+        case VehicleMode::B2:
+            return "B-2";
+        case VehicleMode::Missile:
+            return "Missile";
+        default:
+            return "Airplane";
+    }
+}
+
+size_t VehicleModeToIndex(VehicleMode mode) {
+    const size_t index = static_cast<size_t>(mode);
+    return (index < kVehicleModeCount) ? index : 0u;
+}
+
+VehicleMode VehicleModeFromIndex(int index) {
+    switch (index) {
+        case 1:
+            return VehicleMode::F35;
+        case 2:
+            return VehicleMode::B2;
+        case 3:
+            return VehicleMode::Missile;
+        case 0:
+        default:
+            return VehicleMode::Airplane;
+    }
+}
+
+bool VehicleModeIsMissile(VehicleMode mode) {
+    return mode == VehicleMode::Missile;
+}
+
+struct VehicleRenderAsset {
+    MeshData mesh;
+    GlbMaterialTexture texture;
+    std::string modelStatus;
+    std::string textureStatus;
+    float minZoomMeters = 45.0f;
+};
+
+using VehicleAxisTransform = std::array<std::array<float, 3>, 3>;
 
 struct MissileAutopilotState {
     double launchLatDeg = 37.6188056;
@@ -1078,76 +1132,112 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         return 1;
     }
 
-    MeshData planeMesh;
-    MeshData missileMesh;
-    GlbMaterialTexture planeTexture;
-    GlbMaterialTexture missileTexture;
-    std::string meshError;
-    std::string missileMeshStatus;
-    std::string airplaneTextureStatus;
-    std::string missileTextureStatus;
+    std::array<VehicleRenderAsset, kVehicleModeCount> vehicleAssets{};
+    const auto transformVertexAxis = [](const DirectX::XMFLOAT3& value, const VehicleAxisTransform& axisTransform, float scale) {
+        return DirectX::XMFLOAT3{
+            (axisTransform[0][0] * value.x + axisTransform[0][1] * value.y + axisTransform[0][2] * value.z) * scale,
+            (axisTransform[1][0] * value.x + axisTransform[1][1] * value.y + axisTransform[1][2] * value.z) * scale,
+            (axisTransform[2][0] * value.x + axisTransform[2][1] * value.y + axisTransform[2][2] * value.z) * scale,
+        };
+    };
+    auto configureAircraftAsset =
+        [&](VehicleMode mode, const std::filesystem::path& path, float scale, float minZoomMeters, const VehicleAxisTransform& axisTransform) {
+            auto& asset = vehicleAssets[VehicleModeToIndex(mode)];
+            asset.minZoomMeters = minZoomMeters;
 
-    const std::filesystem::path airplanePath = std::filesystem::path("assets") / "models" / "Airplane.glb";
-    const bool airplaneLoaded = flight::LoadGlbMesh(airplanePath, planeMesh, planeTexture, meshError);
-    if (!airplaneLoaded) {
-        planeMesh = flight::CreatePlaceholderPlane();
-        missileMeshStatus = "Airplane fallback mesh active";
-        airplaneTextureStatus = "Airplane texture: fallback default (model load failed)";
-    } else {
-        // Align GLB local facing with simulation forward direction.
-        for (auto& v : planeMesh.vertices) {
-            v.position.x = -v.position.x;
-            v.position.z = -v.position.z;
-            v.normal.x = -v.normal.x;
-            v.normal.z = -v.normal.z;
-        }
-        if (planeTexture.IsValid()) {
-            airplaneTextureStatus =
-                "Airplane texture loaded (" + std::to_string(planeTexture.width) + "x" + std::to_string(planeTexture.height) + ")";
-        } else {
-            airplaneTextureStatus = "Airplane texture: none in GLB, using default";
-        }
-    }
+            std::string loadError;
+            const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, loadError);
+            if (!loaded) {
+                asset.mesh = flight::CreatePlaceholderPlane();
+            }
 
-    const std::filesystem::path missilePath = std::filesystem::path("assets") / "models" / "AIM120D.glb";
-    std::string missileLoadError;
-    const bool missileLoaded = flight::LoadGlbMesh(missilePath, missileMesh, missileTexture, missileLoadError);
-    if (!missileLoaded) {
-        missileMesh = flight::CreatePlaceholderPlane();
-        // Shrink fallback placeholder so it does not look like an airliner-sized missile.
-        for (auto& v : missileMesh.vertices) {
+            // Imported aircraft do not share one local basis. Apply a per-model remap before upload.
+            for (auto& v : asset.mesh.vertices) {
+                v.position = transformVertexAxis(v.position, axisTransform, scale);
+                v.normal = transformVertexAxis(v.normal, axisTransform, 1.0f);
+            }
+
+            if (!loaded) {
+                asset.modelStatus = std::string(VehicleModeDisplayName(mode)) + " model load failed, using placeholder: " + loadError;
+                asset.textureStatus =
+                    std::string(VehicleModeDisplayName(mode)) + " texture: fallback default (model load failed)";
+            } else {
+                asset.modelStatus = std::string(VehicleModeDisplayName(mode)) + " model loaded: " + path.string();
+                if (asset.texture.IsValid()) {
+                    asset.textureStatus =
+                        std::string(VehicleModeDisplayName(mode)) + " texture loaded (" + std::to_string(asset.texture.width) + "x" +
+                        std::to_string(asset.texture.height) + ")";
+                } else {
+                    asset.textureStatus = std::string(VehicleModeDisplayName(mode)) + " texture: none in GLB, using default";
+                }
+            }
+        };
+    auto configureMissileAsset = [&](const std::filesystem::path& path) {
+        auto& asset = vehicleAssets[VehicleModeToIndex(VehicleMode::Missile)];
+        asset.minZoomMeters = 8.0f;
+
+        std::string loadError;
+        const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, loadError);
+        if (!loaded) {
+            asset.mesh = flight::CreatePlaceholderPlane();
+        }
+
+        // Missile GLB already points the correct way for the chase camera; keep orientation and only scale it down.
+        for (auto& v : asset.mesh.vertices) {
             v.position.x *= 0.08f;
             v.position.y *= 0.08f;
             v.position.z *= 0.08f;
         }
-        missileMeshStatus = "Missile model load failed, using placeholder: " + missileLoadError;
-        missileTextureStatus = "Missile texture: fallback default (model load failed)";
-    } else {
-        // Scale down from loader's default 60m normalization.
-        // Missile GLB is already oriented opposite to airplane asset; keep X/Z signs so chase cam sees rear aspect.
-        for (auto& v : missileMesh.vertices) {
-            v.position.x = v.position.x * 0.08f;
-            v.position.y = v.position.y * 0.08f;
-            v.position.z = v.position.z * 0.08f;
-        }
-        missileMeshStatus = "Missile model loaded: " + missilePath.string();
-        if (missileTexture.IsValid()) {
-            missileTextureStatus =
-                "Missile texture loaded (" + std::to_string(missileTexture.width) + "x" + std::to_string(missileTexture.height) + ")";
+
+        if (!loaded) {
+            asset.modelStatus = "Missile model load failed, using placeholder: " + loadError;
+            asset.textureStatus = "Missile texture: fallback default (model load failed)";
         } else {
-            missileTextureStatus = "Missile texture: none in GLB, using default";
+            asset.modelStatus = "Missile model loaded: " + path.string();
+            if (asset.texture.IsValid()) {
+                asset.textureStatus =
+                    "Missile texture loaded (" + std::to_string(asset.texture.width) + "x" + std::to_string(asset.texture.height) + ")";
+            } else {
+                asset.textureStatus = "Missile texture: none in GLB, using default";
+            }
         }
-    }
+    };
+
+    constexpr VehicleAxisTransform kAirplaneAxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}};
+    constexpr VehicleAxisTransform kF35AxisTransform = {{{1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, -1.0f, 0.0f}}};
+    constexpr VehicleAxisTransform kB2AxisTransform = {{{0.0f, -1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, {1.0f, 0.0f, 0.0f}}};
+
+    configureAircraftAsset(
+        VehicleMode::Airplane,
+        std::filesystem::path("assets") / "models" / "Airplane.glb",
+        1.0f,
+        45.0f,
+        kAirplaneAxisTransform);
+    configureAircraftAsset(
+        VehicleMode::F35,
+        std::filesystem::path("assets") / "models" / "F35.glb",
+        0.27f,
+        18.0f,
+        kF35AxisTransform);
+    configureAircraftAsset(
+        VehicleMode::B2,
+        std::filesystem::path("assets") / "models" / "B2.glb",
+        0.88f,
+        30.0f,
+        kB2AxisTransform);
+    configureMissileAsset(std::filesystem::path("assets") / "models" / "AIM120D.glb");
+
+    const auto& initialVehicleAsset = vehicleAssets[VehicleModeToIndex(VehicleMode::Airplane)];
 
     std::string uploadError;
-    if (!renderer.SetPlaneMesh(planeMesh, uploadError)) {
+    if (!renderer.SetPlaneMesh(initialVehicleAsset.mesh, uploadError)) {
         MessageBoxA(hwnd, uploadError.c_str(), "Plane Upload Error", MB_OK | MB_ICONERROR);
     }
     std::string textureUploadError;
     if (!renderer.SetPlaneTexture(
-            planeTexture.IsValid() ? planeTexture.rgbaPixels.data() : nullptr,
-            planeTexture.width,
-            planeTexture.height,
+            initialVehicleAsset.texture.IsValid() ? initialVehicleAsset.texture.rgbaPixels.data() : nullptr,
+            initialVehicleAsset.texture.width,
+            initialVehicleAsset.texture.height,
             textureUploadError)) {
         MessageBoxA(hwnd, textureUploadError.c_str(), "Plane Texture Upload Error", MB_OK | MB_ICONERROR);
     }
@@ -1155,8 +1245,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     FlightSim sim;
     FlightSim missileViewSim;
     FlightStart editableStart = sim.GetStart();
-    VehicleMode vehicleMode = VehicleMode::Plane;
-    VehicleMode appliedRenderMode = VehicleMode::Plane;
+    VehicleMode vehicleMode = VehicleMode::Airplane;
+    VehicleMode appliedRenderMode = VehicleMode::Airplane;
     MissileAutopilotState missileState{};
     missileState.launchLatDeg = editableStart.latitudeDeg;
     missileState.launchLonDeg = editableStart.longitudeDeg;
@@ -1297,7 +1387,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
     std::string terrainRuntimeError;
     std::string vehicleModeStatus;
-    std::string vehicleTextureStatus = airplaneTextureStatus;
+    std::string vehicleTextureStatus = initialVehicleAsset.textureStatus;
     StreamStats satelliteStats{};
     std::string satelliteRuntimeStatus;
     flight::satellite::WorldTileSystemStats worldTileStats{};
@@ -1386,11 +1476,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     };
 
     auto applyVehicleZoomRange = [&](VehicleMode mode) {
-        constexpr float kPlaneZoomMinMeters = 45.0f;
-        constexpr float kMissileZoomMinMeters = 8.0f;
         constexpr float kZoomMaxMeters = 3000.0f;
+        const float minZoomMeters = vehicleAssets[VehicleModeToIndex(mode)].minZoomMeters;
         renderer.SetCameraZoomRangeMeters(
-            (mode == VehicleMode::Missile) ? kMissileZoomMinMeters : kPlaneZoomMinMeters,
+            minZoomMeters,
             kZoomMaxMeters);
     };
 
@@ -1400,19 +1489,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             applyVehicleZoomRange(mode);
             return;
         }
+        const auto& asset = vehicleAssets[VehicleModeToIndex(mode)];
         std::string meshUploadError;
-        const bool ok = renderer.SetPlaneMesh((mode == VehicleMode::Missile) ? missileMesh : planeMesh, meshUploadError);
+        const bool ok = renderer.SetPlaneMesh(asset.mesh, meshUploadError);
         if (!ok) {
             vehicleModeStatus = "Vehicle mesh switch failed: " + meshUploadError;
             return;
         }
-        const GlbMaterialTexture& selectedTexture = (mode == VehicleMode::Missile) ? missileTexture : planeTexture;
-        std::string selectedTextureStatus = (mode == VehicleMode::Missile) ? missileTextureStatus : airplaneTextureStatus;
         std::string textureError;
         const bool textureOk = renderer.SetPlaneTexture(
-            selectedTexture.IsValid() ? selectedTexture.rgbaPixels.data() : nullptr,
-            selectedTexture.width,
-            selectedTexture.height,
+            asset.texture.IsValid() ? asset.texture.rgbaPixels.data() : nullptr,
+            asset.texture.width,
+            asset.texture.height,
             textureError);
         if (!textureOk) {
             vehicleModeStatus = "Vehicle texture switch failed: " + textureError;
@@ -1420,8 +1508,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
         appliedRenderMode = mode;
         applyVehicleZoomRange(mode);
-        vehicleTextureStatus = std::move(selectedTextureStatus);
-        vehicleModeStatus = (mode == VehicleMode::Missile) ? "Switched to missile vehicle view" : "Switched to airplane vehicle view";
+        vehicleTextureStatus = asset.textureStatus;
+        vehicleModeStatus = std::string("Switched to ") + VehicleModeDisplayName(mode) + " vehicle view";
     };
     applyVehicleZoomRange(vehicleMode);
 
@@ -1516,11 +1604,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         previousBackspace = backspaceDown;
 
         sim.SetStart(editableStart);
-        if (vehicleMode == VehicleMode::Plane) {
+        if (!VehicleModeIsMissile(vehicleMode)) {
             sim.Update(dt, input, static_cast<double>(simTimeScale));
         }
 
-        if (vehicleMode == VehicleMode::Missile) {
+        if (VehicleModeIsMissile(vehicleMode)) {
             if (!missileState.launched && !missileState.impacted) {
                 PrepareMissileAtLaunch(missileState);
             }
@@ -1535,7 +1623,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 missileState.rollRad);
         }
 
-        const FlightSim& activeSim = (vehicleMode == VehicleMode::Missile) ? missileViewSim : sim;
+        const FlightSim& activeSim = VehicleModeIsMissile(vehicleMode) ? missileViewSim : sim;
 
         if (autoTimeOfDay) {
             AdvanceLocalSolarClock(localSolarTimeHours, dayOfYear, static_cast<double>(timeOfDayRateHoursPerSecond) * dt);
@@ -1832,7 +1920,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::NewFrame();
 
         ImGui::Begin("Flight HUD");
-        ImGui::Text("Vehicle: %s", (vehicleMode == VehicleMode::Plane) ? "Airplane" : "Missile");
+        ImGui::Text("Vehicle: %s", VehicleModeDisplayName(vehicleMode));
         ImGui::Text("Lat: %.6f deg", activeSim.LatitudeDeg());
         ImGui::Text("Lon: %.6f deg", activeSim.LongitudeDeg());
         if (useImperialUnits) {
@@ -2040,25 +2128,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         ImGui::Separator();
-        int vehicleModeIndex = (vehicleMode == VehicleMode::Plane) ? 0 : 1;
-        if (ImGui::Combo("Vehicle Mode", &vehicleModeIndex, "Airplane\0AIM-120D Missile\0")) {
-            vehicleMode = (vehicleModeIndex == 0) ? VehicleMode::Plane : VehicleMode::Missile;
+        int vehicleModeIndex = static_cast<int>(vehicleMode);
+        if (ImGui::Combo("Vehicle Mode", &vehicleModeIndex, kVehicleModeComboItems)) {
+            vehicleMode = VehicleModeFromIndex(vehicleModeIndex);
             applyVehicleMesh(vehicleMode);
             regenerateTerrainRequested = true;
             havePatchCenter = false;
-            if (vehicleMode == VehicleMode::Missile && !missileState.launched) {
+            if (VehicleModeIsMissile(vehicleMode) && !missileState.launched) {
                 missileState.impacted = false;
                 PrepareMissileAtLaunch(missileState);
             }
         }
-        if (!missileMeshStatus.empty()) {
-            ImGui::TextWrapped("%s", missileMeshStatus.c_str());
-        }
-        if (!airplaneTextureStatus.empty() && vehicleMode == VehicleMode::Plane) {
-            ImGui::TextWrapped("%s", airplaneTextureStatus.c_str());
-        }
-        if (!missileTextureStatus.empty() && vehicleMode == VehicleMode::Missile) {
-            ImGui::TextWrapped("%s", missileTextureStatus.c_str());
+        const auto& activeVehicleAsset = vehicleAssets[VehicleModeToIndex(vehicleMode)];
+        if (!activeVehicleAsset.modelStatus.empty()) {
+            ImGui::TextWrapped("%s", activeVehicleAsset.modelStatus.c_str());
         }
         if (!vehicleTextureStatus.empty()) {
             ImGui::TextWrapped("Active texture: %s", vehicleTextureStatus.c_str());
@@ -2067,7 +2150,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::TextWrapped("%s", vehicleModeStatus.c_str());
         }
 
-        if (vehicleMode == VehicleMode::Missile) {
+        if (VehicleModeIsMissile(vehicleMode)) {
             ImGui::Separator();
             ImGui::Text("Missile Mission");
             ImGui::Text("State: %s", missileState.launched ? "In Flight" : (missileState.impacted ? "Impact Complete" : "Ready"));
@@ -2170,7 +2253,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         ImGui::Separator();
         ImGui::Text("Controls");
-        if (vehicleMode == VehicleMode::Plane) {
+        if (!VehicleModeIsMissile(vehicleMode)) {
             ImGui::Text("Pitch W/S, Roll A/D, Yaw Q/E");
             ImGui::Text("Throttle Up/Down arrows");
             ImGui::Text("Altitude R/F, Reset Backspace");
