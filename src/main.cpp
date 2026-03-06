@@ -1204,8 +1204,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     };
 
     constexpr VehicleAxisTransform kAirplaneAxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}};
-    constexpr VehicleAxisTransform kF35AxisTransform = {{{1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, -1.0f, 0.0f}}};
-    constexpr VehicleAxisTransform kB2AxisTransform = {{{0.0f, -1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, {1.0f, 0.0f, 0.0f}}};
+    constexpr VehicleAxisTransform kF35AxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, -1.0f, 0.0f}}};
+    constexpr VehicleAxisTransform kB2AxisTransform = {{{0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f}}};
 
     configureAircraftAsset(
         VehicleMode::Airplane,
