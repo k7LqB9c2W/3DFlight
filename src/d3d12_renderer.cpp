@@ -32,6 +32,226 @@ UINT64 Align256(UINT64 v) {
     return (v + 255ull) & ~255ull;
 }
 
+constexpr uint32_t kWorldUploadTileSize = 256;
+constexpr uint32_t kWorldTopLevelStitchPixels = 1;
+constexpr uint32_t kWorldMipStitchPixels = 4;
+
+const std::array<float, 256>& SrgbToLinearLut() {
+    static const std::array<float, 256> lut = []() {
+        std::array<float, 256> out{};
+        for (size_t i = 0; i < out.size(); ++i) {
+            const float srgb = static_cast<float>(i) / 255.0f;
+            out[i] = (srgb <= 0.04045f) ? (srgb / 12.92f) : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+        }
+        return out;
+    }();
+    return lut;
+}
+
+float SrgbByteToLinear(uint8_t value) {
+    return SrgbToLinearLut()[value];
+}
+
+uint8_t LinearToSrgbByte(float value) {
+    const float clamped = std::clamp(value, 0.0f, 1.0f);
+    const float srgb = (clamped <= 0.0031308f)
+        ? (clamped * 12.92f)
+        : (1.055f * std::pow(clamped, 1.0f / 2.4f) - 0.055f);
+    return static_cast<uint8_t>(std::lround(srgb * 255.0f));
+}
+
+bool HasWorldUploadPixels(const uint8_t* pixels) {
+    return pixels != nullptr;
+}
+
+const uint8_t* TilePixelPtr(const uint8_t* pixels, uint32_t x, uint32_t y) {
+    return pixels + ((static_cast<size_t>(y) * kWorldUploadTileSize + static_cast<size_t>(x)) * 4u);
+}
+
+void ReadPixelLinear(const uint8_t* pixel, std::array<float, 4>& out) {
+    out[0] = SrgbByteToLinear(pixel[0]);
+    out[1] = SrgbByteToLinear(pixel[1]);
+    out[2] = SrgbByteToLinear(pixel[2]);
+    out[3] = static_cast<float>(pixel[3]) / 255.0f;
+}
+
+void WritePixelLinear(uint8_t* dst, const std::array<float, 4>& value) {
+    dst[0] = LinearToSrgbByte(value[0]);
+    dst[1] = LinearToSrgbByte(value[1]);
+    dst[2] = LinearToSrgbByte(value[2]);
+    dst[3] = static_cast<uint8_t>(std::lround(std::clamp(value[3], 0.0f, 1.0f) * 255.0f));
+}
+
+void LerpPixelLinear(
+    const std::array<float, 4>& a,
+    const std::array<float, 4>& b,
+    float t,
+    std::array<float, 4>& out) {
+    for (size_t c = 0; c < out.size(); ++c) {
+        out[c] = a[c] + (b[c] - a[c]) * t;
+    }
+}
+
+void BuildStitchedWorldTile(
+    const D3D12Renderer::WorldAtlasPageUpload& upload,
+    uint32_t stitchPixels,
+    std::vector<uint8_t>& out) {
+    if (!HasWorldUploadPixels(upload.rgbaPixels)) {
+        out.assign(static_cast<size_t>(kWorldUploadTileSize) * static_cast<size_t>(kWorldUploadTileSize) * 4u, 0u);
+        return;
+    }
+
+    out.assign(
+        upload.rgbaPixels,
+        upload.rgbaPixels + static_cast<size_t>(kWorldUploadTileSize) * static_cast<size_t>(kWorldUploadTileSize) * 4u);
+
+    const uint32_t clampedStitchPixels = std::clamp(stitchPixels, 1u, kWorldUploadTileSize / 2u);
+    auto edgeWeight = [clampedStitchPixels](uint32_t distToEdge) -> float {
+        const float t = 1.0f - (static_cast<float>(distToEdge) / static_cast<float>(clampedStitchPixels));
+        return 0.5f * std::clamp(t, 0.0f, 1.0f);
+    };
+
+    for (uint32_t y = 0; y < kWorldUploadTileSize; ++y) {
+        for (uint32_t x = 0; x < kWorldUploadTileSize; ++x) {
+            const bool onLeft = x < clampedStitchPixels;
+            const bool onRight = x >= (kWorldUploadTileSize - clampedStitchPixels);
+            const bool onTop = y < clampedStitchPixels;
+            const bool onBottom = y >= (kWorldUploadTileSize - clampedStitchPixels);
+            if (!onLeft && !onRight && !onTop && !onBottom) {
+                continue;
+            }
+
+            const uint8_t* centerPixel = TilePixelPtr(upload.rgbaPixels, x, y);
+            const uint8_t* horizPixel = centerPixel;
+            const uint8_t* vertPixel = centerPixel;
+            const uint8_t* diagPixel = centerPixel;
+            float hW = 0.0f;
+            float vW = 0.0f;
+            int hDir = 0;
+            int vDir = 0;
+
+            if (onLeft && HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Left])) {
+                horizPixel = TilePixelPtr(
+                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Left],
+                    kWorldUploadTileSize - 1u - x,
+                    y);
+                hW = edgeWeight(x);
+                hDir = -1;
+            } else if (
+                onRight &&
+                HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Right])) {
+                const uint32_t dist = (kWorldUploadTileSize - 1u) - x;
+                horizPixel = TilePixelPtr(
+                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Right],
+                    dist,
+                    y);
+                hW = edgeWeight(dist);
+                hDir = 1;
+            }
+
+            if (onTop && HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Top])) {
+                vertPixel = TilePixelPtr(
+                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Top],
+                    x,
+                    kWorldUploadTileSize - 1u - y);
+                vW = edgeWeight(y);
+                vDir = -1;
+            } else if (
+                onBottom &&
+                HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Bottom])) {
+                const uint32_t dist = (kWorldUploadTileSize - 1u) - y;
+                vertPixel = TilePixelPtr(
+                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Bottom],
+                    x,
+                    dist);
+                vW = edgeWeight(dist);
+                vDir = 1;
+            }
+
+            if (hDir != 0 && vDir != 0) {
+                size_t diagIndex = D3D12Renderer::WorldAtlasPageUpload::TopLeft;
+                if (hDir > 0 && vDir < 0) {
+                    diagIndex = D3D12Renderer::WorldAtlasPageUpload::TopRight;
+                } else if (hDir < 0 && vDir > 0) {
+                    diagIndex = D3D12Renderer::WorldAtlasPageUpload::BottomLeft;
+                } else if (hDir > 0 && vDir > 0) {
+                    diagIndex = D3D12Renderer::WorldAtlasPageUpload::BottomRight;
+                }
+
+                if (HasWorldUploadPixels(upload.neighborRgbaPixels[diagIndex])) {
+                    const uint32_t diagX = (hDir < 0) ? (kWorldUploadTileSize - 1u - x) : ((kWorldUploadTileSize - 1u) - x);
+                    const uint32_t diagY = (vDir < 0) ? (kWorldUploadTileSize - 1u - y) : ((kWorldUploadTileSize - 1u) - y);
+                    diagPixel = TilePixelPtr(upload.neighborRgbaPixels[diagIndex], diagX, diagY);
+                } else if (hW > 0.0f) {
+                    diagPixel = horizPixel;
+                } else if (vW > 0.0f) {
+                    diagPixel = vertPixel;
+                }
+            } else if (hW > 0.0f) {
+                diagPixel = horizPixel;
+            } else if (vW > 0.0f) {
+                diagPixel = vertPixel;
+            }
+
+            std::array<float, 4> center{};
+            std::array<float, 4> horiz{};
+            std::array<float, 4> vert{};
+            std::array<float, 4> diag{};
+            ReadPixelLinear(centerPixel, center);
+            ReadPixelLinear(horizPixel, horiz);
+            ReadPixelLinear(vertPixel, vert);
+            ReadPixelLinear(diagPixel, diag);
+
+            std::array<float, 4> blend0{};
+            std::array<float, 4> blend1{};
+            std::array<float, 4> blended{};
+            LerpPixelLinear(center, horiz, hW, blend0);
+            LerpPixelLinear(vert, diag, hW, blend1);
+            LerpPixelLinear(blend0, blend1, vW, blended);
+
+            uint8_t* outPixel = out.data() + ((static_cast<size_t>(y) * kWorldUploadTileSize + static_cast<size_t>(x)) * 4u);
+            WritePixelLinear(outPixel, blended);
+        }
+    }
+}
+
+void DownsampleRgbaBox2x2Linear(const uint8_t* src, uint32_t srcWidth, uint32_t srcHeight, std::vector<uint8_t>& dst) {
+    const uint32_t dstWidth = std::max(1u, srcWidth / 2u);
+    const uint32_t dstHeight = std::max(1u, srcHeight / 2u);
+    dst.assign(static_cast<size_t>(dstWidth) * static_cast<size_t>(dstHeight) * 4u, 0u);
+
+    for (uint32_t y = 0; y < dstHeight; ++y) {
+        for (uint32_t x = 0; x < dstWidth; ++x) {
+            const uint32_t sx0 = std::min(srcWidth - 1u, x * 2u);
+            const uint32_t sx1 = std::min(srcWidth - 1u, sx0 + 1u);
+            const uint32_t sy0 = std::min(srcHeight - 1u, y * 2u);
+            const uint32_t sy1 = std::min(srcHeight - 1u, sy0 + 1u);
+
+            const uint8_t* p00 = src + ((static_cast<size_t>(sy0) * srcWidth + sx0) * 4u);
+            const uint8_t* p10 = src + ((static_cast<size_t>(sy0) * srcWidth + sx1) * 4u);
+            const uint8_t* p01 = src + ((static_cast<size_t>(sy1) * srcWidth + sx0) * 4u);
+            const uint8_t* p11 = src + ((static_cast<size_t>(sy1) * srcWidth + sx1) * 4u);
+            uint8_t* out = dst.data() + ((static_cast<size_t>(y) * dstWidth + x) * 4u);
+
+            const float r = (SrgbByteToLinear(p00[0]) + SrgbByteToLinear(p10[0]) +
+                SrgbByteToLinear(p01[0]) + SrgbByteToLinear(p11[0])) * 0.25f;
+            const float g = (SrgbByteToLinear(p00[1]) + SrgbByteToLinear(p10[1]) +
+                SrgbByteToLinear(p01[1]) + SrgbByteToLinear(p11[1])) * 0.25f;
+            const float b = (SrgbByteToLinear(p00[2]) + SrgbByteToLinear(p10[2]) +
+                SrgbByteToLinear(p01[2]) + SrgbByteToLinear(p11[2])) * 0.25f;
+            const float a = (
+                static_cast<float>(p00[3]) +
+                static_cast<float>(p10[3]) +
+                static_cast<float>(p01[3]) +
+                static_cast<float>(p11[3])) * (0.25f / 255.0f);
+            out[0] = LinearToSrgbByte(r);
+            out[1] = LinearToSrgbByte(g);
+            out[2] = LinearToSrgbByte(b);
+            out[3] = static_cast<uint8_t>(std::lround(std::clamp(a, 0.0f, 1.0f) * 255.0f));
+        }
+    }
+}
+
 DirectX::XMFLOAT3 ToFloat3(const Double3& v) {
     return {static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z)};
 }
@@ -1142,13 +1362,21 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning4 = m_satelliteLodBounds[0];
         obj.tuning5 = m_satelliteLodBounds[1];
         obj.tuning6 = m_satelliteLodBounds[2];
-        obj.tuning7 = {m_satelliteLodValid[0], m_satelliteLodValid[1], m_satelliteLodValid[2], 0.0f};
+        obj.tuning7 = {
+            m_satelliteLodValid[0],
+            m_satelliteLodValid[1],
+            m_satelliteLodValid[2],
+            m_worldForceMipZero ? 1.0f : 0.0f};
         obj.tuning8 = m_satellitePrevLodBounds[0];
         obj.tuning9 = m_satellitePrevLodBounds[1];
         obj.tuning10 = m_satellitePrevLodBounds[2];
         obj.tuning11 = {m_satellitePrevLodValid[0], m_satellitePrevLodValid[1], m_satellitePrevLodValid[2], m_satelliteTransitionT};
         const bool worldSamplingEnabled = m_worldLockedSatelliteEnabled && m_worldStreamingResourcesReady;
-        obj.tuning12 = {layerAlpha, worldSamplingEnabled ? 1.0f : 0.0f, 1.0f, 0.0f};
+        obj.tuning12 = {
+            layerAlpha,
+            worldSamplingEnabled ? 1.0f : 0.0f,
+            1.0f,
+            static_cast<float>(m_worldDebugViewMode)};
         obj.tuning13 = {
             static_cast<float>(kWorldSatelliteAtlasPagesX),
             static_cast<float>(kWorldSatelliteAtlasPagesY),
@@ -1159,7 +1387,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(std::clamp(m_worldSamplingZooms[0], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[1], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[2], 0, 22)),
-            8.0f,
+            static_cast<float>(m_worldShaderProbeBudget),
         };
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
@@ -3103,7 +3331,7 @@ bool D3D12Renderer::CreateWorldStreamingResources(ID3D12GraphicsCommandList* com
     atlasDesc.Width = static_cast<UINT64>(kWorldSatelliteTileSize) * static_cast<UINT64>(kWorldSatelliteAtlasPagesX);
     atlasDesc.Height = kWorldSatelliteTileSize * kWorldSatelliteAtlasPagesY;
     atlasDesc.DepthOrArraySize = 1;
-    atlasDesc.MipLevels = 1;
+    atlasDesc.MipLevels = static_cast<UINT16>(kWorldSatelliteAtlasMipCount);
     atlasDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     atlasDesc.SampleDesc.Count = 1;
     atlasDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -3258,7 +3486,7 @@ bool D3D12Renderer::CreateWorldStreamingResources(ID3D12GraphicsCommandList* com
     atlasSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     atlasSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     atlasSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    atlasSrv.Texture2D.MipLevels = 1;
+    atlasSrv.Texture2D.MipLevels = kWorldSatelliteAtlasMipCount;
     m_device->CreateShaderResourceView(m_worldSatelliteAtlasTexture.Get(), &atlasSrv, CpuSrv(kWorldSatelliteAtlasSrvIndex));
 
     D3D12_SHADER_RESOURCE_VIEW_DESC pageSrv{};
@@ -3362,42 +3590,67 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
                 continue;
             }
 
-            const UINT rowBytes = kWorldSatelliteTileSize * 4u;
-            const UINT rowPitch =
-                ((rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-            const UINT64 uploadBytes = static_cast<UINT64>(rowPitch) * static_cast<UINT64>(kWorldSatelliteTileSize);
-            UINT64 uploadOffset = 0;
-            uint8_t* mapped = nullptr;
-            if (!allocUpload(uploadBytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, uploadOffset, mapped)) {
-                error = "World upload staging buffer exhausted while uploading atlas pages";
-                m_worldStreamingStats.uploadFailures += 1;
-                return false;
+            // Match the outermost texel on the full-resolution tile so the page-edge clamp path
+            // does not expose JPEG tile deltas, then use a slightly wider stitched seed for mips.
+            std::vector<uint8_t> topLevelPixels;
+            BuildStitchedWorldTile(upload, kWorldTopLevelStitchPixels, topLevelPixels);
+            std::vector<uint8_t> mipSeedPixels;
+            BuildStitchedWorldTile(upload, kWorldMipStitchPixels, mipSeedPixels);
+
+            const uint8_t* mipPixels = topLevelPixels.data();
+            uint32_t mipWidth = kWorldSatelliteTileSize;
+            uint32_t mipHeight = kWorldSatelliteTileSize;
+            std::vector<uint8_t> mipStorage;
+            std::vector<uint8_t> nextMipStorage;
+
+            for (uint32_t mip = 0; mip < kWorldSatelliteAtlasMipCount; ++mip) {
+                const UINT rowBytes = mipWidth * 4u;
+                const UINT rowPitch =
+                    ((rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
+                    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+                const UINT64 mipUploadBytes = static_cast<UINT64>(rowPitch) * static_cast<UINT64>(mipHeight);
+                UINT64 uploadOffset = 0;
+                uint8_t* mapped = nullptr;
+                if (!allocUpload(mipUploadBytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, uploadOffset, mapped)) {
+                    error = "World upload staging buffer exhausted while uploading atlas pages";
+                    m_worldStreamingStats.uploadFailures += 1;
+                    return false;
+                }
+                for (uint32_t row = 0; row < mipHeight; ++row) {
+                    const uint8_t* src = mipPixels + static_cast<size_t>(row) * static_cast<size_t>(rowBytes);
+                    std::memcpy(mapped + static_cast<size_t>(row) * static_cast<size_t>(rowPitch), src, rowBytes);
+                }
+
+                D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+                dstLoc.pResource = m_worldSatelliteAtlasTexture.Get();
+                dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dstLoc.SubresourceIndex = mip;
+
+                D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+                srcLoc.pResource = slot.uploadBuffer.Get();
+                srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                srcLoc.PlacedFootprint.Offset = uploadOffset;
+                srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                srcLoc.PlacedFootprint.Footprint.Width = mipWidth;
+                srcLoc.PlacedFootprint.Footprint.Height = mipHeight;
+                srcLoc.PlacedFootprint.Footprint.Depth = 1;
+                srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
+
+                const UINT dstX = upload.atlasPageX * std::max(1u, kWorldSatelliteTileSize >> mip);
+                const UINT dstY = upload.atlasPageY * std::max(1u, kWorldSatelliteTileSize >> mip);
+                slot.commandList->CopyTextureRegion(&dstLoc, dstX, dstY, 0, &srcLoc, nullptr);
+
+                uploadedBytes += mipUploadBytes;
+                if (mip + 1u < kWorldSatelliteAtlasMipCount) {
+                    const uint8_t* downsampleSource = (mip == 0u) ? mipSeedPixels.data() : mipPixels;
+                    DownsampleRgbaBox2x2Linear(downsampleSource, mipWidth, mipHeight, nextMipStorage);
+                    mipStorage.swap(nextMipStorage);
+                    nextMipStorage.clear();
+                    mipPixels = mipStorage.data();
+                    mipWidth = std::max(1u, mipWidth / 2u);
+                    mipHeight = std::max(1u, mipHeight / 2u);
+                }
             }
-            for (uint32_t row = 0; row < kWorldSatelliteTileSize; ++row) {
-                const uint8_t* src = upload.rgbaPixels + static_cast<size_t>(row) * static_cast<size_t>(rowBytes);
-                std::memcpy(mapped + static_cast<size_t>(row) * static_cast<size_t>(rowPitch), src, rowBytes);
-            }
-
-            D3D12_TEXTURE_COPY_LOCATION dstLoc{};
-            dstLoc.pResource = m_worldSatelliteAtlasTexture.Get();
-            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dstLoc.SubresourceIndex = 0;
-
-            D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-            srcLoc.pResource = slot.uploadBuffer.Get();
-            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            srcLoc.PlacedFootprint.Offset = uploadOffset;
-            srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-            srcLoc.PlacedFootprint.Footprint.Width = kWorldSatelliteTileSize;
-            srcLoc.PlacedFootprint.Footprint.Height = kWorldSatelliteTileSize;
-            srcLoc.PlacedFootprint.Footprint.Depth = 1;
-            srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
-
-            const UINT dstX = upload.atlasPageX * kWorldSatelliteTileSize;
-            const UINT dstY = upload.atlasPageY * kWorldSatelliteTileSize;
-            slot.commandList->CopyTextureRegion(&dstLoc, dstX, dstY, 0, &srcLoc, nullptr);
-
-            uploadedBytes += uploadBytes;
         }
 
         D3D12_RESOURCE_BARRIER toShader{};

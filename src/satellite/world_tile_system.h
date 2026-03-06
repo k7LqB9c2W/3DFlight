@@ -32,10 +32,23 @@ struct WorldTileKeyHasher {
 };
 
 struct WorldAtlasUpload {
+    enum NeighborIndex : size_t {
+        Left = 0,
+        Right,
+        Top,
+        Bottom,
+        TopLeft,
+        TopRight,
+        BottomLeft,
+        BottomRight,
+        NeighborCount
+    };
+
     WorldTileKey key{};
     uint32_t atlasPageX = 0;
     uint32_t atlasPageY = 0;
     std::shared_ptr<const std::vector<uint8_t>> rgbaPixels;
+    std::array<std::shared_ptr<const std::vector<uint8_t>>, NeighborCount> neighborRgbaPixels{};
 };
 
 struct WorldPageTableUpdate {
@@ -120,6 +133,7 @@ public:
     void SetEnabled(bool enabled) { m_enabled = enabled; }
     [[nodiscard]] bool IsEnabled() const { return m_enabled; }
     void SetFrameTimeMs(double frameTimeMs);
+    void SetShaderProbeBudget(uint32_t budget);
 
     void Tick(const ViewState& view, SatelliteStreamer& streamer);
     void ConsumeGpuUpdates(std::vector<WorldAtlasUpload>& outAtlas, std::vector<WorldPageTableUpdate>& outPageTable);

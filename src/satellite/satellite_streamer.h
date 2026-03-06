@@ -52,7 +52,7 @@ public:
     bool Initialize(const Config& config, std::string& error);
     void Shutdown();
 
-    void PrefetchForView(double latDeg, double lonDeg, double altitudeMeters);
+    void PrefetchForView(double latDeg, double lonDeg, double altitudeMeters, double headingDeg = 0.0);
     bool ComposeLodRings(
         double latDeg,
         double lonDeg,

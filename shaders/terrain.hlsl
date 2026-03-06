@@ -31,12 +31,12 @@ cbuffer ObjectCB : register(b1)
     float4 gTuning4; // streamed near  bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning5; // streamed mid   bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning6; // streamed far   bounds lonWest/lonEast/latSouth/latNorth
-    float4 gTuning7; // x nearValid, y midValid, z farValid, w unused
+    float4 gTuning7; // x nearValid, y midValid, z farValid, w worldForceMip0
     float4 gTuning8; // previous streamed near bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning9; // previous streamed mid  bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning10; // previous streamed far bounds lonWest/lonEast/latSouth/latNorth
     float4 gTuning11; // x prevNearValid, y prevMidValid, z prevFarValid, w transition [0..1] old->new
-    float4 gTuning12; // x terrain layer alpha, y worldLockedEnabled, z worldLockedBlend, w unused
+    float4 gTuning12; // x terrain layer alpha, y worldLockedEnabled, z worldLockedBlend, w worldDebugMode
     float4 gTuning13; // x atlasPagesX, y atlasPagesY, z pageTableWidth, w pageTableHeight
     float4 gTuning14; // x nearZoom, y midZoom, z farZoom, w maxPageTableProbeCount
 };
@@ -193,7 +193,52 @@ bool LookupWorldAtlasPage(uint z, uint x, uint y, out uint atlasPageIndex)
     return false;
 }
 
-bool SampleWorldAtlasTile(int z, int tileXi, int tileYi, float2 localUv, out float4 sampleOut)
+float ComputeWorldAtlasLod(float2 tileCoord)
+{
+    if (gTuning7.w > 0.5)
+    {
+        return 0.0;
+    }
+
+    // Derive mip level from continuous tile coordinates instead of frac(localUv),
+    // which is discontinuous at every tile edge and produces seam-only mip spikes.
+    const float2 gradXTexels = ddx(tileCoord) * 256.0;
+    const float2 gradYTexels = ddy(tileCoord) * 256.0;
+    const float rho2 = max(dot(gradXTexels, gradXTexels), dot(gradYTexels, gradYTexels));
+    return clamp(0.5 * log2(max(rho2, 1.0e-8)) - 0.15, 0.0, 8.0);
+}
+
+float3 DebugWorldZoomColor(float zoomValue, float nearZoom, float midZoom, float farZoom)
+{
+    if (zoomValue >= (nearZoom - 0.25))
+    {
+        return float3(0.10, 0.95, 0.20);
+    }
+    if (zoomValue >= (midZoom - 0.25))
+    {
+        return float3(1.00, 0.85, 0.12);
+    }
+    if (zoomValue >= (farZoom - 0.25))
+    {
+        return float3(1.00, 0.42, 0.10);
+    }
+    return float3(1.00, 0.00, 1.00);
+}
+
+float3 DebugWorldMipColor(float lod)
+{
+    const float t = saturate(lod / 8.0);
+    return lerp(float3(0.05, 0.25, 1.00), float3(1.00, 0.15, 0.05), t);
+}
+
+float3 DebugWorldTileEdgeColor(float2 localUv)
+{
+    const float edgeDist = min(min(localUv.x, 1.0 - localUv.x), min(localUv.y, 1.0 - localUv.y));
+    const float edgeBlend = 1.0 - smoothstep(0.00, 0.05, edgeDist);
+    return lerp(float3(0.03, 0.03, 0.03), float3(1.00, 1.00, 1.00), edgeBlend);
+}
+
+bool SampleWorldAtlasPageLevel(int z, int tileXi, int tileYi, float2 localUv, float lod, out float4 sampleOut)
 {
     sampleOut = 0.0;
     if (z < 0 || z > 22)
@@ -222,17 +267,34 @@ bool SampleWorldAtlasTile(int z, int tileXi, int tileYi, float2 localUv, out flo
     const uint pageX = atlasPageIndex % atlasPagesX;
     const uint pageY = atlasPageIndex / atlasPagesX;
 
-    // Keep sampling away from atlas page borders to avoid unrelated-page bilinear bleed.
-    const float guard = 0.5 / 256.0;
+    const float2 atlasPageScale = rcp(float2(atlasPagesX, atlasPagesY));
+    // Expand the border guard with mip level so filtering never pulls from a neighboring atlas page.
+    const float mipGuardPixels = 0.5 * exp2(lod) + 1.0;
+    const float guard = saturate(mipGuardPixels / 256.0);
     const float2 guardedUv = clamp(localUv, float2(guard, guard), float2(1.0 - guard, 1.0 - guard));
-    const float2 atlasUv = (float2(pageX, pageY) + guardedUv) / float2(atlasPagesX, atlasPagesY);
-    sampleOut = gWorldSatelliteAtlas.SampleLevel(gClampSampler, atlasUv, 0.0);
+    const float2 atlasUv = (float2(pageX, pageY) + guardedUv) * atlasPageScale;
+    sampleOut = gWorldSatelliteAtlas.SampleLevel(gClampSampler, atlasUv, lod);
     return sampleOut.a > 0.001;
 }
 
-bool SampleWorldLonLatSeamAware(float lonDeg, float latDeg, int z, out float4 sampleOut)
+bool SampleWorldAtlasTile(int z, float2 tileCoord, int tileXi, int tileYi, float2 localUv, out float4 sampleOut, out float lodOut)
 {
     sampleOut = 0.0;
+    lodOut = 0.0;
+    if (z < 0 || z > 22)
+    {
+        return false;
+    }
+
+    lodOut = ComputeWorldAtlasLod(tileCoord);
+    return SampleWorldAtlasPageLevel(z, tileXi, tileYi, localUv, lodOut, sampleOut);
+}
+
+bool SampleWorldLonLatSeamAware(float lonDeg, float latDeg, int z, out float4 sampleOut, out float lodOut, out float2 localUvOut)
+{
+    sampleOut = 0.0;
+    lodOut = 0.0;
+    localUvOut = 0.0;
     if (z < 0 || z > 22)
     {
         return false;
@@ -245,9 +307,11 @@ bool SampleWorldLonLatSeamAware(float lonDeg, float latDeg, int z, out float4 sa
 
     const int tileXi = int(floor(x));
     const int tileYi = int(floor(y));
+    const float2 tileCoord = float2(x, y);
     const float2 localUv = float2(frac(x), frac(y));
+    localUvOut = localUv;
 
-    return SampleWorldAtlasTile(z, tileXi, tileYi, localUv, sampleOut);
+    return SampleWorldAtlasTile(z, tileCoord, tileXi, tileYi, localUv, sampleOut, lodOut);
 }
 
 bool SampleWorldHierarchical(
@@ -256,19 +320,27 @@ bool SampleWorldHierarchical(
     int preferredZoom,
     int fallbackZoomA,
     int fallbackZoomB,
-    out float4 sampleOut)
+    out float4 sampleOut,
+    out float sampledZoom,
+    out float sampledLod,
+    out float2 sampledLocalUv)
 {
     sampleOut = 0.0;
+    sampledZoom = -1.0;
+    sampledLod = 0.0;
+    sampledLocalUv = 0.0;
     const int z0 = clamp(preferredZoom, 0, 22);
     const int z1 = clamp(preferredZoom - 1, 0, 22);
     const int z2 = clamp(fallbackZoomA, 0, 22);
     const int z3 = clamp(fallbackZoomB, 0, 22);
 
     float4 s = 0.0;
-    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z0, s)) { sampleOut = s; return true; }
-    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z1, s)) { sampleOut = s; return true; }
-    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z2, s)) { sampleOut = s; return true; }
-    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z3, s)) { sampleOut = s; return true; }
+    float lod = 0.0;
+    float2 localUv = 0.0;
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z0, s, lod, localUv)) { sampleOut = s; sampledZoom = float(z0); sampledLod = lod; sampledLocalUv = localUv; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z1, s, lod, localUv)) { sampleOut = s; sampledZoom = float(z1); sampledLod = lod; sampledLocalUv = localUv; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z2, s, lod, localUv)) { sampleOut = s; sampledZoom = float(z2); sampledLod = lod; sampledLocalUv = localUv; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z3, s, lod, localUv)) { sampleOut = s; sampledZoom = float(z3); sampledLod = lod; sampledLocalUv = localUv; return true; }
     return false;
 }
 
@@ -319,6 +391,8 @@ float4 PSMain(VSOutput input) : SV_Target
         const bool wrapLon = (gTuning2.z > 0.5);
         float3 satelliteColor = baseColor;
         bool haveFallback = false;
+        bool useWorldDebugOverride = false;
+        float3 worldDebugOverrideColor = 0.0;
         if (wrapLon)
         {
             u = frac(u);
@@ -346,6 +420,7 @@ float4 PSMain(VSOutput input) : SV_Target
             int nearZoom = int(gTuning14.x + 0.5);
             int midZoom = int(gTuning14.y + 0.5);
             int farZoom = int(gTuning14.z + 0.5);
+            const float worldDebugMode = gTuning12.w;
 
             // Fallback if CPU profile is invalid for any reason.
             if (nearZoom <= 0 || midZoom <= 0 || farZoom <= 0)
@@ -359,45 +434,99 @@ float4 PSMain(VSOutput input) : SV_Target
 
             float3 worldAccum = 0.0;
             float worldW = 0.0;
+            float debugZoomAccum = 0.0;
+            float debugLodAccum = 0.0;
+            float2 debugUvAccum = 0.0;
+            float3 worldDebugColor = 0.0;
+            bool haveWorldDebugColor = false;
 
             if (nearWeight > 1e-4)
             {
                 float4 s;
-                if (SampleWorldHierarchical(lonDeg, latDeg, nearZoom, midZoom, farZoom, s))
+                float sampleZoom = 0.0;
+                float sampleLod = 0.0;
+                float2 sampleUv = 0.0;
+                if (SampleWorldHierarchical(lonDeg, latDeg, nearZoom, midZoom, farZoom, s, sampleZoom, sampleLod, sampleUv))
                 {
                     const float w = nearWeight * saturate(max(s.a, 0.001));
                     worldAccum += s.rgb * w;
                     worldW += w;
+                    debugZoomAccum += sampleZoom * w;
+                    debugLodAccum += sampleLod * w;
+                    debugUvAccum += sampleUv * w;
                 }
             }
             if (midWeight > 1e-4)
             {
                 float4 s;
-                if (SampleWorldHierarchical(lonDeg, latDeg, midZoom, farZoom, nearZoom - 2, s))
+                float sampleZoom = 0.0;
+                float sampleLod = 0.0;
+                float2 sampleUv = 0.0;
+                if (SampleWorldHierarchical(lonDeg, latDeg, midZoom, farZoom, nearZoom - 2, s, sampleZoom, sampleLod, sampleUv))
                 {
                     const float w = midWeight * saturate(max(s.a, 0.001));
                     worldAccum += s.rgb * w;
                     worldW += w;
+                    debugZoomAccum += sampleZoom * w;
+                    debugLodAccum += sampleLod * w;
+                    debugUvAccum += sampleUv * w;
                 }
             }
             if (farWeight > 1e-4)
             {
                 float4 s;
-                if (SampleWorldHierarchical(lonDeg, latDeg, farZoom, farZoom - 1, farZoom - 2, s))
+                float sampleZoom = 0.0;
+                float sampleLod = 0.0;
+                float2 sampleUv = 0.0;
+                if (SampleWorldHierarchical(lonDeg, latDeg, farZoom, farZoom - 1, farZoom - 2, s, sampleZoom, sampleLod, sampleUv))
                 {
                     const float w = farWeight * saturate(max(s.a, 0.001));
                     worldAccum += s.rgb * w;
                     worldW += w;
+                    debugZoomAccum += sampleZoom * w;
+                    debugLodAccum += sampleLod * w;
+                    debugUvAccum += sampleUv * w;
                 }
             }
 
             if (worldW > 1e-4)
             {
                 const float3 streamed = worldAccum / worldW;
+                if (worldDebugMode > 0.5)
+                {
+                    const float avgZoom = debugZoomAccum / worldW;
+                    const float avgLod = debugLodAccum / worldW;
+                    const float2 avgUv = debugUvAccum / worldW;
+                    if (worldDebugMode < 1.5)
+                    {
+                        worldDebugColor = DebugWorldZoomColor(avgZoom, nearZoom, midZoom, farZoom);
+                    }
+                    else if (worldDebugMode < 2.5)
+                    {
+                        worldDebugColor = DebugWorldMipColor(avgLod);
+                    }
+                    else
+                    {
+                        worldDebugColor = DebugWorldTileEdgeColor(avgUv);
+                    }
+                    haveWorldDebugColor = true;
+                }
+
                 // Keep coverage stable once we have any streamed sample this frame.
                 const float blend = saturate(gTuning12.z);
                 satelliteColor = haveFallback ? lerp(satelliteColor, streamed, blend) : streamed;
                 haveFallback = true;
+            }
+            else if (worldDebugMode > 0.5)
+            {
+                worldDebugColor = float3(1.0, 0.0, 1.0);
+                haveWorldDebugColor = true;
+            }
+
+            if (haveWorldDebugColor)
+            {
+                useWorldDebugOverride = true;
+                worldDebugOverrideColor = worldDebugColor;
             }
         }
         else if (gTuning2.w > 0.5)
@@ -488,7 +617,11 @@ float4 PSMain(VSOutput input) : SV_Target
             }
         }
 
-        if (haveFallback)
+        if (useWorldDebugOverride)
+        {
+            baseColor = worldDebugOverrideColor;
+        }
+        else if (haveFallback)
         {
             baseColor = lerp(baseColor, satelliteColor, saturate(gTuning2.y));
         }

@@ -62,11 +62,56 @@ int WrapTileX(int x, int n) {
     return r;
 }
 
+bool HasDecodedTilePixels(const std::shared_ptr<const std::vector<uint8_t>>& pixels) {
+    return pixels && pixels->size() >= (256u * 256u * 4u);
+}
+
+WorldTileKey OffsetWorldTileKey(const WorldTileKey& key, int dx, int dy) {
+    const int n = 1 << key.z;
+    WorldTileKey shifted = key;
+    shifted.x = WrapTileX(key.x + dx, n);
+    shifted.y = std::clamp(key.y + dy, 0, n - 1);
+    return shifted;
+}
+
+void PopulateUploadNeighborPixels(
+    const WorldTileKey& key,
+    SatelliteStreamer& streamer,
+    WorldAtlasUpload& upload) {
+    static constexpr std::array<std::pair<int, int>, WorldAtlasUpload::NeighborCount> kNeighborOffsets{{
+        {-1, 0},
+        {1, 0},
+        {0, -1},
+        {0, 1},
+        {-1, -1},
+        {1, -1},
+        {-1, 1},
+        {1, 1},
+    }};
+
+    for (size_t i = 0; i < kNeighborOffsets.size(); ++i) {
+        const auto [dx, dy] = kNeighborOffsets[i];
+        const WorldTileKey neighborKey = OffsetWorldTileKey(key, dx, dy);
+        std::shared_ptr<const std::vector<uint8_t>> neighborPixels;
+        if (streamer.TryGetCachedTileRgba(neighborKey.z, neighborKey.x, neighborKey.y, neighborPixels) &&
+            HasDecodedTilePixels(neighborPixels)) {
+            upload.neighborRgbaPixels[i] = std::move(neighborPixels);
+        }
+    }
+}
+
 double ApproxKmPerTile(double latDeg, int zoom) {
     const double n = static_cast<double>(1u << zoom);
     const double kmPerTileEq = 40075.016686 / n;
     const double cosLat = std::max(0.18, std::cos(ClampLatDeg(latDeg) * (kPi / 180.0)));
     return kmPerTileEq * cosLat;
+}
+
+double HeadingForwardComponentTiles(double dx, double dy, double headingDeg) {
+    const double headingRad = headingDeg * (kPi / 180.0);
+    const double east = std::sin(headingRad);
+    const double north = std::cos(headingRad);
+    return dx * east + (-dy) * north;
 }
 
 } // namespace
@@ -174,6 +219,10 @@ void WorldTileSystem::SetFrameTimeMs(double frameTimeMs) {
     m_lastFrameTimeMs = std::clamp(frameTimeMs, 5.0, 80.0);
 }
 
+void WorldTileSystem::SetShaderProbeBudget(uint32_t budget) {
+    m_config.shaderProbeBudget = std::clamp<uint32_t>(budget, 1u, 16u);
+}
+
 int WorldTileSystem::ComputeDesiredZoomBand(double altitudeMeters) {
     if (altitudeMeters < kBandBoundariesMeters[0]) {
         return 0;
@@ -252,11 +301,11 @@ void WorldTileSystem::UpdateFrameTimeGovernor() {
     const double frameMs = std::clamp(m_lastFrameTimeMs, 5.0, 80.0);
 
     int targetLevel = 0;
-    if (frameMs > 34.0) {
+    if (frameMs > 40.0) {
         targetLevel = 3;
-    } else if (frameMs > 27.0) {
+    } else if (frameMs > 32.0) {
         targetLevel = 2;
-    } else if (frameMs > 21.0) {
+    } else if (frameMs > 24.0) {
         targetLevel = 1;
     }
 
@@ -268,11 +317,11 @@ void WorldTileSystem::UpdateFrameTimeGovernor() {
         if (canRecover) {
             bool allowStepDown = false;
             if (m_governorLevel == 3) {
-                allowStepDown = frameMs < 31.0;
+                allowStepDown = frameMs < 36.0;
             } else if (m_governorLevel == 2) {
-                allowStepDown = frameMs < 25.0;
+                allowStepDown = frameMs < 29.0;
             } else if (m_governorLevel == 1) {
-                allowStepDown = frameMs < 19.0;
+                allowStepDown = frameMs < 22.0;
             }
             if (allowStepDown) {
                 m_governorLevel -= 1;
@@ -281,8 +330,8 @@ void WorldTileSystem::UpdateFrameTimeGovernor() {
         }
     }
 
-    const std::array<float, 4> requestScale{1.0f, 0.72f, 0.50f, 0.30f};
-    const std::array<float, 4> uploadScale{1.0f, 0.70f, 0.45f, 0.25f};
+    const std::array<float, 4> requestScale{1.0f, 0.84f, 0.68f, 0.52f};
+    const std::array<float, 4> uploadScale{1.0f, 0.88f, 0.72f, 0.56f};
 
     const float reqMul = requestScale[static_cast<size_t>(std::clamp(m_governorLevel, 0, 3))];
     const float upMul = uploadScale[static_cast<size_t>(std::clamp(m_governorLevel, 0, 3))];
@@ -334,6 +383,7 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
 
     const double lat = ClampLatDeg(view.latDeg);
     const double lon = WrapLonDeg(view.lonDeg);
+    const double headingDeg = view.headingDeg;
     for (const auto& band : bands) {
         const int z = band.zoom;
         const int n = 1 << z;
@@ -360,12 +410,18 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
                 key.y = yClamp;
 
                 const float distNorm = static_cast<float>(std::sqrt(distSq) / std::max(1, radiusTiles));
-                const float priority = band.basePriority + distNorm;
+                const double forwardTiles = HeadingForwardComponentTiles(dx, dy, headingDeg);
+                const float forwardNorm = static_cast<float>(forwardTiles / std::max(1, radiusTiles));
+                const float forwardBias = std::max(0.0f, forwardNorm);
+                const float priority = band.basePriority + distNorm - forwardBias * (band.nearProtected ? 0.34f : 0.22f);
                 auto& s = unique[key];
                 s.priority = std::min(s.priority, priority);
-                const bool nearProtect = band.nearProtected && (distNorm <= kNearProtectionDistNorm);
+                const bool nearProtect =
+                    band.nearProtected &&
+                    (distNorm <= kNearProtectionDistNorm || (distNorm <= 0.72f && forwardNorm >= 0.18f));
                 s.nearProtected = s.nearProtected || nearProtect;
-                s.highPriority = s.highPriority || (band.nearProtected && distNorm < 0.55f);
+                s.highPriority = s.highPriority ||
+                    (band.nearProtected && (distNorm < 0.55f || (distNorm < 0.92f && forwardNorm >= 0.24f)));
             }
         }
     }
@@ -631,8 +687,8 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
 
         if (!state.pendingUpload) {
             std::shared_ptr<const std::vector<uint8_t>> pixels;
-            if (streamer.TryGetCachedTileRgba(candidate.key.z, candidate.key.x, candidate.key.y, pixels) && pixels &&
-                pixels->size() >= (256u * 256u * 4u)) {
+            if (streamer.TryGetCachedTileRgba(candidate.key.z, candidate.key.x, candidate.key.y, pixels) &&
+                HasDecodedTilePixels(pixels)) {
                 state.decodedPixels = std::move(pixels);
                 state.pendingUpload = true;
                 m_streamerCacheHits += 1;
@@ -721,6 +777,7 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
             upload.atlasPageX = static_cast<uint32_t>(page % m_config.atlasPagesX);
             upload.atlasPageY = static_cast<uint32_t>(page / m_config.atlasPagesX);
             upload.rgbaPixels = state.decodedPixels;
+            PopulateUploadNeighborPixels(candidate.key, streamer, upload);
             m_pendingAtlasUploads.push_back(std::move(upload));
             m_atlasUploads += 1;
 

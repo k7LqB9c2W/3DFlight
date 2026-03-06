@@ -96,6 +96,13 @@ double DistanceMeters(double latA, double lonA, double latB, double lonB) {
     return kEarthRadiusMeters * c;
 }
 
+double HeadingForwardComponentTiles(double dx, double dy, double headingDeg) {
+    const double headingRad = flight::DegToRad(headingDeg);
+    const double east = std::sin(headingRad);
+    const double north = std::cos(headingRad);
+    return dx * east + (-dy) * north;
+}
+
 double SnapToStep(double value, double step) {
     if (step <= 1e-9) {
         return value;
@@ -351,6 +358,7 @@ struct SatelliteStreamer::Impl {
         int zoom,
         double latDeg,
         double lonDeg,
+        double headingDeg,
         double radiusKm,
         int capRadiusTiles,
         bool highPriority,
@@ -394,6 +402,7 @@ struct SatelliteStreamer::Impl {
         struct Candidate {
             TileKey key{};
             double distSq = 0.0;
+            double score = 0.0;
         };
         std::vector<Candidate> candidates;
         candidates.reserve(static_cast<size_t>((x1 - x0 + 1) * (y1 - y0 + 1)));
@@ -407,18 +416,26 @@ struct SatelliteStreamer::Impl {
                 const double dx = static_cast<double>(x) - centerX;
                 const double dy = static_cast<double>(y) - centerY;
                 c.distSq = dx * dx + dy * dy;
+                const double forwardTiles = HeadingForwardComponentTiles(dx, dy, headingDeg);
+                const double forwardNorm = forwardTiles / std::max(1, capRadiusTiles);
+                const double forwardBias = std::max(0.0, forwardNorm);
+                const double rearPenalty = std::max(0.0, -forwardNorm);
+                c.score = c.distSq - forwardBias * (highPriority ? 3.4 : 2.2) + rearPenalty * (highPriority ? 0.45 : 0.25);
                 candidates.push_back(c);
             }
         }
 
         std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            if (a.distSq == b.distSq) {
-                if (a.key.y == b.key.y) {
-                    return a.key.x < b.key.x;
+            if (a.score == b.score) {
+                if (a.distSq == b.distSq) {
+                    if (a.key.y == b.key.y) {
+                        return a.key.x < b.key.x;
+                    }
+                    return a.key.y < b.key.y;
                 }
-                return a.key.y < b.key.y;
+                return a.distSq < b.distSq;
             }
-            return a.distSq < b.distSq;
+            return a.score < b.score;
         });
 
         size_t enqueued = 0;
@@ -433,7 +450,7 @@ struct SatelliteStreamer::Impl {
         return enqueued;
     }
 
-    void PrefetchForView(double latDeg, double lonDeg, double altitudeMeters) {
+    void PrefetchForView(double latDeg, double lonDeg, double altitudeMeters, double headingDeg) {
         if (!initialized) {
             return;
         }
@@ -455,6 +472,7 @@ struct SatelliteStreamer::Impl {
             rings[0].zoom,
             latDeg,
             lonDeg,
+            headingDeg,
             rings[0].radiusKm,
             nearCoreRadius,
             true,
@@ -466,6 +484,7 @@ struct SatelliteStreamer::Impl {
             rings[0].zoom,
             latDeg,
             lonDeg,
+            headingDeg,
             rings[0].radiusKm,
             rings[0].prefetchRadiusTiles,
             false,
@@ -478,6 +497,7 @@ struct SatelliteStreamer::Impl {
                 rings[1].zoom,
                 latDeg,
                 lonDeg,
+                headingDeg,
                 rings[1].radiusKm,
                 rings[1].prefetchRadiusTiles,
                 false,
@@ -491,6 +511,7 @@ struct SatelliteStreamer::Impl {
                 rings[2].zoom,
                 latDeg,
                 lonDeg,
+                headingDeg,
                 rings[2].radiusKm,
                 rings[2].prefetchRadiusTiles,
                 false,
@@ -1315,11 +1336,11 @@ void SatelliteStreamer::Shutdown() {
     m_impl = nullptr;
 }
 
-void SatelliteStreamer::PrefetchForView(double latDeg, double lonDeg, double altitudeMeters) {
+void SatelliteStreamer::PrefetchForView(double latDeg, double lonDeg, double altitudeMeters, double headingDeg) {
     if (!m_impl) {
         return;
     }
-    m_impl->PrefetchForView(latDeg, lonDeg, altitudeMeters);
+    m_impl->PrefetchForView(latDeg, lonDeg, altitudeMeters, headingDeg);
 }
 
 bool SatelliteStreamer::ComposeLodRings(
