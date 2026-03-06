@@ -1,3 +1,5 @@
+HEADERS FOR DIRECT 3D 12 ARE AT D:\Include\10.0.26100.0
+
 # AGENTS.MD
 
 ## Purpose

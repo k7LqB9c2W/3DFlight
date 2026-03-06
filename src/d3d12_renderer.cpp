@@ -616,6 +616,7 @@ bool D3D12Renderer::SetSatelliteLodTextures(const std::array<SatelliteLodTexture
         return false;
     }
 
+    WaitForFenceValue(m_satelliteUploadFenceValue);
     CleanupDeferredTerrainResources();
 
     if (FAILED(m_satelliteUploadAllocator->Reset())) {
@@ -744,6 +745,7 @@ bool D3D12Renderer::SetTerrainMesh(
         return false;
     }
 
+    WaitForFenceValue(m_terrainUploadFenceValue);
     CleanupDeferredTerrainResources();
 
     if (FAILED(m_uploadAllocator->Reset())) {
@@ -1146,7 +1148,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(std::clamp(m_worldSamplingZooms[0], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[1], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[2], 0, 22)),
-            2.0f,
+            4.0f,
         };
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
@@ -1517,7 +1519,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     graphicsSrvRanges[1].NumDescriptors = 3; // t19..t21
     graphicsSrvRanges[1].BaseShaderRegister = 19;
     graphicsSrvRanges[1].RegisterSpace = 0;
-    graphicsSrvRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    graphicsSrvRanges[1].OffsetInDescriptorsFromTableStart = kWorldSatelliteAtlasSrvIndex - kSrvTableStartIndex;
 
     D3D12_ROOT_PARAMETER graphicsParams[3]{};
 
@@ -1600,7 +1602,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     computeSrvRanges[1].NumDescriptors = 3; // t19..t21
     computeSrvRanges[1].BaseShaderRegister = 19;
     computeSrvRanges[1].RegisterSpace = 0;
-    computeSrvRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    computeSrvRanges[1].OffsetInDescriptorsFromTableStart = kWorldSatelliteAtlasSrvIndex - kSrvTableStartIndex;
 
     D3D12_DESCRIPTOR_RANGE computeUavRange{};
     computeUavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -3261,6 +3263,7 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
         return true;
     }
 
+    WaitForFenceValue(m_worldUploadFenceValue);
     CleanupDeferredTerrainResources();
 
     if (FAILED(m_worldUploadAllocator->Reset())) {
@@ -3593,6 +3596,16 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
 void D3D12Renderer::WaitForFrame(UINT frameIndex) {
     if (m_fence->GetCompletedValue() < m_frames[frameIndex].fenceValue) {
         m_fence->SetEventOnCompletion(m_frames[frameIndex].fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+}
+
+void D3D12Renderer::WaitForFenceValue(UINT64 fenceValue) {
+    if (!m_fence || fenceValue == 0) {
+        return;
+    }
+    if (m_fence->GetCompletedValue() < fenceValue) {
+        m_fence->SetEventOnCompletion(fenceValue, m_fenceEvent);
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
 }

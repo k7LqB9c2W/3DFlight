@@ -59,6 +59,7 @@ target_link_libraries(3DFlight PRIVATE
     dxgi
     dxguid
     d3dcompiler
+    dbghelp
     windowscodecs
     winhttp
 )

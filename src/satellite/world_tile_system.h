@@ -61,6 +61,7 @@ struct WorldTileSystemStats {
     uint64_t pageTableWrites = 0;
     uint64_t evictions = 0;
     uint64_t uploadSkipsNoPage = 0;
+    uint64_t evictionSkipsSticky = 0;
     int activeZoomNear = 0;
     int activeZoomMid = 0;
     int activeZoomFar = 0;
@@ -70,6 +71,15 @@ struct WorldTileSystemStats {
     size_t governorRequestBudget = 0;
     size_t governorUploadBudget = 0;
     double governorFrameTimeMs = 0.0;
+    size_t pageTableCapacity = 0;
+    size_t pageTableTombstoneCount = 0;
+    double pageTableLoadFactor = 0.0;
+    double pageTableTombstoneRatio = 0.0;
+    uint32_t shaderProbeBudget = 0;
+    uint32_t maxProbeDistance = 0;
+    double avgProbeDistance = 0.0;
+    size_t visibleResidentCount = 0;
+    size_t visibleResidentOverProbeBudget = 0;
 };
 
 class WorldTileSystem {
@@ -89,6 +99,8 @@ public:
         uint64_t zoomSwitchHoldFrames = 45;
         double altitudeBandHysteresisMeters = 180.0;
         uint64_t governorRecoveryHoldFrames = 45;
+        uint32_t shaderProbeBudget = 4;
+        uint64_t residentStickinessFrames = 180;
     };
 
     struct ViewState {
@@ -117,6 +129,7 @@ private:
         bool resident = false;
         bool pendingUpload = false;
         int atlasPageIndex = -1;
+        uint32_t pageTableProbeDistance = 0;
         uint64_t lastTouchedFrame = 0;
         uint64_t lastRequestFrame = 0;
         std::shared_ptr<const std::vector<uint8_t>> decodedPixels;
@@ -181,6 +194,12 @@ private:
     uint64_t m_pageTableWrites = 0;
     uint64_t m_evictions = 0;
     uint64_t m_uploadSkipsNoPage = 0;
+    uint64_t m_evictionSkipsSticky = 0;
+    size_t m_pageTableTombstoneCount = 0;
+    uint32_t m_debugMaxProbeDistance = 0;
+    double m_debugAvgProbeDistance = 0.0;
+    size_t m_debugVisibleResidentCount = 0;
+    size_t m_debugVisibleResidentOverProbeBudget = 0;
 };
 
 } // namespace flight::satellite

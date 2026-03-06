@@ -21,11 +21,12 @@ constexpr std::array<std::array<int, 3>, 4> kBandZoomTriplets{{
 }};
 
 constexpr std::array<std::array<double, 3>, 4> kBandRadiusKm{{
-    {{18.0, 65.0, 230.0}},
-    {{26.0, 95.0, 330.0}},
-    {{38.0, 145.0, 520.0}},
-    {{56.0, 200.0, 820.0}},
+    {{10.0, 34.0, 120.0}},
+    {{14.0, 48.0, 170.0}},
+    {{20.0, 72.0, 250.0}},
+    {{28.0, 100.0, 340.0}},
 }};
+constexpr float kNearProtectionDistNorm = 0.38f;
 
 double WrapLonDeg(double lonDeg) {
     while (lonDeg >= 180.0) {
@@ -89,13 +90,19 @@ bool WorldTileSystem::Initialize(const Config& config, std::string& error) {
     cfg.zoomSwitchHoldFrames = std::clamp<uint64_t>(cfg.zoomSwitchHoldFrames, 5, 300);
     cfg.altitudeBandHysteresisMeters = std::clamp(cfg.altitudeBandHysteresisMeters, 20.0, 2000.0);
     cfg.governorRecoveryHoldFrames = std::clamp<uint64_t>(cfg.governorRecoveryHoldFrames, 15, 300);
-    m_config = cfg;
+    cfg.shaderProbeBudget = std::clamp<uint32_t>(cfg.shaderProbeBudget, 1u, 8u);
+    cfg.residentStickinessFrames = std::clamp<uint64_t>(cfg.residentStickinessFrames, 0, 900);
 
     const size_t atlasPageCount = static_cast<size_t>(cfg.atlasPagesX) * static_cast<size_t>(cfg.atlasPagesY);
     if (atlasPageCount == 0) {
         error = "Invalid world tile atlas page count";
         return false;
     }
+    // Prevent permanent over-subscription (visible set far larger than resident atlas).
+    const size_t visibleCapFromAtlas = std::max<size_t>(64, (atlasPageCount * 3u) / 2u);
+    cfg.maxVisibleTilesPerFrame = std::min(cfg.maxVisibleTilesPerFrame, visibleCapFromAtlas);
+    m_config = cfg;
+
     m_pageToKey.assign(atlasPageCount, std::nullopt);
     m_freeAtlasPages.reserve(atlasPageCount);
     for (int i = static_cast<int>(atlasPageCount) - 1; i >= 0; --i) {
@@ -149,6 +156,12 @@ void WorldTileSystem::Reset() {
     m_pageTableWrites = 0;
     m_evictions = 0;
     m_uploadSkipsNoPage = 0;
+    m_evictionSkipsSticky = 0;
+    m_pageTableTombstoneCount = 0;
+    m_debugMaxProbeDistance = 0;
+    m_debugAvgProbeDistance = 0.0;
+    m_debugVisibleResidentCount = 0;
+    m_debugVisibleResidentOverProbeBudget = 0;
 }
 
 void WorldTileSystem::SetFrameTimeMs(double frameTimeMs) {
@@ -340,8 +353,9 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
                 const float priority = band.basePriority + distNorm;
                 auto& s = unique[key];
                 s.priority = std::min(s.priority, priority);
-                s.nearProtected = s.nearProtected || band.nearProtected;
-                s.highPriority = s.highPriority || (band.nearProtected && distNorm < 0.45f);
+                const bool nearProtect = band.nearProtected && (distNorm <= kNearProtectionDistNorm);
+                s.nearProtected = s.nearProtected || nearProtect;
+                s.highPriority = s.highPriority || (band.nearProtected && distNorm < 0.55f);
             }
         }
     }
@@ -393,6 +407,9 @@ void WorldTileSystem::ReleasePageTableSlot(const WorldTileKey& key) {
     const uint32_t slot = slotIt->second;
     if (slot < m_pageTableSlots.size()) {
         m_pageTableSlots[slot].reset();
+        if (slot < m_pageTableEverUsed.size() && m_pageTableEverUsed[slot] != 0u) {
+            m_pageTableTombstoneCount += 1;
+        }
         const uint32_t x = slot % static_cast<uint32_t>(m_config.pageTableWidth);
         const uint32_t y = slot / static_cast<uint32_t>(m_config.pageTableWidth);
         // Mark deleted entries as tombstones so probe chains remain valid.
@@ -425,6 +442,9 @@ std::optional<uint32_t> WorldTileSystem::AssignPageTableSlot(const WorldTileKey&
             }
             const size_t target = firstTombstone.value_or(probe);
             m_pageTableSlots[target] = key;
+            if (firstTombstone.has_value() && target == *firstTombstone && m_pageTableTombstoneCount > 0) {
+                m_pageTableTombstoneCount -= 1;
+            }
             if (target < m_pageTableEverUsed.size()) {
                 m_pageTableEverUsed[target] = 1u;
             }
@@ -435,6 +455,9 @@ std::optional<uint32_t> WorldTileSystem::AssignPageTableSlot(const WorldTileKey&
     if (firstTombstone.has_value()) {
         const size_t target = *firstTombstone;
         m_pageTableSlots[target] = key;
+        if (m_pageTableTombstoneCount > 0) {
+            m_pageTableTombstoneCount -= 1;
+        }
         if (target < m_pageTableEverUsed.size()) {
             m_pageTableEverUsed[target] = 1u;
         }
@@ -476,6 +499,7 @@ void WorldTileSystem::EvictResident(const WorldTileKey& key, TileState& state) {
     }
     state.resident = false;
     state.atlasPageIndex = -1;
+    state.pageTableProbeDistance = 0;
     ReleasePageTableSlot(key);
     m_evictions += 1;
 }
@@ -495,6 +519,12 @@ std::optional<int> WorldTileSystem::AllocateAtlasPage(const WorldTileKey& forKey
         }
         TileState& state = found->second;
         if (!state.resident || state.protectedNear || state.visibleThisFrame || evictKey == forKey) {
+            continue;
+        }
+        const bool stickyHighDetail = evictKey.z >= std::max(m_activeZooms[1] - 1, m_config.minZoom);
+        if (stickyHighDetail && m_config.residentStickinessFrames > 0 &&
+            (m_frameId - state.lastTouchedFrame) <= m_config.residentStickinessFrames) {
+            m_evictionSkipsSticky += 1;
             continue;
         }
         const int page = state.atlasPageIndex;
@@ -547,6 +577,11 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
     m_frameId += 1;
     m_pendingAtlasUploads.clear();
     m_pendingPageUpdates.clear();
+    m_debugMaxProbeDistance = 0;
+    m_debugAvgProbeDistance = 0.0;
+    m_debugVisibleResidentCount = 0;
+    m_debugVisibleResidentOverProbeBudget = 0;
+    uint64_t probeAccum = 0;
 
     UpdateZoomBandWithHysteresis(view.altitudeMeters);
     UpdateFrameTimeGovernor();
@@ -568,6 +603,12 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
         state.lastTouchedFrame = m_frameId;
 
         if (state.resident) {
+            m_debugVisibleResidentCount += 1;
+            m_debugMaxProbeDistance = std::max(m_debugMaxProbeDistance, state.pageTableProbeDistance);
+            probeAccum += static_cast<uint64_t>(state.pageTableProbeDistance);
+            if (state.pageTableProbeDistance >= m_config.shaderProbeBudget) {
+                m_debugVisibleResidentOverProbeBudget += 1;
+            }
             TouchResident(candidate.key, state);
             continue;
         }
@@ -630,6 +671,13 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
 
         if (const auto slotOpt = AssignPageTableSlot(candidate.key); slotOpt.has_value()) {
             const uint32_t slot = *slotOpt;
+            const size_t tableCount = static_cast<size_t>(m_config.pageTableWidth) * static_cast<size_t>(m_config.pageTableHeight);
+            const size_t hashSlot = (tableCount > 0)
+                ? (static_cast<size_t>(HashTileKeyForPageTable(candidate.key)) % tableCount)
+                : 0u;
+            const size_t slotSz = static_cast<size_t>(slot);
+            const size_t probeDistance = (slotSz >= hashSlot) ? (slotSz - hashSlot) : (slotSz + tableCount - hashSlot);
+            state.pageTableProbeDistance = static_cast<uint32_t>(std::min<size_t>(probeDistance, 0xFFFFFFFFu));
             const uint32_t x = slot % static_cast<uint32_t>(m_config.pageTableWidth);
             const uint32_t y = slot / static_cast<uint32_t>(m_config.pageTableWidth);
             const uint32_t value = PackPageTableValue(candidate.key, page);
@@ -640,6 +688,11 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
         }
 
         uploadBudget -= 1;
+    }
+
+    if (m_debugVisibleResidentCount > 0) {
+        m_debugAvgProbeDistance =
+            static_cast<double>(probeAccum) / static_cast<double>(m_debugVisibleResidentCount);
     }
 
     GarbageCollect();
@@ -665,6 +718,7 @@ WorldTileSystemStats WorldTileSystem::GetStats() const {
     s.pageTableWrites = m_pageTableWrites;
     s.evictions = m_evictions;
     s.uploadSkipsNoPage = m_uploadSkipsNoPage;
+    s.evictionSkipsSticky = m_evictionSkipsSticky;
     s.activeZoomNear = m_activeZooms[0];
     s.activeZoomMid = m_activeZooms[1];
     s.activeZoomFar = m_activeZooms[2];
@@ -676,6 +730,19 @@ WorldTileSystemStats WorldTileSystem::GetStats() const {
     s.governorRequestBudget = m_effectiveRequestBudget;
     s.governorUploadBudget = m_effectiveUploadBudget;
     s.governorFrameTimeMs = m_lastFrameTimeMs;
+    s.pageTableCapacity = m_pageTableSlots.size();
+    s.pageTableTombstoneCount = m_pageTableTombstoneCount;
+    s.pageTableLoadFactor = (s.pageTableCapacity > 0)
+        ? static_cast<double>(s.pageTableOccupancy) / static_cast<double>(s.pageTableCapacity)
+        : 0.0;
+    s.pageTableTombstoneRatio = (s.pageTableCapacity > 0)
+        ? static_cast<double>(s.pageTableTombstoneCount) / static_cast<double>(s.pageTableCapacity)
+        : 0.0;
+    s.shaderProbeBudget = m_config.shaderProbeBudget;
+    s.maxProbeDistance = m_debugMaxProbeDistance;
+    s.avgProbeDistance = m_debugAvgProbeDistance;
+    s.visibleResidentCount = m_debugVisibleResidentCount;
+    s.visibleResidentOverProbeBudget = m_debugVisibleResidentOverProbeBudget;
 
     size_t resident = 0;
     size_t protectedCount = 0;

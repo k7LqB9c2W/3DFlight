@@ -292,6 +292,7 @@ private:
         std::string& error);
 
     void WaitForFrame(UINT frameIndex);
+    void WaitForFenceValue(UINT64 fenceValue);
     void CleanupDeferredTerrainResources();
     void CreateRenderTargetViews();
     void ReleaseRenderTargets();

@@ -394,7 +394,8 @@ float4 PSMain(VSOutput input) : SV_Target
             if (worldW > 1e-4)
             {
                 const float3 streamed = worldAccum / worldW;
-                const float blend = saturate(worldW * gTuning12.z);
+                // Keep coverage stable once we have any streamed sample this frame.
+                const float blend = saturate(gTuning12.z);
                 satelliteColor = haveFallback ? lerp(satelliteColor, streamed, blend) : streamed;
                 haveFallback = true;
             }

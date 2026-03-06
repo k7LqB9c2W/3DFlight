@@ -1,11 +1,18 @@
 #include <windows.h>
+#include <dbghelp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <system_error>
 
@@ -45,6 +52,380 @@ D3D12Renderer* g_renderer = nullptr;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kMetersToFeet = 3.280839895013123;
 constexpr double kMetersPerSecondToMph = 2.2369362920544025;
+std::atomic_flag g_crashLogInProgress = ATOMIC_FLAG_INIT;
+
+std::string WideToUtf8(const wchar_t* text) {
+    if (!text || *text == L'\0') {
+        return {};
+    }
+    const int neededBytes = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (neededBytes <= 1) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(neededBytes - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), neededBytes, nullptr, nullptr);
+    return out;
+}
+
+std::string UtcTimestampForDisplay() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+    gmtime_s(&utc, &now);
+
+    std::ostringstream ss;
+    ss << std::put_time(&utc, "%Y-%m-%d %H:%M:%S UTC");
+    return ss.str();
+}
+
+std::string UtcTimestampForFile() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+    gmtime_s(&utc, &now);
+
+    std::ostringstream ss;
+    ss << std::put_time(&utc, "%Y%m%d_%H%M%S");
+    return ss.str();
+}
+
+const char* ExceptionCodeName(DWORD code) {
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:
+            return "EXCEPTION_ACCESS_VIOLATION";
+        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+            return "EXCEPTION_ARRAY_BOUNDS_EXCEEDED";
+        case EXCEPTION_BREAKPOINT:
+            return "EXCEPTION_BREAKPOINT";
+        case EXCEPTION_DATATYPE_MISALIGNMENT:
+            return "EXCEPTION_DATATYPE_MISALIGNMENT";
+        case EXCEPTION_FLT_DENORMAL_OPERAND:
+            return "EXCEPTION_FLT_DENORMAL_OPERAND";
+        case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+            return "EXCEPTION_FLT_DIVIDE_BY_ZERO";
+        case EXCEPTION_FLT_INEXACT_RESULT:
+            return "EXCEPTION_FLT_INEXACT_RESULT";
+        case EXCEPTION_FLT_INVALID_OPERATION:
+            return "EXCEPTION_FLT_INVALID_OPERATION";
+        case EXCEPTION_FLT_OVERFLOW:
+            return "EXCEPTION_FLT_OVERFLOW";
+        case EXCEPTION_FLT_STACK_CHECK:
+            return "EXCEPTION_FLT_STACK_CHECK";
+        case EXCEPTION_FLT_UNDERFLOW:
+            return "EXCEPTION_FLT_UNDERFLOW";
+        case EXCEPTION_ILLEGAL_INSTRUCTION:
+            return "EXCEPTION_ILLEGAL_INSTRUCTION";
+        case EXCEPTION_IN_PAGE_ERROR:
+            return "EXCEPTION_IN_PAGE_ERROR";
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:
+            return "EXCEPTION_INT_DIVIDE_BY_ZERO";
+        case EXCEPTION_INT_OVERFLOW:
+            return "EXCEPTION_INT_OVERFLOW";
+        case EXCEPTION_INVALID_DISPOSITION:
+            return "EXCEPTION_INVALID_DISPOSITION";
+        case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+            return "EXCEPTION_NONCONTINUABLE_EXCEPTION";
+        case EXCEPTION_PRIV_INSTRUCTION:
+            return "EXCEPTION_PRIV_INSTRUCTION";
+        case EXCEPTION_SINGLE_STEP:
+            return "EXCEPTION_SINGLE_STEP";
+        case EXCEPTION_STACK_OVERFLOW:
+            return "EXCEPTION_STACK_OVERFLOW";
+        case 0x87d:
+            return "D3D_DEBUG_LAYER_EXCEPTION";
+        default:
+            return "UNKNOWN_EXCEPTION";
+    }
+}
+
+void WriteRegisters(std::ofstream& out, const CONTEXT* ctx) {
+    if (!ctx) {
+        return;
+    }
+#if defined(_M_X64)
+    out << "Registers:\n";
+    out << "  RIP=0x" << std::hex << ctx->Rip << "  RSP=0x" << ctx->Rsp << "  RBP=0x" << ctx->Rbp << std::dec << "\n";
+    out << "  RAX=0x" << std::hex << ctx->Rax << "  RBX=0x" << ctx->Rbx << "  RCX=0x" << ctx->Rcx << "  RDX=0x" << ctx->Rdx
+        << std::dec << "\n";
+    out << "  RSI=0x" << std::hex << ctx->Rsi << "  RDI=0x" << ctx->Rdi << "  R8=0x" << ctx->R8 << "  R9=0x" << ctx->R9
+        << std::dec << "\n";
+#elif defined(_M_IX86)
+    out << "Registers:\n";
+    out << "  EIP=0x" << std::hex << ctx->Eip << "  ESP=0x" << ctx->Esp << "  EBP=0x" << ctx->Ebp << std::dec << "\n";
+    out << "  EAX=0x" << std::hex << ctx->Eax << "  EBX=0x" << ctx->Ebx << "  ECX=0x" << ctx->Ecx << "  EDX=0x" << ctx->Edx
+        << std::dec << "\n";
+#endif
+}
+
+void WriteStackTrace(std::ofstream& out, const CONTEXT* sourceCtx) {
+    if (!sourceCtx) {
+        out << "Stack trace: unavailable (no context)\n";
+        return;
+    }
+
+    HANDLE process = GetCurrentProcess();
+    HANDLE thread = GetCurrentThread();
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+    if (!SymInitialize(process, nullptr, TRUE)) {
+        out << "SymInitialize failed, error=" << GetLastError() << "\n";
+        return;
+    }
+
+    CONTEXT ctx = *sourceCtx;
+    STACKFRAME64 frame{};
+    DWORD machineType = 0;
+
+#if defined(_M_X64)
+    machineType = IMAGE_FILE_MACHINE_AMD64;
+    frame.AddrPC.Offset = ctx.Rip;
+    frame.AddrFrame.Offset = ctx.Rbp;
+    frame.AddrStack.Offset = ctx.Rsp;
+#elif defined(_M_IX86)
+    machineType = IMAGE_FILE_MACHINE_I386;
+    frame.AddrPC.Offset = ctx.Eip;
+    frame.AddrFrame.Offset = ctx.Ebp;
+    frame.AddrStack.Offset = ctx.Esp;
+#else
+    out << "Stack trace not supported on this architecture.\n";
+    SymCleanup(process);
+    return;
+#endif
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Mode = AddrModeFlat;
+
+    out << "Stack trace:\n";
+    for (uint32_t i = 0; i < 80; ++i) {
+        if (frame.AddrPC.Offset == 0) {
+            break;
+        }
+
+        const DWORD64 address = frame.AddrPC.Offset;
+        char symbolBuffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(symbolBuffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+
+        DWORD64 displacement = 0;
+        const BOOL hasSymbol = SymFromAddr(process, address, &displacement, symbol);
+
+        IMAGEHLP_LINE64 lineInfo{};
+        lineInfo.SizeOfStruct = sizeof(lineInfo);
+        DWORD lineDisplacement = 0;
+        const BOOL hasLine = SymGetLineFromAddr64(process, address, &lineDisplacement, &lineInfo);
+
+        out << "  [" << i << "] 0x" << std::hex << address << std::dec;
+        if (hasSymbol) {
+            out << " " << symbol->Name;
+            if (displacement != 0) {
+                out << " +0x" << std::hex << displacement << std::dec;
+            }
+        } else {
+            out << " <symbol unavailable>";
+        }
+
+        if (hasLine) {
+            out << " (" << lineInfo.FileName << ":" << lineInfo.LineNumber << ")";
+        }
+        out << "\n";
+
+        const BOOL walked = StackWalk64(
+            machineType,
+            process,
+            thread,
+            &frame,
+            &ctx,
+            nullptr,
+            SymFunctionTableAccess64,
+            SymGetModuleBase64,
+            nullptr);
+        if (!walked) {
+            break;
+        }
+    }
+
+    SymCleanup(process);
+}
+
+void WriteExceptionRecord(std::ofstream& out, const EXCEPTION_RECORD* record) {
+    if (!record) {
+        out << "Exception: unavailable\n";
+        return;
+    }
+
+    out << "Exception code: 0x" << std::hex << record->ExceptionCode << std::dec
+        << " (" << ExceptionCodeName(record->ExceptionCode) << ")\n";
+    out << "Exception flags: 0x" << std::hex << record->ExceptionFlags << std::dec << "\n";
+    out << "Fault address: 0x" << std::hex << reinterpret_cast<uintptr_t>(record->ExceptionAddress) << std::dec << "\n";
+
+    if ((record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+        record->NumberParameters >= 2) {
+        const ULONG_PTR accessType = record->ExceptionInformation[0];
+        const char* op = "unknown";
+        if (accessType == 0) {
+            op = "read";
+        } else if (accessType == 1) {
+            op = "write";
+        } else if (accessType == 8) {
+            op = "execute";
+        }
+        out << "Access violation operation: " << op << "\n";
+        out << "Access violation address: 0x" << std::hex << record->ExceptionInformation[1] << std::dec << "\n";
+    }
+}
+
+bool WriteMiniDump(const std::filesystem::path& dumpPath, EXCEPTION_POINTERS* exceptionPointers, DWORD& outError) {
+    outError = ERROR_SUCCESS;
+
+    HANDLE file = CreateFileW(
+        dumpPath.wstring().c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        outError = GetLastError();
+        return false;
+    }
+
+    MINIDUMP_EXCEPTION_INFORMATION exInfo{};
+    exInfo.ThreadId = GetCurrentThreadId();
+    exInfo.ExceptionPointers = exceptionPointers;
+    exInfo.ClientPointers = FALSE;
+
+    const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
+        MiniDumpWithDataSegs |
+        MiniDumpWithHandleData |
+        MiniDumpWithThreadInfo |
+        MiniDumpWithUnloadedModules |
+        MiniDumpWithIndirectlyReferencedMemory);
+
+    const BOOL wrote = MiniDumpWriteDump(
+        GetCurrentProcess(),
+        GetCurrentProcessId(),
+        file,
+        dumpType,
+        exceptionPointers ? &exInfo : nullptr,
+        nullptr,
+        nullptr);
+    if (!wrote) {
+        outError = GetLastError();
+    }
+
+    CloseHandle(file);
+    return wrote == TRUE;
+}
+
+void WriteCrashArtifacts(const char* crashType, EXCEPTION_POINTERS* exceptionPointers, const std::string& details) noexcept {
+    if (g_crashLogInProgress.test_and_set()) {
+        return;
+    }
+
+    try {
+        std::error_code ec;
+        const std::filesystem::path crashDir = std::filesystem::path("logs") / "crash";
+        std::filesystem::create_directories(crashDir, ec);
+
+        const std::string fileStamp =
+            UtcTimestampForFile() + "_pid" + std::to_string(GetCurrentProcessId()) + "_tid" + std::to_string(GetCurrentThreadId());
+        const std::filesystem::path logPath = crashDir / ("crash_" + fileStamp + ".log");
+        const std::filesystem::path dumpPath = crashDir / ("crash_" + fileStamp + ".dmp");
+
+        DWORD dumpError = ERROR_SUCCESS;
+        const bool dumpWritten = WriteMiniDump(dumpPath, exceptionPointers, dumpError);
+
+        std::ofstream out(logPath, std::ios::out | std::ios::trunc);
+        if (out) {
+            out << "3DFlight Crash Report\n";
+            out << "Timestamp: " << UtcTimestampForDisplay() << "\n";
+            out << "Crash Type: " << (crashType ? crashType : "unknown") << "\n";
+            out << "Process ID: " << GetCurrentProcessId() << "\n";
+            out << "Thread ID: " << GetCurrentThreadId() << "\n";
+            if (!details.empty()) {
+                out << "Details: " << details << "\n";
+            }
+            if (exceptionPointers) {
+                WriteExceptionRecord(out, exceptionPointers->ExceptionRecord);
+                WriteRegisters(out, exceptionPointers->ContextRecord);
+            } else {
+                CONTEXT context{};
+                RtlCaptureContext(&context);
+                WriteRegisters(out, &context);
+            }
+
+            out << "MiniDump: " << dumpPath.string();
+            if (dumpWritten) {
+                out << " (written)\n";
+            } else {
+                out << " (failed, error=" << dumpError << ")\n";
+            }
+
+            const CONTEXT* stackContext = exceptionPointers ? exceptionPointers->ContextRecord : nullptr;
+            CONTEXT fallbackContext{};
+            if (!stackContext) {
+                RtlCaptureContext(&fallbackContext);
+                stackContext = &fallbackContext;
+            }
+            WriteStackTrace(out, stackContext);
+        }
+
+        const std::string summary = "3DFlight crash log written: " + logPath.string() + "\n";
+        OutputDebugStringA(summary.c_str());
+        MessageBoxA(nullptr, summary.c_str(), "3DFlight Crash", MB_OK | MB_ICONERROR | MB_TOPMOST);
+    } catch (...) {
+        OutputDebugStringA("3DFlight crash logger failed while handling a crash.\n");
+    }
+}
+
+LONG WINAPI UnhandledSehFilter(EXCEPTION_POINTERS* exceptionPointers) {
+    WriteCrashArtifacts("Unhandled SEH exception", exceptionPointers, {});
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+[[noreturn]] void TerminateHandler() {
+    std::string details = "std::terminate invoked.";
+    if (const std::exception_ptr ep = std::current_exception(); ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& ex) {
+            details += " Active exception: ";
+            details += ex.what();
+        } catch (...) {
+            details += " Active exception: non-std exception.";
+        }
+    }
+    WriteCrashArtifacts("Unhandled C++ termination", nullptr, details);
+    std::_Exit(EXIT_FAILURE);
+}
+
+void InvalidParameterHandler(
+    const wchar_t* expression,
+    const wchar_t* function,
+    const wchar_t* file,
+    unsigned int line,
+    uintptr_t) {
+    std::ostringstream details;
+    details << "CRT invalid parameter";
+    if (expression) {
+        details << ", expression: " << WideToUtf8(expression);
+    }
+    if (function) {
+        details << ", function: " << WideToUtf8(function);
+    }
+    if (file) {
+        details << ", file: " << WideToUtf8(file) << ":" << line;
+    }
+    WriteCrashArtifacts("CRT invalid parameter", nullptr, details.str());
+    std::_Exit(EXIT_FAILURE);
+}
+
+void InstallCrashHandlers() {
+    SetUnhandledExceptionFilter(UnhandledSehFilter);
+    std::set_terminate(TerminateHandler);
+#if defined(_MSC_VER)
+    _set_invalid_parameter_handler(InvalidParameterHandler);
+#endif
+}
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
@@ -412,7 +793,7 @@ struct GraphicsTuningConfig {
 
     bool satelliteEnabled = true;
     float satelliteBlend = 1.0f;
-    bool worldLockedSatelliteEnabled = false;
+    bool worldLockedSatelliteEnabled = true;
 };
 
 void SanitizeGraphicsTuning(GraphicsTuningConfig& cfg) {
@@ -459,6 +840,7 @@ GraphicsTuningConfig MakeRealisticTuningPreset() {
     cfg.specularStrength = 0.10f;
     cfg.lodSeamBlendStrength = 0.12f;
     cfg.aerialPerspectiveDepthMeters = 220000.0f;
+    cfg.worldLockedSatelliteEnabled = true;
     SanitizeGraphicsTuning(cfg);
     return cfg;
 }
@@ -592,8 +974,9 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
         outCfg.satelliteEnabled = true;
         outCfg.satelliteBlend = 1.0f;
     }
-    if (version < 5) {
-        outCfg.worldLockedSatelliteEnabled = false;
+    if (version < 7) {
+        // v7 promotes world-locked streaming as the stable default, overriding legacy ring-mode profiles.
+        outCfg.worldLockedSatelliteEnabled = true;
     }
 
     SanitizeGraphicsTuning(outCfg);
@@ -636,7 +1019,7 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
     j["satellite_enabled"] = cfg.satelliteEnabled;
     j["satellite_blend"] = cfg.satelliteBlend;
     j["world_locked_satellite_enabled"] = cfg.worldLockedSatelliteEnabled;
-    j["config_version"] = 5;
+    j["config_version"] = 7;
 
     out << j.dump(2) << "\n";
     return true;
@@ -645,6 +1028,7 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
+    InstallCrashHandlers();
     CoInitializeEx(nullptr, COINITBASE_MULTITHREADED);
 
     const wchar_t* kClassName = L"3DFlightClass";
@@ -832,12 +1216,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         worldCfg.atlasPagesY = 16;
         worldCfg.pageTableWidth = 1024;
         worldCfg.pageTableHeight = 1024;
-        worldCfg.maxVisibleTilesPerFrame = 1600;
-        worldCfg.maxRequestsPerFrame = 320;
-        worldCfg.maxUploadsPerFrame = 12;
+        worldCfg.maxVisibleTilesPerFrame = 512;
+        worldCfg.maxRequestsPerFrame = 220;
+        worldCfg.maxUploadsPerFrame = 8;
+        worldCfg.requestCooldownFrames = 3;
         worldCfg.zoomSwitchHoldFrames = 45;
         worldCfg.altitudeBandHysteresisMeters = 180.0;
         worldCfg.governorRecoveryHoldFrames = 45;
+        worldCfg.shaderProbeBudget = 4;
+        worldCfg.residentStickinessFrames = 90;
         std::string worldError;
         if (worldTileSystem.Initialize(worldCfg, worldError)) {
             worldTileSystemReady = true;
@@ -913,6 +1300,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     flight::satellite::WorldTileSystemStats worldTileStats{};
     D3D12Renderer::WorldStreamingStats worldStreamingStats{};
     std::string worldTileRuntimeStatus;
+    double worldLastUploadAlphaCoverage = 0.0;
+    size_t worldLastUploadPageCount = 0;
     struct SatelliteRingDebugInfo {
         bool valid = false;
         bool hasPixels = false;
@@ -1035,22 +1424,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
     if (satelliteStreamerReady) {
         satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters());
-        const auto preloadStart = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(3)) {
-            satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters());
-            std::array<flight::satellite::RingTexture, 3> rings{};
-            std::string composeError;
-            const bool composed =
-                satelliteStreamer.ComposeLodRings(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), true, rings, composeError);
-            if (composed && uploadSatelliteRings(rings)) {
-                satelliteRuntimeStatus = "Satellite preload complete";
-                break;
+        if (!renderer.IsWorldLockedSatelliteEnabled()) {
+            const auto preloadStart = std::chrono::steady_clock::now();
+            while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(3)) {
+                satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters());
+                std::array<flight::satellite::RingTexture, 3> rings{};
+                std::string composeError;
+                const bool composed =
+                    satelliteStreamer.ComposeLodRings(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), true, rings, composeError);
+                if (composed && uploadSatelliteRings(rings)) {
+                    satelliteRuntimeStatus = "Satellite preload complete";
+                    break;
+                }
+                if (!composeError.empty()) {
+                    satelliteRuntimeStatus = "Satellite preload compose failed: " + composeError;
+                }
+                satelliteStats = satelliteStreamer.GetStats();
+                Sleep(60);
             }
-            if (!composeError.empty()) {
-                satelliteRuntimeStatus = "Satellite preload compose failed: " + composeError;
-            }
-            satelliteStats = satelliteStreamer.GetStats();
-            Sleep(60);
+        } else {
+            satelliteRuntimeStatus = "World-locked mode active: ring compose preload skipped";
         }
     }
 
@@ -1166,46 +1559,59 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 satelliteStreamer.PrefetchForView(activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
                 satellitePrefetchCooldownSeconds = prefetchCadenceSeconds;
             }
-            satelliteComposeCooldownSeconds = std::max(0.0, satelliteComposeCooldownSeconds - dt);
-            if (satelliteComposeInFlight &&
-                satelliteComposeFuture.valid() &&
-                satelliteComposeFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-                SatelliteComposeAsyncResult result = satelliteComposeFuture.get();
-                satelliteComposeInFlight = false;
-                if (satelliteComposeLaunchValid) {
-                    satelliteLastComposeMs =
-                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - satelliteComposeLaunchTime).count();
+            const bool useLegacyRingCompose = !renderer.IsWorldLockedSatelliteEnabled();
+            if (useLegacyRingCompose) {
+                satelliteComposeCooldownSeconds = std::max(0.0, satelliteComposeCooldownSeconds - dt);
+                if (satelliteComposeInFlight &&
+                    satelliteComposeFuture.valid() &&
+                    satelliteComposeFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    SatelliteComposeAsyncResult result = satelliteComposeFuture.get();
+                    satelliteComposeInFlight = false;
+                    if (satelliteComposeLaunchValid) {
+                        satelliteLastComposeMs =
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - satelliteComposeLaunchTime).count();
+                        satelliteComposeLaunchValid = false;
+                    }
+                    if (result.composed) {
+                        satelliteComposeGeneration += 1;
+                        if (uploadSatelliteRings(result.rings)) {
+                            satelliteComposeCooldownSeconds =
+                                (frameTimeEmaMs > 30.0) ? 0.22 : ((frameTimeEmaMs > 22.0) ? 0.14 : 0.08);
+                        } else {
+                            satelliteComposeCooldownSeconds = 0.25;
+                        }
+                    } else if (!result.error.empty()) {
+                        satelliteComposeFailureCount += 1;
+                        satelliteRuntimeStatus = "Satellite compose failed: " + result.error;
+                        satelliteComposeCooldownSeconds = 0.30;
+                    }
+                }
+
+                if (!satelliteComposeInFlight && satelliteComposeCooldownSeconds <= 0.0) {
+                    const double satLat = activeSim.LatitudeDeg();
+                    const double satLon = activeSim.LongitudeDeg();
+                    const double satAlt = activeSim.AltitudeMeters();
+                    satelliteComposeInFlight = true;
+                    satelliteComposeLaunchTime = std::chrono::steady_clock::now();
+                    satelliteComposeLaunchValid = true;
+                    satelliteComposeFuture = std::async(std::launch::async, [&satelliteStreamer, satLat, satLon, satAlt]() {
+                        SatelliteComposeAsyncResult out{};
+                        out.composed = satelliteStreamer.ComposeLodRings(satLat, satLon, satAlt, false, out.rings, out.error);
+                        return out;
+                    });
+                    satelliteComposeCooldownSeconds =
+                        (frameTimeEmaMs > 30.0) ? 0.12 : ((frameTimeEmaMs > 22.0) ? 0.08 : 0.04);
+                }
+            } else {
+                satelliteComposeCooldownSeconds = 0.0;
+                // If user switched modes while a compose task was running, drain it once and ignore results.
+                if (satelliteComposeInFlight &&
+                    satelliteComposeFuture.valid() &&
+                    satelliteComposeFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    (void)satelliteComposeFuture.get();
+                    satelliteComposeInFlight = false;
                     satelliteComposeLaunchValid = false;
                 }
-                if (result.composed) {
-                    satelliteComposeGeneration += 1;
-                    if (uploadSatelliteRings(result.rings)) {
-                        satelliteComposeCooldownSeconds =
-                            (frameTimeEmaMs > 30.0) ? 0.22 : ((frameTimeEmaMs > 22.0) ? 0.14 : 0.08);
-                    } else {
-                        satelliteComposeCooldownSeconds = 0.25;
-                    }
-                } else if (!result.error.empty()) {
-                    satelliteComposeFailureCount += 1;
-                    satelliteRuntimeStatus = "Satellite compose failed: " + result.error;
-                    satelliteComposeCooldownSeconds = 0.30;
-                }
-            }
-
-            if (!satelliteComposeInFlight && satelliteComposeCooldownSeconds <= 0.0) {
-                const double satLat = activeSim.LatitudeDeg();
-                const double satLon = activeSim.LongitudeDeg();
-                const double satAlt = activeSim.AltitudeMeters();
-                satelliteComposeInFlight = true;
-                satelliteComposeLaunchTime = std::chrono::steady_clock::now();
-                satelliteComposeLaunchValid = true;
-                satelliteComposeFuture = std::async(std::launch::async, [&satelliteStreamer, satLat, satLon, satAlt]() {
-                    SatelliteComposeAsyncResult out{};
-                    out.composed = satelliteStreamer.ComposeLodRings(satLat, satLon, satAlt, false, out.rings, out.error);
-                    return out;
-                });
-                satelliteComposeCooldownSeconds =
-                    (frameTimeEmaMs > 30.0) ? 0.12 : ((frameTimeEmaMs > 22.0) ? 0.08 : 0.04);
             }
             satelliteStats = satelliteStreamer.GetStats();
         }
@@ -1228,9 +1634,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 if (!atlasUploads.empty() || !pageUpdates.empty()) {
                     std::vector<D3D12Renderer::WorldAtlasPageUpload> rendererUploads;
                     rendererUploads.reserve(atlasUploads.size());
+                    uint64_t worldAlphaNonZero = 0;
+                    uint64_t worldAlphaTotal = 0;
                     for (const auto& upload : atlasUploads) {
                         if (!upload.rgbaPixels || upload.rgbaPixels->size() < (256u * 256u * 4u)) {
                             continue;
+                        }
+                        for (size_t idx = 3; idx < upload.rgbaPixels->size(); idx += 4) {
+                            worldAlphaTotal += 1;
+                            if ((*upload.rgbaPixels)[idx] > 0) {
+                                worldAlphaNonZero += 1;
+                            }
                         }
                         D3D12Renderer::WorldAtlasPageUpload item{};
                         item.rgbaPixels = upload.rgbaPixels->data();
@@ -1256,6 +1670,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                         worldTileRuntimeStatus = "World stream GPU upload failed: " + worldUploadError;
                     } else {
                         worldTileRuntimeStatus = "World stream updated atlas/page-table";
+                        worldLastUploadPageCount = rendererUploads.size();
+                        worldLastUploadAlphaCoverage =
+                            (worldAlphaTotal > 0u) ? static_cast<double>(worldAlphaNonZero) / static_cast<double>(worldAlphaTotal) : 0.0;
                     }
                 }
             } else {
@@ -1456,6 +1873,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         const bool satInCoverage = lonInCoverage && latInCoverage;
         ImGui::Text("Satellite wraps lon: %s", satWrapsLon ? "yes" : "no");
         ImGui::Text("Satellite sample at plane: %s", satInCoverage ? "in coverage" : "out of coverage");
+        ImGui::Text(
+            "Satellite imagery: %s (blend %.2f)",
+            graphicsTuning.satelliteEnabled ? "enabled" : "disabled",
+            graphicsTuning.satelliteBlend);
         ImGui::Text("Sentinel stream: %s", satelliteStreamerReady ? "enabled" : "disabled");
         if (!satelliteInitStatus.empty()) {
             ImGui::TextWrapped("%s", satelliteInitStatus.c_str());
@@ -1483,6 +1904,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
         }
         ImGui::Text("World-locked stream: %s", renderer.IsWorldLockedSatelliteEnabled() ? "enabled" : "disabled");
+        if (!renderer.IsWorldLockedSatelliteEnabled()) {
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.8f, 0.35f, 1.0f),
+                "Legacy ring mode active (expected shimmer/popping). Enable World-Locked Satellite.");
+        }
+        if (!worldTileSystemReady || !satelliteStreamerReady || !renderer.IsWorldLockedSatelliteEnabled()) {
+            const char* worldDisableReason = "disabled by graphics tuning";
+            if (!worldTileSystemReady) {
+                worldDisableReason = "world tile manager unavailable";
+            } else if (!satelliteStreamerReady) {
+                worldDisableReason = "satellite streamer unavailable";
+            }
+            ImGui::Text("World stream gate reason: %s", worldDisableReason);
+        }
         if (!worldTileInitStatus.empty()) {
             ImGui::TextWrapped("%s", worldTileInitStatus.c_str());
         }
@@ -1510,10 +1945,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             worldTileStats.governorRequestBudget,
             worldTileStats.governorUploadBudget);
         ImGui::Text(
+            "World page table occ/tomb/cap: %zu / %zu / %zu (load %.3f tomb %.3f)",
+            worldTileStats.pageTableOccupancy,
+            worldTileStats.pageTableTombstoneCount,
+            worldTileStats.pageTableCapacity,
+            worldTileStats.pageTableLoadFactor,
+            worldTileStats.pageTableTombstoneRatio);
+        ImGui::Text(
+            "World probe avg/max/budget: %.2f / %u / %u  visible resident over-budget: %zu / %zu",
+            worldTileStats.avgProbeDistance,
+            worldTileStats.maxProbeDistance,
+            worldTileStats.shaderProbeBudget,
+            worldTileStats.visibleResidentOverProbeBudget,
+            worldTileStats.visibleResidentCount);
+        ImGui::Text(
+            "World evictions/skips(sticky): %llu / %llu",
+            static_cast<unsigned long long>(worldTileStats.evictions),
+            static_cast<unsigned long long>(worldTileStats.evictionSkipsSticky));
+        ImGui::Text(
             "World uploads/pages/bytes: %llu / %llu / %.2f MB",
             static_cast<unsigned long long>(worldStreamingStats.uploadBatches),
             static_cast<unsigned long long>(worldStreamingStats.atlasPageUploads),
             static_cast<double>(worldStreamingStats.uploadBytes) / (1024.0 * 1024.0));
+        ImGui::Text(
+            "World last upload pages/alpha: %zu / %.1f%%",
+            worldLastUploadPageCount,
+            worldLastUploadAlphaCoverage * 100.0);
         if (!worldTileRuntimeStatus.empty()) {
             ImGui::TextWrapped("%s", worldTileRuntimeStatus.c_str());
         }
@@ -1935,8 +2392,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Text("Last compose: %.2f ms", satelliteLastComposeMs);
         ImGui::Text("Last upload: %.2f ms", satelliteLastUploadMs);
         ImGui::Text("View: lat %.6f lon %.6f alt %.1f m", activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), activeSim.AltitudeMeters());
+        ImGui::Text(
+            "Satellite imagery: %s (blend %.2f)",
+            graphicsTuning.satelliteEnabled ? "enabled" : "disabled",
+            graphicsTuning.satelliteBlend);
         ImGui::Separator();
         ImGui::Text("World-Locked: %s", renderer.IsWorldLockedSatelliteEnabled() ? "enabled" : "disabled");
+        if (!worldTileSystemReady || !satelliteStreamerReady || !renderer.IsWorldLockedSatelliteEnabled()) {
+            const char* worldDisableReason = "disabled by graphics tuning";
+            if (!worldTileSystemReady) {
+                worldDisableReason = "world tile manager unavailable";
+            } else if (!satelliteStreamerReady) {
+                worldDisableReason = "satellite streamer unavailable";
+            }
+            ImGui::Text("World Gate: %s", worldDisableReason);
+        }
         ImGui::Text(
             "Frame/Visible/Resident/Pending: %llu / %zu / %zu / %zu",
             static_cast<unsigned long long>(worldTileStats.frameId),
@@ -1955,6 +2425,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             "GPU upload batches/failures: %llu / %llu",
             static_cast<unsigned long long>(worldStreamingStats.uploadBatches),
             static_cast<unsigned long long>(worldStreamingStats.uploadFailures));
+        ImGui::Text(
+            "World last upload pages/alpha: %zu / %.1f%%",
+            worldLastUploadPageCount,
+            worldLastUploadAlphaCoverage * 100.0);
         if (!satelliteRuntimeStatus.empty()) {
             ImGui::TextWrapped("Status: %s", satelliteRuntimeStatus.c_str());
         }
