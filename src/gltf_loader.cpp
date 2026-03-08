@@ -467,7 +467,7 @@ bool LoadGlbMesh(
     const std::filesystem::path& glbPath,
     MeshData& outMesh,
     GlbMaterialTexture& outBaseColorTexture,
-    bool bakeMaterialColor,
+    const GlbLoadOptions& loadOptions,
     std::string& error) {
     outMesh = {};
     outBaseColorTexture = {};
@@ -510,7 +510,7 @@ bool LoadGlbMesh(
             const cgltf_primitive& primitive = node.mesh->primitives[primitiveIndex];
             MaterialBakeInfo bakeInfo{};
             const MaterialBakeInfo* bakeInfoPtr = nullptr;
-            if (bakeMaterialColor) {
+            if (loadOptions.bakeMaterialColor) {
                 bakeInfo = ResolveMaterialBakeInfo(primitive, glbPath, imageCache);
                 bakeInfoPtr = &bakeInfo;
             } else if (!outBaseColorTexture.IsValid()) {
@@ -533,7 +533,7 @@ bool LoadGlbMesh(
                 const cgltf_primitive& primitive = mesh.primitives[primitiveIndex];
                 MaterialBakeInfo bakeInfo{};
                 const MaterialBakeInfo* bakeInfoPtr = nullptr;
-                if (bakeMaterialColor) {
+                if (loadOptions.bakeMaterialColor) {
                     bakeInfo = ResolveMaterialBakeInfo(primitive, glbPath, imageCache);
                     bakeInfoPtr = &bakeInfo;
                 } else if (!outBaseColorTexture.IsValid()) {
@@ -560,7 +560,7 @@ bool LoadGlbMesh(
         ComputeNormals(outMesh);
     }
 
-    NormalizeScaleAndCenter(outMesh, 60.0f);
+    NormalizeScaleAndCenter(outMesh, std::max(loadOptions.targetExtentMeters, 0.01f));
 
     cgltf_free(data);
 
@@ -574,7 +574,7 @@ bool LoadGlbMesh(
 
 bool LoadGlbMesh(const std::filesystem::path& glbPath, MeshData& outMesh, std::string& error) {
     GlbMaterialTexture ignoredTexture;
-    return LoadGlbMesh(glbPath, outMesh, ignoredTexture, false, error);
+    return LoadGlbMesh(glbPath, outMesh, ignoredTexture, GlbLoadOptions{}, error);
 }
 
 bool LoadGlbMesh(
@@ -582,7 +582,18 @@ bool LoadGlbMesh(
     MeshData& outMesh,
     GlbMaterialTexture& outBaseColorTexture,
     std::string& error) {
-    return LoadGlbMesh(glbPath, outMesh, outBaseColorTexture, false, error);
+    return LoadGlbMesh(glbPath, outMesh, outBaseColorTexture, GlbLoadOptions{}, error);
+}
+
+bool LoadGlbMesh(
+    const std::filesystem::path& glbPath,
+    MeshData& outMesh,
+    GlbMaterialTexture& outBaseColorTexture,
+    bool bakeMaterialColor,
+    std::string& error) {
+    GlbLoadOptions loadOptions;
+    loadOptions.bakeMaterialColor = bakeMaterialColor;
+    return LoadGlbMesh(glbPath, outMesh, outBaseColorTexture, loadOptions, error);
 }
 
 } // namespace flight

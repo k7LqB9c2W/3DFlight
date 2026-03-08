@@ -18,7 +18,18 @@ struct GlbMaterialTexture {
     }
 };
 
+struct GlbLoadOptions {
+    float targetExtentMeters = 60.0f;
+    bool bakeMaterialColor = false;
+};
+
 bool LoadGlbMesh(const std::filesystem::path& glbPath, MeshData& outMesh, std::string& error);
+bool LoadGlbMesh(
+    const std::filesystem::path& glbPath,
+    MeshData& outMesh,
+    GlbMaterialTexture& outBaseColorTexture,
+    const GlbLoadOptions& options,
+    std::string& error);
 bool LoadGlbMesh(
     const std::filesystem::path& glbPath,
     MeshData& outMesh,

@@ -1,0 +1,28 @@
+{
+  "config_version": 1,
+  "profiles": {
+    "737cockpit": {
+      "model_scale": 1.0,
+      "model_right_m": 0.0,
+      "model_up_m": 0.0,
+      "model_forward_m": 0.0,
+      "model_yaw_deg": 0.0,
+      "model_pitch_deg": 0.0,
+      "model_roll_deg": 0.0,
+      "seat_right_m": 0.0,
+      "seat_up_m": 0.0,
+      "seat_forward_m": 0.0,
+      "base_yaw_deg": 0.0,
+      "base_pitch_deg": 0.0,
+      "fov_deg": 68.0,
+      "world_near_clip_m": 2.0,
+      "cockpit_near_clip_m": 0.03,
+      "cockpit_far_clip_m": 100.0,
+      "mouse_sensitivity_deg_per_pixel": 0.12,
+      "max_look_yaw_deg": 120.0,
+      "max_look_pitch_up_deg": 85.0,
+      "max_look_pitch_down_deg": 85.0,
+      "recenter_halflife_sec": 0.12
+    }
+  }
+}

@@ -20,6 +20,7 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <nlohmann/json.hpp>
+#include <windowsx.h>
 
 #include "d3d12_renderer.h"
 #include "gltf_loader.h"
@@ -54,6 +55,42 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kMetersToFeet = 3.280839895013123;
 constexpr double kMetersPerSecondToMph = 2.2369362920544025;
 std::atomic_flag g_crashLogInProgress = ATOMIC_FLAG_INIT;
+
+struct CockpitViewConfig {
+    float modelScale = 1.0f;
+    float modelRightMeters = 0.0f;
+    float modelUpMeters = 0.0f;
+    float modelForwardMeters = 0.0f;
+    float modelYawDeg = 0.0f;
+    float modelPitchDeg = 0.0f;
+    float modelRollDeg = 0.0f;
+    float seatRightMeters = 0.0f;
+    float seatUpMeters = 0.0f;
+    float seatForwardMeters = 0.0f;
+    float baseYawDeg = 0.0f;
+    float basePitchDeg = 0.0f;
+    float fovDeg = 68.0f;
+    float worldNearClipMeters = 2.0f;
+    float cockpitNearClipMeters = 0.03f;
+    float cockpitFarClipMeters = 100.0f;
+    float freelookSensitivityDegPerPixel = 0.12f;
+    float maxLookYawDeg = 120.0f;
+    float maxLookPitchUpDeg = 85.0f;
+    float maxLookPitchDownDeg = 85.0f;
+    float recenterHalflifeSec = 0.12f;
+};
+
+struct CockpitViewRuntimeState {
+    bool freelookActive = false;
+    float lookYawDeg = 0.0f;
+    float lookPitchDeg = 0.0f;
+    POINT lastMousePos{};
+    bool hasLastMousePos = false;
+};
+
+bool* g_cockpitViewSelected = nullptr;
+CockpitViewConfig* g_cockpitViewConfig = nullptr;
+CockpitViewRuntimeState* g_cockpitViewRuntime = nullptr;
 
 std::string WideToUtf8(const wchar_t* text) {
     if (!text || *text == L'\0') {
@@ -429,9 +466,18 @@ void InstallCrashHandlers() {
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
-        return 1;
-    }
+    const bool imguiHandled = ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam) != 0;
+
+    auto clearCockpitFreelook = [&](bool releaseCapture) {
+        if (g_cockpitViewRuntime == nullptr) {
+            return;
+        }
+        g_cockpitViewRuntime->freelookActive = false;
+        g_cockpitViewRuntime->hasLastMousePos = false;
+        if (releaseCapture && GetCapture() == hwnd) {
+            ReleaseCapture();
+        }
+    };
 
     switch (msg) {
         case WM_SIZE:
@@ -442,18 +488,65 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             }
             return 0;
         case WM_MOUSEWHEEL:
-            if (g_renderer != nullptr) {
+            if (g_renderer != nullptr && !(g_cockpitViewSelected != nullptr && *g_cockpitViewSelected)) {
                 const short wheelDelta = GET_WHEEL_DELTA_WPARAM(wparam);
                 const float wheelSteps = static_cast<float>(wheelDelta) / static_cast<float>(WHEEL_DELTA);
                 g_renderer->AddCameraZoomSteps(wheelSteps);
             }
             return 0;
+        case WM_RBUTTONDOWN:
+            if (g_cockpitViewSelected != nullptr && *g_cockpitViewSelected && g_cockpitViewRuntime != nullptr &&
+                g_cockpitViewConfig != nullptr && !ImGui::GetIO().WantCaptureMouse) {
+                g_cockpitViewRuntime->freelookActive = true;
+                g_cockpitViewRuntime->lastMousePos = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                g_cockpitViewRuntime->hasLastMousePos = true;
+                SetCapture(hwnd);
+                return 0;
+            }
+            break;
+        case WM_MOUSEMOVE:
+            if (g_cockpitViewSelected != nullptr && *g_cockpitViewSelected && g_cockpitViewRuntime != nullptr &&
+                g_cockpitViewRuntime->freelookActive && g_cockpitViewConfig != nullptr) {
+                const POINT currentPos{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (g_cockpitViewRuntime->hasLastMousePos) {
+                    const float dx = static_cast<float>(currentPos.x - g_cockpitViewRuntime->lastMousePos.x);
+                    const float dy = static_cast<float>(currentPos.y - g_cockpitViewRuntime->lastMousePos.y);
+                    g_cockpitViewRuntime->lookYawDeg += dx * g_cockpitViewConfig->freelookSensitivityDegPerPixel;
+                    g_cockpitViewRuntime->lookPitchDeg -= dy * g_cockpitViewConfig->freelookSensitivityDegPerPixel;
+                    g_cockpitViewRuntime->lookYawDeg =
+                        std::clamp(g_cockpitViewRuntime->lookYawDeg, -g_cockpitViewConfig->maxLookYawDeg, g_cockpitViewConfig->maxLookYawDeg);
+                    g_cockpitViewRuntime->lookPitchDeg = std::clamp(
+                        g_cockpitViewRuntime->lookPitchDeg,
+                        -g_cockpitViewConfig->maxLookPitchDownDeg,
+                        g_cockpitViewConfig->maxLookPitchUpDeg);
+                }
+                g_cockpitViewRuntime->lastMousePos = currentPos;
+                g_cockpitViewRuntime->hasLastMousePos = true;
+                return 0;
+            }
+            break;
+        case WM_RBUTTONUP:
+            if (g_cockpitViewRuntime != nullptr && g_cockpitViewRuntime->freelookActive) {
+                clearCockpitFreelook(true);
+                return 0;
+            }
+            break;
+        case WM_KILLFOCUS:
+            clearCockpitFreelook(true);
+            return 0;
         case WM_DESTROY:
+            clearCockpitFreelook(true);
             PostQuitMessage(0);
             return 0;
         default:
-            return DefWindowProc(hwnd, msg, wparam, lparam);
+            break;
     }
+
+    if (imguiHandled) {
+        return 1;
+    }
+
+    return DefWindowProc(hwnd, msg, wparam, lparam);
 }
 
 bool IsKeyDown(int vk) {
@@ -755,10 +848,17 @@ enum class VehicleMode {
     F35 = 2,
     B2 = 3,
     Missile = 4,
+    Cockpit737 = 5,
 };
 
-constexpr size_t kVehicleModeCount = 5;
-const char* kVehicleModeComboItems = "Airplane\0A320-200\0F-35 Lightning II\0B-2 Spirit\0AIM-120D Missile\0";
+constexpr size_t kVehicleModeCount = 6;
+const char* kVehicleModeComboItems =
+    "Airplane\0"
+    "A320-200\0"
+    "F-35 Lightning II\0"
+    "B-2 Spirit\0"
+    "AIM-120D Missile\0"
+    "737 Cockpit\0";
 
 const char* VehicleModeDisplayName(VehicleMode mode) {
     switch (mode) {
@@ -772,6 +872,8 @@ const char* VehicleModeDisplayName(VehicleMode mode) {
             return "B-2";
         case VehicleMode::Missile:
             return "Missile";
+        case VehicleMode::Cockpit737:
+            return "737 Cockpit";
         default:
             return "Airplane";
     }
@@ -792,6 +894,8 @@ VehicleMode VehicleModeFromIndex(int index) {
             return VehicleMode::B2;
         case 4:
             return VehicleMode::Missile;
+        case 5:
+            return VehicleMode::Cockpit737;
         case 0:
         default:
             return VehicleMode::Airplane;
@@ -802,15 +906,28 @@ bool VehicleModeIsMissile(VehicleMode mode) {
     return mode == VehicleMode::Missile;
 }
 
+bool VehicleModeIsCockpit(VehicleMode mode) {
+    return mode == VehicleMode::Cockpit737;
+}
+
+enum class VehicleRenderKind {
+    ExteriorAircraft,
+    InteriorCockpit,
+    Missile,
+};
+
+using VehicleAxisTransform = std::array<std::array<float, 3>, 3>;
+
 struct VehicleRenderAsset {
     MeshData mesh;
     GlbMaterialTexture texture;
     std::string modelStatus;
     std::string textureStatus;
     float minZoomMeters = 45.0f;
+    VehicleRenderKind renderKind = VehicleRenderKind::ExteriorAircraft;
+    float modelScale = 1.0f;
+    VehicleAxisTransform axisTransform{{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
 };
-
-using VehicleAxisTransform = std::array<std::array<float, 3>, 3>;
 
 struct MissileAutopilotState {
     double launchLatDeg = 37.6188056;
@@ -1233,6 +1350,141 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
     return true;
 }
 
+CockpitViewConfig MakeDefaultCockpitViewConfig() {
+    CockpitViewConfig cfg;
+    return cfg;
+}
+
+void SanitizeCockpitViewConfig(CockpitViewConfig& cfg) {
+    cfg.modelScale = std::clamp(cfg.modelScale, 0.05f, 20.0f);
+    cfg.modelRightMeters = std::clamp(cfg.modelRightMeters, -25.0f, 25.0f);
+    cfg.modelUpMeters = std::clamp(cfg.modelUpMeters, -25.0f, 25.0f);
+    cfg.modelForwardMeters = std::clamp(cfg.modelForwardMeters, -25.0f, 25.0f);
+    cfg.modelYawDeg = std::clamp(cfg.modelYawDeg, -180.0f, 180.0f);
+    cfg.modelPitchDeg = std::clamp(cfg.modelPitchDeg, -180.0f, 180.0f);
+    cfg.modelRollDeg = std::clamp(cfg.modelRollDeg, -180.0f, 180.0f);
+    cfg.seatRightMeters = std::clamp(cfg.seatRightMeters, -25.0f, 25.0f);
+    cfg.seatUpMeters = std::clamp(cfg.seatUpMeters, -25.0f, 25.0f);
+    cfg.seatForwardMeters = std::clamp(cfg.seatForwardMeters, -25.0f, 25.0f);
+    cfg.baseYawDeg = std::clamp(cfg.baseYawDeg, -180.0f, 180.0f);
+    cfg.basePitchDeg = std::clamp(cfg.basePitchDeg, -89.0f, 89.0f);
+    cfg.fovDeg = std::clamp(cfg.fovDeg, 30.0f, 110.0f);
+    cfg.worldNearClipMeters = std::clamp(cfg.worldNearClipMeters, 0.05f, 1000.0f);
+    cfg.cockpitNearClipMeters = std::clamp(cfg.cockpitNearClipMeters, 0.01f, 10.0f);
+    cfg.cockpitFarClipMeters = std::clamp(cfg.cockpitFarClipMeters, 10.0f, 5000.0f);
+    cfg.freelookSensitivityDegPerPixel = std::clamp(cfg.freelookSensitivityDegPerPixel, 0.01f, 2.0f);
+    cfg.maxLookYawDeg = std::clamp(cfg.maxLookYawDeg, 5.0f, 179.0f);
+    cfg.maxLookPitchUpDeg = std::clamp(cfg.maxLookPitchUpDeg, 5.0f, 89.0f);
+    cfg.maxLookPitchDownDeg = std::clamp(cfg.maxLookPitchDownDeg, 5.0f, 89.0f);
+    cfg.recenterHalflifeSec = std::clamp(cfg.recenterHalflifeSec, 0.01f, 5.0f);
+    cfg.cockpitFarClipMeters = std::max(cfg.cockpitFarClipMeters, cfg.cockpitNearClipMeters + 1.0f);
+}
+
+bool LoadCockpitViewConfig(const std::filesystem::path& path, CockpitViewConfig& outCfg, std::string& error) {
+    error.clear();
+    std::ifstream in(path);
+    if (!in) {
+        error = "Failed to open cockpit config: " + path.string();
+        return false;
+    }
+
+    nlohmann::json j;
+    try {
+        in >> j;
+    } catch (const std::exception& ex) {
+        error = "Failed to parse cockpit JSON: " + std::string(ex.what());
+        return false;
+    }
+
+    const nlohmann::json* profile = nullptr;
+    if (j.contains("profiles") && j["profiles"].is_object()) {
+        const auto& profiles = j["profiles"];
+        if (profiles.contains("737cockpit") && profiles["737cockpit"].is_object()) {
+            profile = &profiles["737cockpit"];
+        }
+    }
+    if (profile == nullptr) {
+        profile = &j;
+    }
+
+    auto readFloat = [profile](const char* key, float& value) {
+        if (profile->contains(key) && (*profile)[key].is_number()) {
+            value = (*profile)[key].get<float>();
+        }
+    };
+
+    readFloat("model_scale", outCfg.modelScale);
+    readFloat("model_right_m", outCfg.modelRightMeters);
+    readFloat("model_up_m", outCfg.modelUpMeters);
+    readFloat("model_forward_m", outCfg.modelForwardMeters);
+    readFloat("model_yaw_deg", outCfg.modelYawDeg);
+    readFloat("model_pitch_deg", outCfg.modelPitchDeg);
+    readFloat("model_roll_deg", outCfg.modelRollDeg);
+    readFloat("seat_right_m", outCfg.seatRightMeters);
+    readFloat("seat_up_m", outCfg.seatUpMeters);
+    readFloat("seat_forward_m", outCfg.seatForwardMeters);
+    readFloat("base_yaw_deg", outCfg.baseYawDeg);
+    readFloat("base_pitch_deg", outCfg.basePitchDeg);
+    readFloat("fov_deg", outCfg.fovDeg);
+    readFloat("world_near_clip_m", outCfg.worldNearClipMeters);
+    readFloat("cockpit_near_clip_m", outCfg.cockpitNearClipMeters);
+    readFloat("cockpit_far_clip_m", outCfg.cockpitFarClipMeters);
+    readFloat("mouse_sensitivity_deg_per_pixel", outCfg.freelookSensitivityDegPerPixel);
+    readFloat("max_look_yaw_deg", outCfg.maxLookYawDeg);
+    readFloat("max_look_pitch_up_deg", outCfg.maxLookPitchUpDeg);
+    readFloat("max_look_pitch_down_deg", outCfg.maxLookPitchDownDeg);
+    readFloat("recenter_halflife_sec", outCfg.recenterHalflifeSec);
+
+    SanitizeCockpitViewConfig(outCfg);
+    return true;
+}
+
+bool SaveCockpitViewConfig(const std::filesystem::path& path, const CockpitViewConfig& cfg, std::string& error) {
+    error.clear();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        error = "Failed to create config directory: " + ec.message();
+        return false;
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) {
+        error = "Failed to write cockpit config: " + path.string();
+        return false;
+    }
+
+    nlohmann::json profile;
+    profile["model_scale"] = cfg.modelScale;
+    profile["model_right_m"] = cfg.modelRightMeters;
+    profile["model_up_m"] = cfg.modelUpMeters;
+    profile["model_forward_m"] = cfg.modelForwardMeters;
+    profile["model_yaw_deg"] = cfg.modelYawDeg;
+    profile["model_pitch_deg"] = cfg.modelPitchDeg;
+    profile["model_roll_deg"] = cfg.modelRollDeg;
+    profile["seat_right_m"] = cfg.seatRightMeters;
+    profile["seat_up_m"] = cfg.seatUpMeters;
+    profile["seat_forward_m"] = cfg.seatForwardMeters;
+    profile["base_yaw_deg"] = cfg.baseYawDeg;
+    profile["base_pitch_deg"] = cfg.basePitchDeg;
+    profile["fov_deg"] = cfg.fovDeg;
+    profile["world_near_clip_m"] = cfg.worldNearClipMeters;
+    profile["cockpit_near_clip_m"] = cfg.cockpitNearClipMeters;
+    profile["cockpit_far_clip_m"] = cfg.cockpitFarClipMeters;
+    profile["mouse_sensitivity_deg_per_pixel"] = cfg.freelookSensitivityDegPerPixel;
+    profile["max_look_yaw_deg"] = cfg.maxLookYawDeg;
+    profile["max_look_pitch_up_deg"] = cfg.maxLookPitchUpDeg;
+    profile["max_look_pitch_down_deg"] = cfg.maxLookPitchDownDeg;
+    profile["recenter_halflife_sec"] = cfg.recenterHalflifeSec;
+
+    nlohmann::json j;
+    j["config_version"] = 1;
+    j["profiles"] = {{"737cockpit", profile}};
+
+    out << j.dump(2) << "\n";
+    return true;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
@@ -1300,16 +1552,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             float scale,
             float minZoomMeters,
             const VehicleAxisTransform& axisTransform,
-            bool bakeMaterialColor = false) {
+            VehicleRenderKind renderKind = VehicleRenderKind::ExteriorAircraft,
+            flight::GlbLoadOptions loadOptions = {}) {
             auto& asset = vehicleAssets[VehicleModeToIndex(mode)];
             asset.minZoomMeters = minZoomMeters;
+            asset.renderKind = renderKind;
+            asset.modelScale = scale;
+            asset.axisTransform = axisTransform;
 
             std::string loadError;
-            const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, bakeMaterialColor, loadError);
+            const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, loadOptions, loadError);
             if (!loaded) {
                 asset.mesh = flight::CreatePlaceholderPlane();
             }
-            if (bakeMaterialColor) {
+            if (loadOptions.bakeMaterialColor) {
                 asset.texture = {};
             }
 
@@ -1337,6 +1593,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     auto configureMissileAsset = [&](const std::filesystem::path& path) {
         auto& asset = vehicleAssets[VehicleModeToIndex(VehicleMode::Missile)];
         asset.minZoomMeters = 8.0f;
+        asset.renderKind = VehicleRenderKind::Missile;
 
         std::string loadError;
         const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, loadError);
@@ -1369,32 +1626,54 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     constexpr VehicleAxisTransform kA320AxisTransform = {{{0.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f}}};
     constexpr VehicleAxisTransform kF35AxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, -1.0f, 0.0f}}};
     constexpr VehicleAxisTransform kB2AxisTransform = {{{0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f}}};
+    constexpr VehicleAxisTransform kCockpitAxisTransform = {{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
+    flight::GlbLoadOptions defaultAircraftLoadOptions;
+    flight::GlbLoadOptions bakedColorAircraftLoadOptions;
+    bakedColorAircraftLoadOptions.bakeMaterialColor = true;
+    flight::GlbLoadOptions cockpitLoadOptions;
+    cockpitLoadOptions.targetExtentMeters = 8.0f;
+    cockpitLoadOptions.bakeMaterialColor = true;
 
     configureAircraftAsset(
         VehicleMode::Airplane,
         std::filesystem::path("assets") / "models" / "Airplane.glb",
         1.0f,
         45.0f,
-        kAirplaneAxisTransform);
+        kAirplaneAxisTransform,
+        VehicleRenderKind::ExteriorAircraft,
+        defaultAircraftLoadOptions);
     configureAircraftAsset(
         VehicleMode::A320,
         std::filesystem::path("assets") / "models" / "A320-200.glb",
         1.0f,
         75.0f,
         kA320AxisTransform,
-        true);
+        VehicleRenderKind::ExteriorAircraft,
+        bakedColorAircraftLoadOptions);
     configureAircraftAsset(
         VehicleMode::F35,
         std::filesystem::path("assets") / "models" / "F35.glb",
         0.27f,
         18.0f,
-        kF35AxisTransform);
+        kF35AxisTransform,
+        VehicleRenderKind::ExteriorAircraft,
+        defaultAircraftLoadOptions);
     configureAircraftAsset(
         VehicleMode::B2,
         std::filesystem::path("assets") / "models" / "B2.glb",
         0.88f,
         30.0f,
-        kB2AxisTransform);
+        kB2AxisTransform,
+        VehicleRenderKind::ExteriorAircraft,
+        defaultAircraftLoadOptions);
+    configureAircraftAsset(
+        VehicleMode::Cockpit737,
+        std::filesystem::path("assets") / "models" / "737cockpit.glb",
+        1.0f,
+        5.0f,
+        kCockpitAxisTransform,
+        VehicleRenderKind::InteriorCockpit,
+        cockpitLoadOptions);
     configureMissileAsset(std::filesystem::path("assets") / "models" / "AIM120D.glb");
 
     const auto& initialVehicleAsset = vehicleAssets[VehicleModeToIndex(VehicleMode::Airplane)];
@@ -1434,6 +1713,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     int dayOfYear = 172;
     bool autoTimeOfDay = false;
     float timeOfDayRateHoursPerSecond = 0.5f;
+    CockpitViewConfig cockpitViewConfig = MakeDefaultCockpitViewConfig();
+    CockpitViewRuntimeState cockpitViewRuntime{};
+    const std::filesystem::path cockpitConfigPath = std::filesystem::path("config") / "cockpit_view.json";
+    std::string cockpitConfigStatus;
 
     TerrainSystem terrainSystem;
     bool terrainSystemReady = false;
@@ -1533,6 +1816,29 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             hasGraphicsConfigWriteTime = true;
         }
     }
+    {
+        std::error_code existsEc;
+        const bool configExists = std::filesystem::exists(cockpitConfigPath, existsEc) && !existsEc;
+        if (configExists) {
+            std::string loadError;
+            if (LoadCockpitViewConfig(cockpitConfigPath, cockpitViewConfig, loadError)) {
+                cockpitConfigStatus = "Loaded " + cockpitConfigPath.string();
+            } else {
+                cockpitConfigStatus = "Cockpit config load failed: " + loadError;
+            }
+        } else {
+            std::string saveError;
+            SanitizeCockpitViewConfig(cockpitViewConfig);
+            if (SaveCockpitViewConfig(cockpitConfigPath, cockpitViewConfig, saveError)) {
+                cockpitConfigStatus = "Created default " + cockpitConfigPath.string();
+            } else {
+                cockpitConfigStatus = "Cockpit config create failed: " + saveError;
+            }
+        }
+    }
+    g_cockpitViewSelected = nullptr;
+    g_cockpitViewConfig = &cockpitViewConfig;
+    g_cockpitViewRuntime = &cockpitViewRuntime;
     double graphicsHotReloadAccumulator = 0.0;
 
     bool regenerateTerrainRequested = true;
@@ -1647,6 +1953,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     };
 
     auto applyVehicleZoomRange = [&](VehicleMode mode) {
+        if (VehicleModeIsCockpit(mode)) {
+            return;
+        }
         constexpr float kZoomMaxMeters = 3000.0f;
         const float minZoomMeters = vehicleAssets[VehicleModeToIndex(mode)].minZoomMeters;
         renderer.SetCameraZoomRangeMeters(
@@ -1655,7 +1964,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     };
 
     bool previousBackspace = false;
+    bool cockpitViewSelected = VehicleModeIsCockpit(vehicleMode);
+    g_cockpitViewSelected = &cockpitViewSelected;
     auto applyVehicleMesh = [&](VehicleMode mode) {
+        cockpitViewSelected = VehicleModeIsCockpit(mode);
+        if (!cockpitViewSelected) {
+            cockpitViewRuntime.freelookActive = false;
+            cockpitViewRuntime.hasLastMousePos = false;
+        }
         if (mode == appliedRenderMode) {
             applyVehicleZoomRange(mode);
             return;
@@ -1680,7 +1996,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         appliedRenderMode = mode;
         applyVehicleZoomRange(mode);
         vehicleTextureStatus = asset.textureStatus;
-        vehicleModeStatus = std::string("Switched to ") + VehicleModeDisplayName(mode) + " vehicle view";
+        vehicleModeStatus = std::string("Switched to ") + VehicleModeDisplayName(mode) +
+            (VehicleModeIsCockpit(mode) ? " cockpit view" : " vehicle view");
     };
     applyVehicleZoomRange(vehicleMode);
 
@@ -1797,6 +2114,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         const FlightSim& activeSim = VehicleModeIsMissile(vehicleMode) ? missileViewSim : sim;
+        if (!cockpitViewRuntime.freelookActive) {
+            const double halflife = std::max(static_cast<double>(cockpitViewConfig.recenterHalflifeSec), 0.01);
+            const float decay = static_cast<float>(std::exp2(-dt / halflife));
+            cockpitViewRuntime.lookYawDeg *= decay;
+            cockpitViewRuntime.lookPitchDeg *= decay;
+            if (std::abs(cockpitViewRuntime.lookYawDeg) < 0.01f) {
+                cockpitViewRuntime.lookYawDeg = 0.0f;
+            }
+            if (std::abs(cockpitViewRuntime.lookPitchDeg) < 0.01f) {
+                cockpitViewRuntime.lookPitchDeg = 0.0f;
+            }
+        }
 
         if (autoTimeOfDay) {
             AdvanceLocalSolarClock(localSolarTimeHours, dayOfYear, static_cast<double>(timeOfDayRateHoursPerSecond) * dt);
@@ -2125,7 +2454,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 ImGui::TextUnformatted("Yaw hold: OFF");
             }
         }
-        ImGui::Text("Camera distance: %.0f m (wheel up/down)", renderer.CameraFollowDistanceMeters());
+        if (VehicleModeIsCockpit(vehicleMode)) {
+            ImGui::Text("Camera mode: cockpit (hold RMB and move mouse to look)");
+        } else {
+            ImGui::Text("Camera distance: %.0f m (wheel up/down)", renderer.CameraFollowDistanceMeters());
+        }
         ImGui::Checkbox("Imperial Units (mph/ft)", &useImperialUnits);
 
         ImGui::Separator();
@@ -2508,6 +2841,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("Pitch W/S, Roll A/D, Yaw Q/E");
             ImGui::Text("Throttle Up/Down arrows");
             ImGui::Text("Altitude R/F, Reset Backspace");
+            if (VehicleModeIsCockpit(vehicleMode)) {
+                ImGui::TextUnformatted("Cockpit view: hold RMB and move mouse to look around.");
+            }
             ImGui::TextUnformatted("Steady Flight levels pitch/roll and holds the current altitude and heading.");
         } else {
             ImGui::TextUnformatted("Missile mode: autonomous guidance");
@@ -2546,6 +2882,112 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::TextUnformatted("Marker shows aircraft position and nose direction.");
         }
         ImGui::End();
+
+        if (VehicleModeIsCockpit(vehicleMode)) {
+            ImGui::Begin("Cockpit View");
+            bool cockpitConfigChanged = false;
+            if (ImGui::SliderFloat("Model Scale", &cockpitViewConfig.modelScale, 0.05f, 6.0f, "%.2f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Model Right (m)", &cockpitViewConfig.modelRightMeters, -15.0f, 15.0f, "%.2f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Model Up (m)", &cockpitViewConfig.modelUpMeters, -15.0f, 15.0f, "%.2f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Model Forward (m)", &cockpitViewConfig.modelForwardMeters, -15.0f, 15.0f, "%.2f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Model Yaw (deg)", &cockpitViewConfig.modelYawDeg, -180.0f, 180.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Model Pitch (deg)", &cockpitViewConfig.modelPitchDeg, -180.0f, 180.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Model Roll (deg)", &cockpitViewConfig.modelRollDeg, -180.0f, 180.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Seat Right (m)", &cockpitViewConfig.seatRightMeters, -10.0f, 10.0f, "%.2f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Seat Up (m)", &cockpitViewConfig.seatUpMeters, -10.0f, 10.0f, "%.2f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Seat Forward (m)", &cockpitViewConfig.seatForwardMeters, -10.0f, 10.0f, "%.2f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Base Yaw (deg)", &cockpitViewConfig.baseYawDeg, -180.0f, 180.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Base Pitch (deg)", &cockpitViewConfig.basePitchDeg, -89.0f, 89.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("FOV (deg)", &cockpitViewConfig.fovDeg, 30.0f, 110.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Mouse Sensitivity", &cockpitViewConfig.freelookSensitivityDegPerPixel, 0.01f, 0.8f, "%.3f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Max Look Yaw", &cockpitViewConfig.maxLookYawDeg, 5.0f, 179.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Max Look Pitch Up", &cockpitViewConfig.maxLookPitchUpDeg, 5.0f, 89.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+            if (ImGui::SliderFloat("Max Look Pitch Down", &cockpitViewConfig.maxLookPitchDownDeg, 5.0f, 89.0f, "%.1f")) {
+                cockpitConfigChanged = true;
+            }
+
+            if (cockpitConfigChanged) {
+                SanitizeCockpitViewConfig(cockpitViewConfig);
+            }
+
+            if (ImGui::Button("Reset Runtime Look")) {
+                cockpitViewRuntime.lookYawDeg = 0.0f;
+                cockpitViewRuntime.lookPitchDeg = 0.0f;
+                cockpitViewRuntime.freelookActive = false;
+                cockpitViewRuntime.hasLastMousePos = false;
+                cockpitConfigStatus = "Reset cockpit runtime look";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset Profile Defaults")) {
+                cockpitViewConfig = MakeDefaultCockpitViewConfig();
+                cockpitViewRuntime.lookYawDeg = 0.0f;
+                cockpitViewRuntime.lookPitchDeg = 0.0f;
+                cockpitViewRuntime.freelookActive = false;
+                cockpitViewRuntime.hasLastMousePos = false;
+                cockpitConfigStatus = "Restored cockpit defaults";
+            }
+            if (ImGui::Button("Save Cockpit Profile")) {
+                SanitizeCockpitViewConfig(cockpitViewConfig);
+                std::string saveError;
+                if (SaveCockpitViewConfig(cockpitConfigPath, cockpitViewConfig, saveError)) {
+                    cockpitConfigStatus = "Saved " + cockpitConfigPath.string();
+                } else {
+                    cockpitConfigStatus = "Cockpit save failed: " + saveError;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reload Cockpit Profile")) {
+                CockpitViewConfig loaded = cockpitViewConfig;
+                std::string loadError;
+                if (LoadCockpitViewConfig(cockpitConfigPath, loaded, loadError)) {
+                    cockpitViewConfig = loaded;
+                    cockpitConfigStatus = "Reloaded " + cockpitConfigPath.string();
+                } else {
+                    cockpitConfigStatus = "Cockpit reload failed: " + loadError;
+                }
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Freelook: %s", cockpitViewRuntime.freelookActive ? "active" : "idle");
+            ImGui::Text("Look yaw/pitch: %.1f / %.1f deg", cockpitViewRuntime.lookYawDeg, cockpitViewRuntime.lookPitchDeg);
+            ImGui::Text("Config: %s", cockpitConfigPath.string().c_str());
+            if (!cockpitConfigStatus.empty()) {
+                ImGui::TextWrapped("%s", cockpitConfigStatus.c_str());
+            }
+            ImGui::End();
+        }
 
         ImGui::Begin("Graphics Tuning");
         bool meshTuningChanged = false;
@@ -2848,6 +3290,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
         ImGui::End();
 
+        D3D12Renderer::CameraSettings cameraSettings{};
+        cameraSettings.mode = VehicleModeIsCockpit(vehicleMode) ? D3D12Renderer::CameraMode::Cockpit : D3D12Renderer::CameraMode::Chase;
+        cameraSettings.chaseDistanceMeters = renderer.CameraFollowDistanceMeters();
+        cameraSettings.cockpitSeatRightMeters = cockpitViewConfig.seatRightMeters;
+        cameraSettings.cockpitSeatUpMeters = cockpitViewConfig.seatUpMeters;
+        cameraSettings.cockpitSeatForwardMeters = cockpitViewConfig.seatForwardMeters;
+        cameraSettings.cockpitModelScale = cockpitViewConfig.modelScale;
+        cameraSettings.cockpitModelRightMeters = cockpitViewConfig.modelRightMeters;
+        cameraSettings.cockpitModelUpMeters = cockpitViewConfig.modelUpMeters;
+        cameraSettings.cockpitModelForwardMeters = cockpitViewConfig.modelForwardMeters;
+        cameraSettings.cockpitModelYawDeg = cockpitViewConfig.modelYawDeg;
+        cameraSettings.cockpitModelPitchDeg = cockpitViewConfig.modelPitchDeg;
+        cameraSettings.cockpitModelRollDeg = cockpitViewConfig.modelRollDeg;
+        cameraSettings.cockpitBaseYawDeg = cockpitViewConfig.baseYawDeg;
+        cameraSettings.cockpitBasePitchDeg = cockpitViewConfig.basePitchDeg;
+        cameraSettings.cockpitLookYawDeg = cockpitViewRuntime.lookYawDeg;
+        cameraSettings.cockpitLookPitchDeg = cockpitViewRuntime.lookPitchDeg;
+        cameraSettings.cockpitFovDeg = cockpitViewConfig.fovDeg;
+        cameraSettings.worldNearClipMeters = cockpitViewConfig.worldNearClipMeters;
+        cameraSettings.cockpitNearClipMeters = cockpitViewConfig.cockpitNearClipMeters;
+        cameraSettings.cockpitFarClipMeters = cockpitViewConfig.cockpitFarClipMeters;
+        cameraSettings.renderOnlyCockpitMesh = VehicleModeIsCockpit(vehicleMode);
+        renderer.SetCameraSettings(cameraSettings);
+
         ImGui::Render();
         renderer.Render(activeSim, ImGui::GetDrawData());
     }
@@ -2858,6 +3324,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
     renderer.Shutdown();
     g_renderer = nullptr;
+    g_cockpitViewSelected = nullptr;
+    g_cockpitViewConfig = nullptr;
+    g_cockpitViewRuntime = nullptr;
 
     CoUninitialize();
     return 0;

@@ -1311,121 +1311,182 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     const Double3 planeEcef = sim.PlaneEcef();
     const Double3 forwardEcef = Normalize(sim.ForwardEcef());
     const Double3 upEcef = Normalize(sim.UpEcef());
+    Double3 rightEcef = Normalize(Cross(upEcef, forwardEcef));
+    if (Length(rightEcef) < 1e-6) {
+        rightEcef = {1.0, 0.0, 0.0};
+    }
+    Double3 upOrtho = Normalize(Cross(forwardEcef, rightEcef));
+    if (Length(upOrtho) < 1e-6) {
+        upOrtho = upEcef;
+    }
 
-    // Third-person chase camera with wheel-controlled follow distance.
-    const double kCameraFollowDistance = static_cast<double>(m_cameraFollowDistanceMeters);
-    const double kCameraHeight = std::clamp(kCameraFollowDistance * 0.32, 18.0, 420.0);
-    const double kCameraLookAhead = std::clamp(kCameraFollowDistance * 0.35, 28.0, 540.0);
-    constexpr float kCameraFovDegrees = 50.0f;
+    const double c = std::cos(sim.RollRad());
+    const double s = std::sin(sim.RollRad());
+    const Double3 rightRolled = Normalize(rightEcef * c + upOrtho * s);
+    const Double3 upRolled = Normalize(Cross(forwardEcef, rightRolled));
 
-    const Double3 cameraEcef = planeEcef - forwardEcef * kCameraFollowDistance + upEcef * kCameraHeight;
+    const auto rotateAroundAxis = [](const Double3& value, const Double3& axisUnit, double angleRad) {
+        const double cosAngle = std::cos(angleRad);
+        const double sinAngle = std::sin(angleRad);
+        return value * cosAngle + Cross(axisUnit, value) * sinAngle + axisUnit * (Dot(axisUnit, value) * (1.0 - cosAngle));
+    };
+
+    const bool cockpitMode = m_cameraSettings.mode == CameraMode::Cockpit;
+    const float aspect = static_cast<float>(m_width) / static_cast<float>(std::max(m_height, 1u));
+    constexpr float kChaseFovDegrees = 50.0f;
+    constexpr float kWorldFarClipMeters = 50000000.0f;
+
+    Double3 cameraEcef{};
+    Double3 cameraForward{};
+    Double3 cameraViewUp{};
+    float worldFovDegrees = kChaseFovDegrees;
+    float worldNearClipMeters = 10.0f;
+
+    if (cockpitMode) {
+        cameraEcef = planeEcef +
+            rightRolled * static_cast<double>(m_cameraSettings.cockpitSeatRightMeters) +
+            upRolled * static_cast<double>(m_cameraSettings.cockpitSeatUpMeters) +
+            forwardEcef * static_cast<double>(m_cameraSettings.cockpitSeatForwardMeters);
+
+        const double yawRad = DirectX::XMConvertToRadians(m_cameraSettings.cockpitBaseYawDeg + m_cameraSettings.cockpitLookYawDeg);
+        const double pitchRad = DirectX::XMConvertToRadians(m_cameraSettings.cockpitBasePitchDeg + m_cameraSettings.cockpitLookPitchDeg);
+
+        Double3 viewForward = forwardEcef;
+        Double3 viewRight = rightRolled;
+        Double3 viewUp = upRolled;
+        if (std::abs(yawRad) > 1e-8) {
+            viewForward = Normalize(rotateAroundAxis(viewForward, upRolled, yawRad));
+            viewRight = Normalize(rotateAroundAxis(viewRight, upRolled, yawRad));
+        }
+        if (std::abs(pitchRad) > 1e-8) {
+            viewForward = Normalize(rotateAroundAxis(viewForward, viewRight, pitchRad));
+            viewUp = Normalize(rotateAroundAxis(viewUp, viewRight, pitchRad));
+        }
+
+        cameraForward = viewForward;
+        cameraViewUp = viewUp;
+        worldFovDegrees = std::clamp(m_cameraSettings.cockpitFovDeg, 30.0f, 110.0f);
+        worldNearClipMeters = std::clamp(m_cameraSettings.worldNearClipMeters, 0.05f, 1000.0f);
+    } else {
+        const double cameraFollowDistance = static_cast<double>(std::clamp(m_cameraSettings.chaseDistanceMeters, 1.0f, 100000.0f));
+        const double cameraHeight = std::clamp(cameraFollowDistance * 0.32, 18.0, 420.0);
+        cameraEcef = planeEcef - forwardEcef * cameraFollowDistance + upEcef * cameraHeight;
+        cameraForward = Normalize((planeEcef + forwardEcef * std::clamp(cameraFollowDistance * 0.35, 28.0, 540.0)) - cameraEcef);
+        cameraViewUp = upEcef;
+    }
+
     const Double3 anchor = cameraEcef;
-
     const Double3 planeLocalD = planeEcef - anchor;
     const Double3 earthCenterLocalD = Double3{-anchor.x, -anchor.y, -anchor.z};
-    const Double3 cameraTarget = planeLocalD + forwardEcef * kCameraLookAhead;
-
-    const DirectX::XMVECTOR eye = DirectX::XMVectorZero();
-    const DirectX::XMVECTOR at = DirectX::XMVectorSet(
-        static_cast<float>(cameraTarget.x),
-        static_cast<float>(cameraTarget.y),
-        static_cast<float>(cameraTarget.z),
-        1.0f);
-    const DirectX::XMVECTOR up = DirectX::XMVectorSet(
-        static_cast<float>(upEcef.x),
-        static_cast<float>(upEcef.y),
-        static_cast<float>(upEcef.z),
-        0.0f);
-
-    const DirectX::XMMATRIX view = DirectX::XMMatrixLookAtLH(eye, at, up);
-    const float aspect = static_cast<float>(m_width) / static_cast<float>(std::max(m_height, 1u));
-    const DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(
-        DirectX::XMConvertToRadians(kCameraFovDegrees),
-        aspect,
-        10.0f,
-        50000000.0f);
-    const DirectX::XMMATRIX viewProj = view * proj;
-    const DirectX::XMMATRIX invViewProj = DirectX::XMMatrixInverse(nullptr, viewProj);
+    const Double3 cameraTarget = cameraForward * 200.0;
     const Double3 cameraUp = Normalize(Double3{-earthCenterLocalD.x, -earthCenterLocalD.y, -earthCenterLocalD.z});
     const float topRadius = static_cast<float>(kEarthRadiusMeters + static_cast<double>(m_atmosphereSettings.atmosphereHeightMeters));
 
-    SceneConstants sceneCb{};
-    DirectX::XMStoreFloat4x4(&sceneCb.viewProj, DirectX::XMMatrixTranspose(viewProj));
-    DirectX::XMStoreFloat4x4(&sceneCb.invViewProj, DirectX::XMMatrixTranspose(invViewProj));
-    sceneCb.earthCenterRadius = {
-        static_cast<float>(earthCenterLocalD.x),
-        static_cast<float>(earthCenterLocalD.y),
-        static_cast<float>(earthCenterLocalD.z),
-        static_cast<float>(kEarthRadiusMeters),
+    const auto writeSceneConstants = [&](UINT64 sceneOffsetBytes, float fovDegrees, float nearClipMeters, float farClipMeters) {
+        const DirectX::XMVECTOR eye = DirectX::XMVectorZero();
+        const DirectX::XMVECTOR at = DirectX::XMVectorSet(
+            static_cast<float>(cameraTarget.x),
+            static_cast<float>(cameraTarget.y),
+            static_cast<float>(cameraTarget.z),
+            1.0f);
+        const DirectX::XMVECTOR up = DirectX::XMVectorSet(
+            static_cast<float>(cameraViewUp.x),
+            static_cast<float>(cameraViewUp.y),
+            static_cast<float>(cameraViewUp.z),
+            0.0f);
+
+        const DirectX::XMMATRIX view = DirectX::XMMatrixLookAtLH(eye, at, up);
+        const DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(
+            DirectX::XMConvertToRadians(fovDegrees),
+            aspect,
+            nearClipMeters,
+            farClipMeters);
+        const DirectX::XMMATRIX viewProj = view * proj;
+        const DirectX::XMMATRIX invViewProj = DirectX::XMMatrixInverse(nullptr, viewProj);
+
+        SceneConstants sceneCb{};
+        DirectX::XMStoreFloat4x4(&sceneCb.viewProj, DirectX::XMMatrixTranspose(viewProj));
+        DirectX::XMStoreFloat4x4(&sceneCb.invViewProj, DirectX::XMMatrixTranspose(invViewProj));
+        sceneCb.earthCenterRadius = {
+            static_cast<float>(earthCenterLocalD.x),
+            static_cast<float>(earthCenterLocalD.y),
+            static_cast<float>(earthCenterLocalD.z),
+            static_cast<float>(kEarthRadiusMeters),
+        };
+        const Double3 sunDir = Normalize(m_sunDirection);
+        sceneCb.sunDirIntensity = {
+            static_cast<float>(sunDir.x),
+            static_cast<float>(sunDir.y),
+            static_cast<float>(sunDir.z),
+            m_atmosphereSettings.sunIlluminance,
+        };
+        sceneCb.cameraPosTopRadius = {0.0f, 0.0f, 0.0f, topRadius};
+        sceneCb.cameraUpAndTime = {
+            static_cast<float>(cameraUp.x),
+            static_cast<float>(cameraUp.y),
+            static_cast<float>(cameraUp.z),
+            static_cast<float>(GetTickCount64() * 0.001),
+        };
+        sceneCb.viewportAndAerialDepth = {
+            static_cast<float>(m_width),
+            static_cast<float>(m_height),
+            m_aerialPerspectiveDepthMeters,
+            m_atmosphereEnabled ? 1.0f : 0.0f,
+        };
+        sceneCb.atmosphereFlags = {
+            m_multipleScatteringEnabled ? 1.0f : 0.0f,
+            m_atmosphereSettings.miePhaseG,
+            m_atmosphereExposure,
+            0.0f,
+        };
+        sceneCb.rayleighScatteringAndScale = {
+            m_atmosphereSettings.rayleighScattering.x,
+            m_atmosphereSettings.rayleighScattering.y,
+            m_atmosphereSettings.rayleighScattering.z,
+            m_atmosphereSettings.rayleighScaleHeightMeters,
+        };
+        sceneCb.rayleighAbsorptionPad = {
+            m_atmosphereSettings.rayleighAbsorption.x,
+            m_atmosphereSettings.rayleighAbsorption.y,
+            m_atmosphereSettings.rayleighAbsorption.z,
+            0.0f,
+        };
+        sceneCb.mieScatteringAndScale = {
+            m_atmosphereSettings.mieScattering.x,
+            m_atmosphereSettings.mieScattering.y,
+            m_atmosphereSettings.mieScattering.z,
+            m_atmosphereSettings.mieScaleHeightMeters,
+        };
+        sceneCb.mieAbsorptionAndG = {
+            m_atmosphereSettings.mieAbsorption.x,
+            m_atmosphereSettings.mieAbsorption.y,
+            m_atmosphereSettings.mieAbsorption.z,
+            m_atmosphereSettings.miePhaseG,
+        };
+        sceneCb.ozoneAbsorptionAndCenter = {
+            m_atmosphereSettings.ozoneAbsorption.x,
+            m_atmosphereSettings.ozoneAbsorption.y,
+            m_atmosphereSettings.ozoneAbsorption.z,
+            m_atmosphereSettings.ozoneCenterHeightMeters,
+        };
+        sceneCb.ozoneHalfWidthAtmosphereHeightSunRadius = {
+            m_atmosphereSettings.ozoneHalfWidthMeters,
+            m_atmosphereSettings.atmosphereHeightMeters,
+            m_atmosphereSettings.sunAngularRadiusRad,
+            0.0f,
+        };
+        std::memcpy(m_sceneCbMapped[m_frameIndex] + sceneOffsetBytes, &sceneCb, sizeof(sceneCb));
+        return sceneCb;
     };
-    const Double3 sunDir = Normalize(m_sunDirection);
-    sceneCb.sunDirIntensity = {
-        static_cast<float>(sunDir.x),
-        static_cast<float>(sunDir.y),
-        static_cast<float>(sunDir.z),
-        m_atmosphereSettings.sunIlluminance,
-    };
-    sceneCb.cameraPosTopRadius = {
-        0.0f,
-        0.0f,
-        0.0f,
-        topRadius,
-    };
-    sceneCb.cameraUpAndTime = {
-        static_cast<float>(cameraUp.x),
-        static_cast<float>(cameraUp.y),
-        static_cast<float>(cameraUp.z),
-        static_cast<float>(GetTickCount64() * 0.001),
-    };
-    sceneCb.viewportAndAerialDepth = {
-        static_cast<float>(m_width),
-        static_cast<float>(m_height),
-        m_aerialPerspectiveDepthMeters,
-        m_atmosphereEnabled ? 1.0f : 0.0f,
-    };
-    sceneCb.atmosphereFlags = {
-        m_multipleScatteringEnabled ? 1.0f : 0.0f,
-        m_atmosphereSettings.miePhaseG,
-        m_atmosphereExposure,
-        0.0f,
-    };
-    sceneCb.rayleighScatteringAndScale = {
-        m_atmosphereSettings.rayleighScattering.x,
-        m_atmosphereSettings.rayleighScattering.y,
-        m_atmosphereSettings.rayleighScattering.z,
-        m_atmosphereSettings.rayleighScaleHeightMeters,
-    };
-    sceneCb.rayleighAbsorptionPad = {
-        m_atmosphereSettings.rayleighAbsorption.x,
-        m_atmosphereSettings.rayleighAbsorption.y,
-        m_atmosphereSettings.rayleighAbsorption.z,
-        0.0f,
-    };
-    sceneCb.mieScatteringAndScale = {
-        m_atmosphereSettings.mieScattering.x,
-        m_atmosphereSettings.mieScattering.y,
-        m_atmosphereSettings.mieScattering.z,
-        m_atmosphereSettings.mieScaleHeightMeters,
-    };
-    sceneCb.mieAbsorptionAndG = {
-        m_atmosphereSettings.mieAbsorption.x,
-        m_atmosphereSettings.mieAbsorption.y,
-        m_atmosphereSettings.mieAbsorption.z,
-        m_atmosphereSettings.miePhaseG,
-    };
-    sceneCb.ozoneAbsorptionAndCenter = {
-        m_atmosphereSettings.ozoneAbsorption.x,
-        m_atmosphereSettings.ozoneAbsorption.y,
-        m_atmosphereSettings.ozoneAbsorption.z,
-        m_atmosphereSettings.ozoneCenterHeightMeters,
-    };
-    sceneCb.ozoneHalfWidthAtmosphereHeightSunRadius = {
-        m_atmosphereSettings.ozoneHalfWidthMeters,
-        m_atmosphereSettings.atmosphereHeightMeters,
-        m_atmosphereSettings.sunAngularRadiusRad,
-        0.0f,
-    };
-    std::memcpy(m_sceneCbMapped[m_frameIndex], &sceneCb, sizeof(sceneCb));
+
+    const SceneConstants worldSceneCb = writeSceneConstants(0, worldFovDegrees, worldNearClipMeters, kWorldFarClipMeters);
+    if (cockpitMode) {
+        writeSceneConstants(
+            m_sceneCbSize,
+            std::clamp(m_cameraSettings.cockpitFovDeg, 30.0f, 110.0f),
+            std::clamp(m_cameraSettings.cockpitNearClipMeters, 0.01f, 10.0f),
+            std::clamp(m_cameraSettings.cockpitFarClipMeters, 10.0f, 5000.0f));
+    }
 
     if (m_satelliteTransitionActive) {
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_satelliteTransitionStart).count();
@@ -1439,14 +1500,16 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         m_satelliteTransitionT = 1.0f;
     }
 
-    const D3D12_GPU_VIRTUAL_ADDRESS sceneCbGpu = m_sceneCb[m_frameIndex]->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS sceneCbGpuBase = m_sceneCb[m_frameIndex]->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS worldSceneCbGpu = sceneCbGpuBase;
+    const D3D12_GPU_VIRTUAL_ADDRESS cockpitSceneCbGpu = sceneCbGpuBase + m_sceneCbSize;
     const D3D12_GPU_VIRTUAL_ADDRESS objectCbGpuBase = m_objectCb[m_frameIndex]->GetGPUVirtualAddress();
 
-    DispatchAtmosphereLuts(m_commandList.Get(), sceneCb);
+    DispatchAtmosphereLuts(m_commandList.Get(), worldSceneCb);
 
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    m_commandList->SetGraphicsRootConstantBufferView(0, sceneCbGpu);
+    m_commandList->SetGraphicsRootConstantBufferView(0, worldSceneCbGpu);
     m_commandList->SetGraphicsRootDescriptorTable(2, GpuSrv(kSrvTableStartIndex));
 
     // Draw skybox first with depth disabled.
@@ -1588,25 +1651,44 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         }
     }
 
-    // Draw plane.
-    {
-        Double3 rightEcef = Normalize(Cross(upEcef, forwardEcef));
-        if (Length(rightEcef) < 1e-6) {
-            rightEcef = {1.0, 0.0, 0.0};
+    const auto drawVehicle = [&]() {
+        const float vehicleScale = cockpitMode ? std::clamp(m_cameraSettings.cockpitModelScale, 0.01f, 100.0f) : 1.0f;
+        Double3 modelRight = rightRolled;
+        Double3 modelUp = upRolled;
+        Double3 modelForward = forwardEcef;
+        Double3 modelOffset = planeLocalD;
+
+        if (cockpitMode) {
+            modelOffset =
+                planeLocalD +
+                rightRolled * static_cast<double>(m_cameraSettings.cockpitModelRightMeters) +
+                upRolled * static_cast<double>(m_cameraSettings.cockpitModelUpMeters) +
+                forwardEcef * static_cast<double>(m_cameraSettings.cockpitModelForwardMeters);
+
+            const double modelYawRad = DirectX::XMConvertToRadians(m_cameraSettings.cockpitModelYawDeg);
+            const double modelPitchRad = DirectX::XMConvertToRadians(m_cameraSettings.cockpitModelPitchDeg);
+            const double modelRollRad = DirectX::XMConvertToRadians(m_cameraSettings.cockpitModelRollDeg);
+
+            if (std::abs(modelYawRad) > 1e-8) {
+                modelForward = Normalize(rotateAroundAxis(modelForward, modelUp, modelYawRad));
+                modelRight = Normalize(rotateAroundAxis(modelRight, modelUp, modelYawRad));
+            }
+            if (std::abs(modelPitchRad) > 1e-8) {
+                modelForward = Normalize(rotateAroundAxis(modelForward, modelRight, modelPitchRad));
+                modelUp = Normalize(rotateAroundAxis(modelUp, modelRight, modelPitchRad));
+            }
+            if (std::abs(modelRollRad) > 1e-8) {
+                modelRight = Normalize(rotateAroundAxis(modelRight, modelForward, modelRollRad));
+                modelUp = Normalize(rotateAroundAxis(modelUp, modelForward, modelRollRad));
+            }
         }
-        Double3 upOrtho = Normalize(Cross(forwardEcef, rightEcef));
 
-        const double c = std::cos(sim.RollRad());
-        const double s = std::sin(sim.RollRad());
-        const Double3 rightRolled = Normalize(rightEcef * c + upOrtho * s);
-        const Double3 upRolled = Normalize(Cross(forwardEcef, rightRolled));
-
-        const DirectX::XMFLOAT3 pos = ToFloat3(planeLocalD);
+        const DirectX::XMFLOAT3 pos = ToFloat3(modelOffset);
 
         const DirectX::XMMATRIX model(
-            static_cast<float>(rightRolled.x), static_cast<float>(rightRolled.y), static_cast<float>(rightRolled.z), 0.0f,
-            static_cast<float>(upRolled.x), static_cast<float>(upRolled.y), static_cast<float>(upRolled.z), 0.0f,
-            static_cast<float>(forwardEcef.x), static_cast<float>(forwardEcef.y), static_cast<float>(forwardEcef.z), 0.0f,
+            static_cast<float>(modelRight.x) * vehicleScale, static_cast<float>(modelRight.y) * vehicleScale, static_cast<float>(modelRight.z) * vehicleScale, 0.0f,
+            static_cast<float>(modelUp.x) * vehicleScale, static_cast<float>(modelUp.y) * vehicleScale, static_cast<float>(modelUp.z) * vehicleScale, 0.0f,
+            static_cast<float>(modelForward.x) * vehicleScale, static_cast<float>(modelForward.y) * vehicleScale, static_cast<float>(modelForward.z) * vehicleScale, 0.0f,
             pos.x, pos.y, pos.z, 1.0f);
 
         ObjectConstants obj{};
@@ -1625,6 +1707,15 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
         m_commandList->SetPipelineState(m_planePso.Get());
         m_planeMesh.Draw(m_commandList.Get());
+    };
+
+    if (!cockpitMode || !m_cameraSettings.renderOnlyCockpitMesh) {
+        drawVehicle();
+    } else {
+        m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        m_commandList->SetGraphicsRootConstantBufferView(0, cockpitSceneCbGpu);
+        drawVehicle();
+        m_commandList->SetGraphicsRootConstantBufferView(0, worldSceneCbGpu);
     }
 
     if (imguiDrawData != nullptr) {
@@ -2331,7 +2422,7 @@ bool D3D12Renderer::CreateConstantBuffers(std::string& error) {
 
         D3D12_RESOURCE_DESC sceneDesc{};
         sceneDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        sceneDesc.Width = m_sceneCbSize;
+        sceneDesc.Width = m_sceneCbSize * 2;
         sceneDesc.Height = 1;
         sceneDesc.DepthOrArraySize = 1;
         sceneDesc.MipLevels = 1;

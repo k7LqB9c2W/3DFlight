@@ -24,6 +24,35 @@ namespace flight {
 
 class D3D12Renderer {
 public:
+    enum class CameraMode {
+        Chase,
+        Cockpit,
+    };
+
+    struct CameraSettings {
+        CameraMode mode = CameraMode::Chase;
+        float chaseDistanceMeters = 250.0f;
+        float cockpitSeatRightMeters = 0.0f;
+        float cockpitSeatUpMeters = 0.0f;
+        float cockpitSeatForwardMeters = 0.0f;
+        float cockpitModelScale = 1.0f;
+        float cockpitModelRightMeters = 0.0f;
+        float cockpitModelUpMeters = 0.0f;
+        float cockpitModelForwardMeters = 0.0f;
+        float cockpitModelYawDeg = 0.0f;
+        float cockpitModelPitchDeg = 0.0f;
+        float cockpitModelRollDeg = 0.0f;
+        float cockpitBaseYawDeg = 0.0f;
+        float cockpitBasePitchDeg = 0.0f;
+        float cockpitLookYawDeg = 0.0f;
+        float cockpitLookPitchDeg = 0.0f;
+        float cockpitFovDeg = 68.0f;
+        float worldNearClipMeters = 2.0f;
+        float cockpitNearClipMeters = 0.03f;
+        float cockpitFarClipMeters = 100.0f;
+        bool renderOnlyCockpitMesh = false;
+    };
+
     struct SatelliteLodTexture {
         const uint8_t* rgbaPixels = nullptr;
         uint32_t width = 0;
@@ -126,6 +155,8 @@ public:
     [[nodiscard]] bool IsMultipleScatteringEnabled() const { return m_multipleScatteringEnabled; }
     void SetAtmosphereExposure(float exposure) { m_atmosphereExposure = exposure; }
     [[nodiscard]] float AtmosphereExposure() const { return m_atmosphereExposure; }
+    void SetCameraSettings(const CameraSettings& settings) { m_cameraSettings = settings; }
+    [[nodiscard]] const CameraSettings& GetCameraSettings() const { return m_cameraSettings; }
     void SetCameraZoomRangeMeters(float minDistance, float maxDistance);
     void AddCameraZoomSteps(float wheelSteps);
     [[nodiscard]] float CameraFollowDistanceMeters() const { return m_cameraFollowDistanceMeters; }
@@ -462,6 +493,7 @@ private:
 
     D3D12_VIEWPORT m_viewport{};
     D3D12_RECT m_scissor{};
+    CameraSettings m_cameraSettings{};
     float m_cameraFollowDistanceMeters = 250.0f;
     float m_cameraMinFollowDistanceMeters = 45.0f;
     float m_cameraMaxFollowDistanceMeters = 3000.0f;
