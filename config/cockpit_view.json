@@ -3,10 +3,10 @@
   "profiles": {
     "737cockpit": {
       "model_scale": 1.0,
-      "model_right_m": 0.0,
-      "model_up_m": 0.0,
-      "model_forward_m": 0.0,
-      "model_yaw_deg": 0.0,
+      "model_right_m": -3.71,
+      "model_up_m": -0.10,
+      "model_forward_m": -1.07,
+      "model_yaw_deg": 180.0,
       "model_pitch_deg": 0.0,
       "model_roll_deg": 0.0,
       "seat_right_m": 0.0,

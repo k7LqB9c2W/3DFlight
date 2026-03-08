@@ -1352,6 +1352,10 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
 
 CockpitViewConfig MakeDefaultCockpitViewConfig() {
     CockpitViewConfig cfg;
+    cfg.modelRightMeters = -3.71f;
+    cfg.modelUpMeters = -0.10f;
+    cfg.modelForwardMeters = -1.07f;
+    cfg.modelYawDeg = 180.0f;
     return cfg;
 }
 
@@ -2886,57 +2890,47 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (VehicleModeIsCockpit(vehicleMode)) {
             ImGui::Begin("Cockpit View");
             bool cockpitConfigChanged = false;
-            if (ImGui::SliderFloat("Model Scale", &cockpitViewConfig.modelScale, 0.05f, 6.0f, "%.2f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Model Right (m)", &cockpitViewConfig.modelRightMeters, -15.0f, 15.0f, "%.2f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Model Up (m)", &cockpitViewConfig.modelUpMeters, -15.0f, 15.0f, "%.2f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Model Forward (m)", &cockpitViewConfig.modelForwardMeters, -15.0f, 15.0f, "%.2f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Model Yaw (deg)", &cockpitViewConfig.modelYawDeg, -180.0f, 180.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Model Pitch (deg)", &cockpitViewConfig.modelPitchDeg, -180.0f, 180.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Model Roll (deg)", &cockpitViewConfig.modelRollDeg, -180.0f, 180.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Seat Right (m)", &cockpitViewConfig.seatRightMeters, -10.0f, 10.0f, "%.2f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Seat Up (m)", &cockpitViewConfig.seatUpMeters, -10.0f, 10.0f, "%.2f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Seat Forward (m)", &cockpitViewConfig.seatForwardMeters, -10.0f, 10.0f, "%.2f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Base Yaw (deg)", &cockpitViewConfig.baseYawDeg, -180.0f, 180.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Base Pitch (deg)", &cockpitViewConfig.basePitchDeg, -89.0f, 89.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("FOV (deg)", &cockpitViewConfig.fovDeg, 30.0f, 110.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Mouse Sensitivity", &cockpitViewConfig.freelookSensitivityDegPerPixel, 0.01f, 0.8f, "%.3f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Max Look Yaw", &cockpitViewConfig.maxLookYawDeg, 5.0f, 179.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Max Look Pitch Up", &cockpitViewConfig.maxLookPitchUpDeg, 5.0f, 89.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
-            if (ImGui::SliderFloat("Max Look Pitch Down", &cockpitViewConfig.maxLookPitchDownDeg, 5.0f, 89.0f, "%.1f")) {
-                cockpitConfigChanged = true;
-            }
+            const auto editFloatWithInput =
+                [&](const char* label, float& value, float minValue, float maxValue, float dragSpeed, const char* format, float step, float stepFast) {
+                    bool changed = false;
+                    ImGui::PushID(label);
+                    changed = ImGui::DragFloat("##drag", &value, dragSpeed, minValue, maxValue, format) || changed;
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(88.0f);
+                    changed = ImGui::InputFloat("##input", &value, step, stepFast, format) || changed;
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(label);
+                    ImGui::PopID();
+                    if (changed) {
+                        cockpitConfigChanged = true;
+                    }
+                };
+
+            editFloatWithInput("Model Scale", cockpitViewConfig.modelScale, 0.05f, 6.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Right (m)", cockpitViewConfig.modelRightMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Up (m)", cockpitViewConfig.modelUpMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Forward (m)", cockpitViewConfig.modelForwardMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Yaw (deg)", cockpitViewConfig.modelYawDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Model Pitch (deg)", cockpitViewConfig.modelPitchDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Model Roll (deg)", cockpitViewConfig.modelRollDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Seat Right (m)", cockpitViewConfig.seatRightMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Seat Up (m)", cockpitViewConfig.seatUpMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Seat Forward (m)", cockpitViewConfig.seatForwardMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Base Yaw (deg)", cockpitViewConfig.baseYawDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Base Pitch (deg)", cockpitViewConfig.basePitchDeg, -89.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("FOV (deg)", cockpitViewConfig.fovDeg, 30.0f, 110.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput(
+                "Mouse Sensitivity",
+                cockpitViewConfig.freelookSensitivityDegPerPixel,
+                0.01f,
+                0.8f,
+                0.005f,
+                "%.3f",
+                0.01f,
+                0.05f);
+            editFloatWithInput("Max Look Yaw", cockpitViewConfig.maxLookYawDeg, 5.0f, 179.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Max Look Pitch Up", cockpitViewConfig.maxLookPitchUpDeg, 5.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Max Look Pitch Down", cockpitViewConfig.maxLookPitchDownDeg, 5.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
 
             if (cockpitConfigChanged) {
                 SanitizeCockpitViewConfig(cockpitViewConfig);
