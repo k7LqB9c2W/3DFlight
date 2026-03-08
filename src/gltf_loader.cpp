@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 
 #include <windows.h>
 #include <wincodec.h>
@@ -20,6 +21,142 @@ DirectX::XMFLOAT3 ToFloat3(const std::array<float, 3>& v) {
 
 DirectX::XMFLOAT2 ToFloat2(const std::array<float, 2>& v) {
     return {v[0], v[1]};
+}
+
+std::array<float, 3> TransformPoint(const float* matrix, const std::array<float, 3>& v) {
+    if (matrix == nullptr) {
+        return v;
+    }
+
+    return {
+        matrix[0] * v[0] + matrix[4] * v[1] + matrix[8] * v[2] + matrix[12],
+        matrix[1] * v[0] + matrix[5] * v[1] + matrix[9] * v[2] + matrix[13],
+        matrix[2] * v[0] + matrix[6] * v[1] + matrix[10] * v[2] + matrix[14],
+    };
+}
+
+std::array<float, 3> TransformDirection(const float* matrix, const std::array<float, 3>& v) {
+    if (matrix == nullptr) {
+        return v;
+    }
+
+    return {
+        matrix[0] * v[0] + matrix[4] * v[1] + matrix[8] * v[2],
+        matrix[1] * v[0] + matrix[5] * v[1] + matrix[9] * v[2],
+        matrix[2] * v[0] + matrix[6] * v[1] + matrix[10] * v[2],
+    };
+}
+
+struct MaterialBakeInfo {
+    DirectX::XMFLOAT4 colorFactor{1.0f, 1.0f, 1.0f, 1.0f};
+    const GlbMaterialTexture* texture = nullptr;
+};
+
+DirectX::XMFLOAT4 SampleMaterialTexture(const GlbMaterialTexture& texture, const DirectX::XMFLOAT2& uv);
+
+bool AppendPrimitive(
+    const cgltf_primitive& primitive,
+    const float* worldMatrix,
+    const MaterialBakeInfo* bakeInfo,
+    MeshData& outMesh,
+    bool& anyMissingNormals,
+    std::string& error) {
+    if (primitive.type != cgltf_primitive_type_triangles) {
+        return true;
+    }
+
+    const cgltf_accessor* posAccessor = nullptr;
+    const cgltf_accessor* normalAccessor = nullptr;
+    const cgltf_accessor* uvAccessor = nullptr;
+
+    for (cgltf_size i = 0; i < primitive.attributes_count; ++i) {
+        const cgltf_attribute& attr = primitive.attributes[i];
+        switch (attr.type) {
+            case cgltf_attribute_type_position:
+                posAccessor = attr.data;
+                break;
+            case cgltf_attribute_type_normal:
+                normalAccessor = attr.data;
+                break;
+            case cgltf_attribute_type_texcoord:
+                if (attr.index == 0) {
+                    uvAccessor = attr.data;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (posAccessor == nullptr) {
+        error = "A triangle primitive is missing POSITION data";
+        return false;
+    }
+
+    const size_t baseVertex = outMesh.vertices.size();
+    const size_t vertexCount = static_cast<size_t>(posAccessor->count);
+    outMesh.vertices.resize(baseVertex + vertexCount);
+
+    for (size_t i = 0; i < vertexCount; ++i) {
+        std::array<float, 3> pos{};
+        cgltf_accessor_read_float(posAccessor, i, pos.data(), 3);
+        pos = TransformPoint(worldMatrix, pos);
+        outMesh.vertices[baseVertex + i].position = ToFloat3(pos);
+
+        if (normalAccessor != nullptr) {
+            std::array<float, 3> nrm{};
+            cgltf_accessor_read_float(normalAccessor, i, nrm.data(), 3);
+            nrm = TransformDirection(worldMatrix, nrm);
+            DirectX::XMFLOAT3 normal = ToFloat3(nrm);
+            const DirectX::XMVECTOR normalVec = DirectX::XMVector3Normalize(DirectX::XMLoadFloat3(&normal));
+            DirectX::XMStoreFloat3(&outMesh.vertices[baseVertex + i].normal, normalVec);
+        } else {
+            outMesh.vertices[baseVertex + i].normal = {0.0f, 1.0f, 0.0f};
+            anyMissingNormals = true;
+        }
+
+        if (uvAccessor != nullptr) {
+            std::array<float, 2> uv{};
+            cgltf_accessor_read_float(uvAccessor, i, uv.data(), 2);
+            outMesh.vertices[baseVertex + i].uv = ToFloat2(uv);
+        } else {
+            outMesh.vertices[baseVertex + i].uv = {0.0f, 0.0f};
+        }
+
+        DirectX::XMFLOAT4 vertexColor{1.0f, 1.0f, 1.0f, 1.0f};
+        if (bakeInfo != nullptr) {
+            vertexColor = bakeInfo->colorFactor;
+            if (bakeInfo->texture != nullptr) {
+                const DirectX::XMFLOAT4 sampled = SampleMaterialTexture(*bakeInfo->texture, outMesh.vertices[baseVertex + i].uv);
+                vertexColor.x *= sampled.x;
+                vertexColor.y *= sampled.y;
+                vertexColor.z *= sampled.z;
+                vertexColor.w *= sampled.w;
+            }
+        }
+        outMesh.vertices[baseVertex + i].color = vertexColor;
+    }
+
+    const size_t indexBase = outMesh.indices.size();
+    if (primitive.indices != nullptr) {
+        const size_t indexCount = static_cast<size_t>(primitive.indices->count);
+        outMesh.indices.resize(indexBase + indexCount);
+        for (size_t i = 0; i < indexCount; ++i) {
+            outMesh.indices[indexBase + i] = static_cast<uint32_t>(baseVertex + cgltf_accessor_read_index(primitive.indices, i));
+        }
+    } else {
+        outMesh.indices.resize(indexBase + vertexCount);
+        for (size_t i = 0; i < vertexCount; ++i) {
+            outMesh.indices[indexBase + i] = static_cast<uint32_t>(baseVertex + i);
+        }
+    }
+
+    // GLTF is right-handed. Flip triangle winding for D3D12's left-handed setup.
+    for (size_t i = indexBase; i + 2 < outMesh.indices.size(); i += 3) {
+        std::swap(outMesh.indices[i + 1], outMesh.indices[i + 2]);
+    }
+
+    return true;
 }
 
 void ComputeNormals(MeshData& mesh) {
@@ -217,6 +354,72 @@ bool DecodeImageMemoryToRgba(
     return DecodeImageFromWicDecoder(decoder.Get(), outPixels, outWidth, outHeight);
 }
 
+DirectX::XMFLOAT4 SampleMaterialTexture(const GlbMaterialTexture& texture, const DirectX::XMFLOAT2& uv) {
+    if (!texture.IsValid()) {
+        return {1.0f, 1.0f, 1.0f, 1.0f};
+    }
+
+    const float uWrapped = uv.x - std::floor(uv.x);
+    const float vWrapped = uv.y - std::floor(uv.y);
+    const uint32_t x = std::min(
+        texture.width - 1,
+        static_cast<uint32_t>(std::floor(uWrapped * static_cast<float>(texture.width))));
+    const uint32_t y = std::min(
+        texture.height - 1,
+        static_cast<uint32_t>(std::floor(vWrapped * static_cast<float>(texture.height))));
+    const size_t texel = (static_cast<size_t>(y) * static_cast<size_t>(texture.width) + static_cast<size_t>(x)) * 4ull;
+    return {
+        texture.rgbaPixels[texel + 0] / 255.0f,
+        texture.rgbaPixels[texel + 1] / 255.0f,
+        texture.rgbaPixels[texel + 2] / 255.0f,
+        texture.rgbaPixels[texel + 3] / 255.0f,
+    };
+}
+
+MaterialBakeInfo ResolveMaterialBakeInfo(
+    const cgltf_primitive& primitive,
+    const std::filesystem::path& glbPath,
+    std::unordered_map<const cgltf_image*, GlbMaterialTexture>& imageCache) {
+    MaterialBakeInfo info{};
+    if (primitive.material == nullptr) {
+        return info;
+    }
+
+    const cgltf_material* material = primitive.material;
+    const auto& pbr = material->pbr_metallic_roughness;
+    info.colorFactor = {
+        pbr.base_color_factor[0],
+        pbr.base_color_factor[1],
+        pbr.base_color_factor[2],
+        pbr.base_color_factor[3],
+    };
+
+    const cgltf_texture* baseTex = pbr.base_color_texture.texture;
+    if (baseTex == nullptr || baseTex->image == nullptr) {
+        return info;
+    }
+
+    const cgltf_image* image = baseTex->image;
+    auto it = imageCache.find(image);
+    if (it == imageCache.end()) {
+        GlbMaterialTexture decoded{};
+        if (image->buffer_view != nullptr && image->buffer_view->buffer != nullptr && image->buffer_view->buffer->data != nullptr) {
+            const cgltf_buffer_view* view = image->buffer_view;
+            const uint8_t* raw = static_cast<const uint8_t*>(view->buffer->data) + view->offset;
+            (void)DecodeImageMemoryToRgba(raw, static_cast<size_t>(view->size), decoded.rgbaPixels, decoded.width, decoded.height);
+        } else if (image->uri != nullptr && image->uri[0] != '\0') {
+            const std::filesystem::path uriPath = glbPath.parent_path() / image->uri;
+            (void)DecodeImageFileToRgba(uriPath, decoded.rgbaPixels, decoded.width, decoded.height);
+        }
+        it = imageCache.emplace(image, std::move(decoded)).first;
+    }
+
+    if (it->second.IsValid()) {
+        info.texture = &it->second;
+    }
+    return info;
+}
+
 bool LoadPrimitiveBaseColorTexture(
     const cgltf_primitive* primitive,
     const std::filesystem::path& glbPath,
@@ -264,6 +467,7 @@ bool LoadGlbMesh(
     const std::filesystem::path& glbPath,
     MeshData& outMesh,
     GlbMaterialTexture& outBaseColorTexture,
+    bool bakeMaterialColor,
     std::string& error) {
     outMesh = {};
     outBaseColorTexture = {};
@@ -290,102 +494,69 @@ bool LoadGlbMesh(
         return false;
     }
 
-    const cgltf_primitive* primitive = nullptr;
-    for (cgltf_size m = 0; m < data->meshes_count && primitive == nullptr; ++m) {
-        const cgltf_mesh& mesh = data->meshes[m];
-        if (mesh.primitives_count > 0) {
-            primitive = &mesh.primitives[0];
+    bool appendedAny = false;
+    bool anyMissingNormals = false;
+    std::unordered_map<const cgltf_image*, GlbMaterialTexture> imageCache;
+
+    for (cgltf_size nodeIndex = 0; nodeIndex < data->nodes_count; ++nodeIndex) {
+        const cgltf_node& node = data->nodes[nodeIndex];
+        if (node.mesh == nullptr) {
+            continue;
+        }
+
+        float worldMatrix[16]{};
+        cgltf_node_transform_world(&node, worldMatrix);
+        for (cgltf_size primitiveIndex = 0; primitiveIndex < node.mesh->primitives_count; ++primitiveIndex) {
+            const cgltf_primitive& primitive = node.mesh->primitives[primitiveIndex];
+            MaterialBakeInfo bakeInfo{};
+            const MaterialBakeInfo* bakeInfoPtr = nullptr;
+            if (bakeMaterialColor) {
+                bakeInfo = ResolveMaterialBakeInfo(primitive, glbPath, imageCache);
+                bakeInfoPtr = &bakeInfo;
+            } else if (!outBaseColorTexture.IsValid()) {
+                (void)LoadPrimitiveBaseColorTexture(&primitive, glbPath, outBaseColorTexture);
+            }
+            if (!AppendPrimitive(primitive, worldMatrix, bakeInfoPtr, outMesh, anyMissingNormals, error)) {
+                cgltf_free(data);
+                return false;
+            }
+            if (primitive.type == cgltf_primitive_type_triangles) {
+                appendedAny = true;
+            }
         }
     }
 
-    if (primitive == nullptr) {
-        cgltf_free(data);
-        error = "No primitive found in GLB";
-        return false;
-    }
-
-    if (primitive->type != cgltf_primitive_type_triangles) {
-        cgltf_free(data);
-        error = "Only triangle primitives are supported";
-        return false;
-    }
-
-    // Texture extraction is best-effort; mesh loading should still succeed if texture decode fails.
-    (void)LoadPrimitiveBaseColorTexture(primitive, glbPath, outBaseColorTexture);
-
-    const cgltf_accessor* posAccessor = nullptr;
-    const cgltf_accessor* normalAccessor = nullptr;
-    const cgltf_accessor* uvAccessor = nullptr;
-
-    for (cgltf_size i = 0; i < primitive->attributes_count; ++i) {
-        const cgltf_attribute& attr = primitive->attributes[i];
-        switch (attr.type) {
-            case cgltf_attribute_type_position:
-                posAccessor = attr.data;
-                break;
-            case cgltf_attribute_type_normal:
-                normalAccessor = attr.data;
-                break;
-            case cgltf_attribute_type_texcoord:
-                if (attr.index == 0) {
-                    uvAccessor = attr.data;
+    if (!appendedAny) {
+        for (cgltf_size meshIndex = 0; meshIndex < data->meshes_count; ++meshIndex) {
+            const cgltf_mesh& mesh = data->meshes[meshIndex];
+            for (cgltf_size primitiveIndex = 0; primitiveIndex < mesh.primitives_count; ++primitiveIndex) {
+                const cgltf_primitive& primitive = mesh.primitives[primitiveIndex];
+                MaterialBakeInfo bakeInfo{};
+                const MaterialBakeInfo* bakeInfoPtr = nullptr;
+                if (bakeMaterialColor) {
+                    bakeInfo = ResolveMaterialBakeInfo(primitive, glbPath, imageCache);
+                    bakeInfoPtr = &bakeInfo;
+                } else if (!outBaseColorTexture.IsValid()) {
+                    (void)LoadPrimitiveBaseColorTexture(&primitive, glbPath, outBaseColorTexture);
                 }
-                break;
-            default:
-                break;
+                if (!AppendPrimitive(primitive, nullptr, bakeInfoPtr, outMesh, anyMissingNormals, error)) {
+                    cgltf_free(data);
+                    return false;
+                }
+                if (primitive.type == cgltf_primitive_type_triangles) {
+                    appendedAny = true;
+                }
+            }
         }
     }
 
-    if (posAccessor == nullptr) {
+    if (!appendedAny) {
         cgltf_free(data);
-        error = "No POSITION accessor found";
+        error = "No triangle primitives found in GLB";
         return false;
     }
 
-    const size_t vertexCount = static_cast<size_t>(posAccessor->count);
-    outMesh.vertices.resize(vertexCount);
-
-    for (size_t i = 0; i < vertexCount; ++i) {
-        std::array<float, 3> pos{};
-        cgltf_accessor_read_float(posAccessor, i, pos.data(), 3);
-        outMesh.vertices[i].position = ToFloat3(pos);
-
-        if (normalAccessor != nullptr) {
-            std::array<float, 3> nrm{};
-            cgltf_accessor_read_float(normalAccessor, i, nrm.data(), 3);
-            outMesh.vertices[i].normal = ToFloat3(nrm);
-        } else {
-            outMesh.vertices[i].normal = {0.0f, 1.0f, 0.0f};
-        }
-
-        if (uvAccessor != nullptr) {
-            std::array<float, 2> uv{};
-            cgltf_accessor_read_float(uvAccessor, i, uv.data(), 2);
-            outMesh.vertices[i].uv = ToFloat2(uv);
-        } else {
-            outMesh.vertices[i].uv = {0.0f, 0.0f};
-        }
-    }
-
-    if (primitive->indices != nullptr) {
-        const size_t indexCount = static_cast<size_t>(primitive->indices->count);
-        outMesh.indices.resize(indexCount);
-        for (size_t i = 0; i < indexCount; ++i) {
-            outMesh.indices[i] = static_cast<uint32_t>(cgltf_accessor_read_index(primitive->indices, i));
-        }
-    } else {
-        outMesh.indices.resize(vertexCount);
-        for (size_t i = 0; i < vertexCount; ++i) {
-            outMesh.indices[i] = static_cast<uint32_t>(i);
-        }
-    }
-
-    // GLTF is right-handed. Flip triangle winding for D3D12's left-handed setup.
-    for (size_t i = 0; i + 2 < outMesh.indices.size(); i += 3) {
-        std::swap(outMesh.indices[i + 1], outMesh.indices[i + 2]);
-    }
-
-    if (normalAccessor == nullptr) {
+    if (anyMissingNormals) {
         ComputeNormals(outMesh);
     }
 
@@ -403,7 +574,15 @@ bool LoadGlbMesh(
 
 bool LoadGlbMesh(const std::filesystem::path& glbPath, MeshData& outMesh, std::string& error) {
     GlbMaterialTexture ignoredTexture;
-    return LoadGlbMesh(glbPath, outMesh, ignoredTexture, error);
+    return LoadGlbMesh(glbPath, outMesh, ignoredTexture, false, error);
+}
+
+bool LoadGlbMesh(
+    const std::filesystem::path& glbPath,
+    MeshData& outMesh,
+    GlbMaterialTexture& outBaseColorTexture,
+    std::string& error) {
+    return LoadGlbMesh(glbPath, outMesh, outBaseColorTexture, false, error);
 }
 
 } // namespace flight

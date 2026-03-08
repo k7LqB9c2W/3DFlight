@@ -81,6 +81,7 @@ public:
         float specularStrength = 0.14f;
         float lodSeamBlendStrength = 0.20f;
         bool satelliteEnabled = true;
+        bool streamedSatelliteEnabled = true;
         float satelliteBlend = 1.0f;
     };
 
@@ -116,6 +117,9 @@ public:
     void SetRenderOldEarthSphere(bool enabled) { m_renderOldEarthSphere = enabled; }
     [[nodiscard]] bool IsRenderOldEarthSphereEnabled() const { return m_renderOldEarthSphere; }
     [[nodiscard]] bool HasLandmask() const { return m_hasLandmaskTexture; }
+    [[nodiscard]] uint64_t LandmaskImGuiTextureHandle() const {
+        return (m_srvHeap && m_landmaskTexture) ? GpuSrv(kLandmaskSrvIndex).ptr : 0ull;
+    }
     void SetAtmosphereEnabled(bool enabled) { m_atmosphereEnabled = enabled; }
     [[nodiscard]] bool IsAtmosphereEnabled() const { return m_atmosphereEnabled; }
     void SetMultipleScatteringEnabled(bool enabled) { m_multipleScatteringEnabled = enabled; }

@@ -23,6 +23,7 @@ struct VSInput
     float3 position : POSITION;
     float3 normal : NORMAL;
     float2 uv : TEXCOORD0;
+    float4 color : COLOR0;
 };
 
 struct VSOutput
@@ -31,6 +32,7 @@ struct VSOutput
     float3 worldPos : TEXCOORD0;
     float3 normalWS : TEXCOORD1;
     float2 uv : TEXCOORD2;
+    float4 color : TEXCOORD3;
 };
 
 VSOutput VSMain(VSInput input)
@@ -41,6 +43,7 @@ VSOutput VSMain(VSInput input)
     o.worldPos = worldPos.xyz;
     o.normalWS = normalize(mul(float4(input.normal, 0.0), gModel).xyz);
     o.uv = input.uv;
+    o.color = input.color;
     return o;
 }
 
@@ -60,7 +63,7 @@ float4 PSMain(VSOutput input) : SV_Target
     float ambient = lerp(0.08, 0.25, hemi);
     float diffuse = 0.85 * ndl;
 
-    float3 baseColor = gColorAndFlags.rgb;
+    float3 baseColor = gColorAndFlags.rgb * input.color.rgb;
     if (gColorAndFlags.w > 0.5)
     {
         float3 albedo = gModelAlbedo.Sample(gWrapSampler, input.uv).rgb;

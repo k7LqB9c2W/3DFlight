@@ -587,40 +587,185 @@ double ToDisplaySpeed(double metersPerSecond, bool useImperialUnits) {
     return useImperialUnits ? (metersPerSecond * kMetersPerSecondToMph) : metersPerSecond;
 }
 
-const char* kCityPresetItems = "San Diego\0San Francisco\0Los Angeles\0";
+double NormalizeHeadingDeg360(double headingDeg) {
+    double wrapped = std::fmod(headingDeg, 360.0);
+    if (wrapped < 0.0) {
+        wrapped += 360.0;
+    }
+    return wrapped;
+}
+
+const char* HeadingCardinalName(double headingDeg) {
+    static constexpr std::array<const char*, 8> kDirections = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    const double normalized = NormalizeHeadingDeg360(headingDeg);
+    const size_t index = static_cast<size_t>(std::llround(normalized / 45.0)) % kDirections.size();
+    return kDirections[index];
+}
+
+ImVec2 WorldMapLonLatToScreen(const ImVec2& mapMin, const ImVec2& mapMax, double latDeg, double lonDeg) {
+    const float x = static_cast<float>((WrapLonDeg(lonDeg) + 180.0) / 360.0);
+    const float y = static_cast<float>((90.0 - std::clamp(latDeg, -90.0, 90.0)) / 180.0);
+    return {
+        mapMin.x + (mapMax.x - mapMin.x) * x,
+        mapMin.y + (mapMax.y - mapMin.y) * y,
+    };
+}
+
+void DrawWorldMapGrid(ImDrawList* drawList, const ImVec2& mapMin, const ImVec2& mapMax) {
+    if (drawList == nullptr) {
+        return;
+    }
+
+    constexpr ImU32 kMajorGridColor = IM_COL32(255, 255, 255, 44);
+    constexpr ImU32 kEquatorColor = IM_COL32(255, 255, 255, 72);
+    constexpr ImU32 kPrimeMeridianColor = IM_COL32(255, 255, 255, 72);
+
+    for (int lon = -120; lon <= 120; lon += 60) {
+        const ImVec2 a = WorldMapLonLatToScreen(mapMin, mapMax, -90.0, static_cast<double>(lon));
+        const ImVec2 b = WorldMapLonLatToScreen(mapMin, mapMax, 90.0, static_cast<double>(lon));
+        drawList->AddLine(a, b, lon == 0 ? kPrimeMeridianColor : kMajorGridColor, 1.0f);
+    }
+
+    for (int lat = -60; lat <= 60; lat += 30) {
+        const ImVec2 a = WorldMapLonLatToScreen(mapMin, mapMax, static_cast<double>(lat), -180.0);
+        const ImVec2 b = WorldMapLonLatToScreen(mapMin, mapMax, static_cast<double>(lat), 180.0);
+        drawList->AddLine(a, b, lat == 0 ? kEquatorColor : kMajorGridColor, 1.0f);
+    }
+}
+
+void DrawWorldMapMarker(ImDrawList* drawList, const ImVec2& mapMin, const ImVec2& mapMax, double latDeg, double lonDeg, double headingDeg) {
+    if (drawList == nullptr) {
+        return;
+    }
+
+    const ImVec2 center = WorldMapLonLatToScreen(mapMin, mapMax, latDeg, lonDeg);
+    const float mapSpan = std::min(mapMax.x - mapMin.x, mapMax.y - mapMin.y);
+    const float markerRadius = std::clamp(mapSpan * 0.018f, 4.0f, 8.0f);
+    const float arrowLength = std::clamp(mapSpan * 0.09f, 16.0f, 30.0f);
+    const float arrowWidth = arrowLength * 0.42f;
+
+    const double headingRad = flight::DegToRad(NormalizeHeadingDeg360(headingDeg));
+    const float dirX = static_cast<float>(std::sin(headingRad));
+    const float dirY = static_cast<float>(-std::cos(headingRad));
+    const float perpX = -dirY;
+    const float perpY = dirX;
+
+    const ImVec2 nose = {center.x + dirX * arrowLength, center.y + dirY * arrowLength};
+    const ImVec2 left = {
+        center.x - dirX * (arrowLength * 0.48f) + perpX * arrowWidth,
+        center.y - dirY * (arrowLength * 0.48f) + perpY * arrowWidth,
+    };
+    const ImVec2 right = {
+        center.x - dirX * (arrowLength * 0.48f) - perpX * arrowWidth,
+        center.y - dirY * (arrowLength * 0.48f) - perpY * arrowWidth,
+    };
+
+    drawList->AddCircleFilled(center, markerRadius + 2.0f, IM_COL32(0, 0, 0, 170), 24);
+    drawList->AddTriangleFilled(nose, left, right, IM_COL32(255, 184, 77, 235));
+    drawList->AddTriangle(nose, left, right, IM_COL32(24, 24, 24, 255), 2.0f);
+    drawList->AddCircle(center, markerRadius + 2.0f, IM_COL32(255, 255, 255, 190), 24, 1.5f);
+}
+
+constexpr int kCityPresetSanFrancisco = 0;
+constexpr int kCityPresetLosAngeles = 1;
+constexpr int kCityPresetSanDiego = 2;
+constexpr int kCityPresetNewYorkCity = 3;
+constexpr int kCityPresetChicago = 4;
+constexpr int kCityPresetWashingtonDc = 5;
+constexpr int kCityPresetYosemite = 6;
+constexpr int kCityPresetYellowstone = 7;
+constexpr int kCityPresetGrandCanyon = 8;
+constexpr int kCityPresetZion = 9;
+constexpr int kCityPresetGreatSmokyMountains = 10;
+constexpr int kCityPresetRockyMountain = 11;
+const char* kCityPresetItems =
+    "San Francisco\0"
+    "Los Angeles\0"
+    "San Diego\0"
+    "New York City\0"
+    "Chicago\0"
+    "Washington, D.C.\0"
+    "Yosemite National Park\0"
+    "Yellowstone National Park\0"
+    "Grand Canyon National Park\0"
+    "Zion National Park\0"
+    "Great Smoky Mountains National Park\0"
+    "Rocky Mountain National Park\0";
 
 void CityPresetLatLon(int index, double& outLatDeg, double& outLonDeg) {
     switch (index) {
-        case 0: // San Diego
-            outLatDeg = 32.7157;
-            outLonDeg = -117.1611;
-            break;
-        case 1: // San Francisco
+        case kCityPresetSanFrancisco:
             outLatDeg = 37.7749;
             outLonDeg = -122.4194;
             break;
-        case 2: // Los Angeles
-        default:
+        case kCityPresetLosAngeles:
             outLatDeg = 34.0522;
             outLonDeg = -118.2437;
+            break;
+        case kCityPresetSanDiego:
+            outLatDeg = 32.7157;
+            outLonDeg = -117.1611;
+            break;
+        case kCityPresetNewYorkCity:
+            outLatDeg = 40.7128;
+            outLonDeg = -74.0060;
+            break;
+        case kCityPresetChicago:
+            outLatDeg = 41.8781;
+            outLonDeg = -87.6298;
+            break;
+        case kCityPresetWashingtonDc:
+            outLatDeg = 38.9072;
+            outLonDeg = -77.0369;
+            break;
+        case kCityPresetYosemite:
+            outLatDeg = 37.8651;
+            outLonDeg = -119.5383;
+            break;
+        case kCityPresetYellowstone:
+            outLatDeg = 44.4280;
+            outLonDeg = -110.5885;
+            break;
+        case kCityPresetGrandCanyon:
+            outLatDeg = 36.1069;
+            outLonDeg = -112.1129;
+            break;
+        case kCityPresetZion:
+            outLatDeg = 37.2982;
+            outLonDeg = -113.0263;
+            break;
+        case kCityPresetGreatSmokyMountains:
+            outLatDeg = 35.6532;
+            outLonDeg = -83.5070;
+            break;
+        case kCityPresetRockyMountain:
+            outLatDeg = 40.3428;
+            outLonDeg = -105.6836;
+            break;
+        default:
+            outLatDeg = 41.8781;
+            outLonDeg = -87.6298;
             break;
     }
 }
 
 enum class VehicleMode {
     Airplane = 0,
-    F35 = 1,
-    B2 = 2,
-    Missile = 3,
+    A320 = 1,
+    F35 = 2,
+    B2 = 3,
+    Missile = 4,
 };
 
-constexpr size_t kVehicleModeCount = 4;
-const char* kVehicleModeComboItems = "Airplane\0F-35 Lightning II\0B-2 Spirit\0AIM-120D Missile\0";
+constexpr size_t kVehicleModeCount = 5;
+const char* kVehicleModeComboItems = "Airplane\0A320-200\0F-35 Lightning II\0B-2 Spirit\0AIM-120D Missile\0";
 
 const char* VehicleModeDisplayName(VehicleMode mode) {
     switch (mode) {
         case VehicleMode::Airplane:
             return "Airplane";
+        case VehicleMode::A320:
+            return "A320-200";
         case VehicleMode::F35:
             return "F-35";
         case VehicleMode::B2:
@@ -640,10 +785,12 @@ size_t VehicleModeToIndex(VehicleMode mode) {
 VehicleMode VehicleModeFromIndex(int index) {
     switch (index) {
         case 1:
-            return VehicleMode::F35;
+            return VehicleMode::A320;
         case 2:
-            return VehicleMode::B2;
+            return VehicleMode::F35;
         case 3:
+            return VehicleMode::B2;
+        case 4:
             return VehicleMode::Missile;
         case 0:
         default:
@@ -846,6 +993,7 @@ struct GraphicsTuningConfig {
     float aerialPerspectiveDepthMeters = 180000.0f;
 
     bool satelliteEnabled = true;
+    bool streamedSatelliteEnabled = true;
     float satelliteBlend = 1.0f;
     bool worldLockedSatelliteEnabled = true;
 };
@@ -951,6 +1099,7 @@ void ApplyGraphicsTuning(
     visual.specularStrength = cfg.specularStrength;
     visual.lodSeamBlendStrength = cfg.lodSeamBlendStrength;
     visual.satelliteEnabled = cfg.satelliteEnabled;
+    visual.streamedSatelliteEnabled = cfg.streamedSatelliteEnabled;
     visual.satelliteBlend = cfg.satelliteBlend;
     renderer.SetTerrainVisualSettings(visual);
     renderer.SetWorldLockedSatelliteEnabled(cfg.worldLockedSatelliteEnabled);
@@ -1008,6 +1157,7 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
     readFloat("lod_seam_blend_strength", outCfg.lodSeamBlendStrength);
     readFloat("aerial_perspective_depth_m", outCfg.aerialPerspectiveDepthMeters);
     readBool("satellite_enabled", outCfg.satelliteEnabled);
+    readBool("streamed_satellite_enabled", outCfg.streamedSatelliteEnabled);
     readFloat("satellite_blend", outCfg.satelliteBlend);
     readBool("world_locked_satellite_enabled", outCfg.worldLockedSatelliteEnabled);
 
@@ -1031,6 +1181,9 @@ bool LoadGraphicsTuningConfig(const std::filesystem::path& path, GraphicsTuningC
     if (version < 7) {
         // v7 promotes world-locked streaming as the stable default, overriding legacy ring-mode profiles.
         outCfg.worldLockedSatelliteEnabled = true;
+    }
+    if (version < 8) {
+        outCfg.streamedSatelliteEnabled = true;
     }
 
     SanitizeGraphicsTuning(outCfg);
@@ -1071,9 +1224,10 @@ bool SaveGraphicsTuningConfig(const std::filesystem::path& path, const GraphicsT
     j["lod_seam_blend_strength"] = cfg.lodSeamBlendStrength;
     j["aerial_perspective_depth_m"] = cfg.aerialPerspectiveDepthMeters;
     j["satellite_enabled"] = cfg.satelliteEnabled;
+    j["streamed_satellite_enabled"] = cfg.streamedSatelliteEnabled;
     j["satellite_blend"] = cfg.satelliteBlend;
     j["world_locked_satellite_enabled"] = cfg.worldLockedSatelliteEnabled;
-    j["config_version"] = 7;
+    j["config_version"] = 8;
 
     out << j.dump(2) << "\n";
     return true;
@@ -1141,14 +1295,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         };
     };
     auto configureAircraftAsset =
-        [&](VehicleMode mode, const std::filesystem::path& path, float scale, float minZoomMeters, const VehicleAxisTransform& axisTransform) {
+        [&](VehicleMode mode,
+            const std::filesystem::path& path,
+            float scale,
+            float minZoomMeters,
+            const VehicleAxisTransform& axisTransform,
+            bool bakeMaterialColor = false) {
             auto& asset = vehicleAssets[VehicleModeToIndex(mode)];
             asset.minZoomMeters = minZoomMeters;
 
             std::string loadError;
-            const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, loadError);
+            const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, bakeMaterialColor, loadError);
             if (!loaded) {
                 asset.mesh = flight::CreatePlaceholderPlane();
+            }
+            if (bakeMaterialColor) {
+                asset.texture = {};
             }
 
             // Imported aircraft do not share one local basis. Apply a per-model remap before upload.
@@ -1204,6 +1366,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     };
 
     constexpr VehicleAxisTransform kAirplaneAxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}};
+    constexpr VehicleAxisTransform kA320AxisTransform = {{{0.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f}}};
     constexpr VehicleAxisTransform kF35AxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, -1.0f, 0.0f}}};
     constexpr VehicleAxisTransform kB2AxisTransform = {{{0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f}}};
 
@@ -1213,6 +1376,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         1.0f,
         45.0f,
         kAirplaneAxisTransform);
+    configureAircraftAsset(
+        VehicleMode::A320,
+        std::filesystem::path("assets") / "models" / "A320-200.glb",
+        1.0f,
+        75.0f,
+        kA320AxisTransform,
+        true);
     configureAircraftAsset(
         VehicleMode::F35,
         std::filesystem::path("assets") / "models" / "F35.glb",
@@ -1245,6 +1415,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     FlightSim sim;
     FlightSim missileViewSim;
     FlightStart editableStart = sim.GetStart();
+    int startCityPresetIndex = kCityPresetSanFrancisco;
     VehicleMode vehicleMode = VehicleMode::Airplane;
     VehicleMode appliedRenderMode = VehicleMode::Airplane;
     MissileAutopilotState missileState{};
@@ -1255,8 +1426,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     missileState.targetLonDeg = WrapLonDeg(editableStart.longitudeDeg + 0.55);
     missileState.targetAltMeters = std::max(0.0, editableStart.altitudeMeters * 0.25);
     PrepareMissileAtLaunch(missileState);
-    int launchCityPresetIndex = 1;
-    int targetCityPresetIndex = 2;
+    int launchCityPresetIndex = kCityPresetSanFrancisco;
+    int targetCityPresetIndex = kCityPresetLosAngeles;
     float simTimeScale = 1.0f;
     bool useImperialUnits = false;
     float localSolarTimeHours = 14.0f;
@@ -1513,7 +1684,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     };
     applyVehicleZoomRange(vehicleMode);
 
-    if (satelliteStreamerReady) {
+    if (satelliteStreamerReady && graphicsTuning.streamedSatelliteEnabled) {
         if (!renderer.IsWorldLockedSatelliteEnabled()) {
             satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
             const auto preloadStart = std::chrono::steady_clock::now();
@@ -1536,6 +1707,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         } else {
             satelliteRuntimeStatus = "World-locked mode active: world tile scheduler owns prefetch";
         }
+    } else if (satelliteStreamerReady) {
+        satelliteRuntimeStatus = "Streamed satellite imagery disabled; using fallback texture only";
     }
 
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -1643,7 +1816,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         if (satelliteStreamerReady) {
-            const bool useLegacyRingCompose = !renderer.IsWorldLockedSatelliteEnabled();
+            const bool streamedSatelliteEnabled = graphicsTuning.streamedSatelliteEnabled;
+            const bool useLegacyRingCompose = streamedSatelliteEnabled && !renderer.IsWorldLockedSatelliteEnabled();
             if (useLegacyRingCompose) {
                 const double prefetchCadenceSeconds =
                     (frameTimeEmaMs > 30.0) ? 0.20 : ((frameTimeEmaMs > 22.0) ? 0.12 : 0.06);
@@ -1708,11 +1882,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     satelliteComposeInFlight = false;
                     satelliteComposeLaunchValid = false;
                 }
+                if (!streamedSatelliteEnabled) {
+                    satelliteRuntimeStatus = "Streamed satellite imagery disabled; using fallback texture only";
+                }
             }
             satelliteStats = satelliteStreamer.GetStats();
         }
         if (worldTileSystemReady) {
-            const bool worldEnabled = renderer.IsWorldLockedSatelliteEnabled() && satelliteStreamerReady;
+            const bool worldEnabled =
+                graphicsTuning.streamedSatelliteEnabled && renderer.IsWorldLockedSatelliteEnabled() && satelliteStreamerReady;
             worldTileSystem.SetEnabled(worldEnabled);
             if (worldEnabled) {
                 worldTileSystem.SetFrameTimeMs(frameTimeEmaMs);
@@ -1931,6 +2109,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("Speed: %.1f m/s", activeSim.SpeedMps());
         }
         ImGui::Text("Heading: %.2f deg", activeSim.HeadingDeg());
+        if (!VehicleModeIsMissile(vehicleMode)) {
+            if (sim.IsAltitudeHoldEnabled()) {
+                if (useImperialUnits) {
+                    ImGui::Text("Altitude hold: ON (%.1f ft)", ToDisplayAltitude(sim.AltitudeHoldTargetMeters(), true));
+                } else {
+                    ImGui::Text("Altitude hold: ON (%.1f m)", sim.AltitudeHoldTargetMeters());
+                }
+            } else {
+                ImGui::TextUnformatted("Altitude hold: OFF");
+            }
+            if (sim.IsHeadingHoldEnabled()) {
+                ImGui::Text("Yaw hold: ON (%.2f deg)", sim.HeadingHoldDeg());
+            } else {
+                ImGui::TextUnformatted("Yaw hold: OFF");
+            }
+        }
         ImGui::Text("Camera distance: %.0f m (wheel up/down)", renderer.CameraFollowDistanceMeters());
         ImGui::Checkbox("Imperial Units (mph/ft)", &useImperialUnits);
 
@@ -1980,7 +2174,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             "Satellite imagery: %s (blend %.2f)",
             graphicsTuning.satelliteEnabled ? "enabled" : "disabled",
             graphicsTuning.satelliteBlend);
-        ImGui::Text("Sentinel stream: %s", satelliteStreamerReady ? "enabled" : "disabled");
+        ImGui::Text(
+            "Sentinel stream: %s",
+            satelliteStreamerReady ? (graphicsTuning.streamedSatelliteEnabled ? "enabled" : "disabled by user") : "unavailable");
         if (!satelliteInitStatus.empty()) {
             ImGui::TextWrapped("%s", satelliteInitStatus.c_str());
         }
@@ -2006,16 +2202,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 ImGui::TextWrapped("%s", satelliteRuntimeStatus.c_str());
             }
         }
-        ImGui::Text("World-locked stream: %s", renderer.IsWorldLockedSatelliteEnabled() ? "enabled" : "disabled");
-        if (!renderer.IsWorldLockedSatelliteEnabled()) {
+        ImGui::Text(
+            "World-locked stream: %s",
+            (renderer.IsWorldLockedSatelliteEnabled() && graphicsTuning.streamedSatelliteEnabled) ? "enabled" : "disabled");
+        if (!renderer.IsWorldLockedSatelliteEnabled() && graphicsTuning.streamedSatelliteEnabled) {
             ImGui::TextColored(
                 ImVec4(1.0f, 0.8f, 0.35f, 1.0f),
                 "Legacy ring mode active (expected shimmer/popping). Enable World-Locked Satellite.");
         }
-        if (!worldTileSystemReady || !satelliteStreamerReady || !renderer.IsWorldLockedSatelliteEnabled()) {
+        if (!worldTileSystemReady || !satelliteStreamerReady || !renderer.IsWorldLockedSatelliteEnabled() || !graphicsTuning.streamedSatelliteEnabled) {
             const char* worldDisableReason = "disabled by graphics tuning";
             if (!worldTileSystemReady) {
                 worldDisableReason = "world tile manager unavailable";
+            } else if (!graphicsTuning.streamedSatelliteEnabled) {
+                worldDisableReason = "streamed satellite imagery disabled";
             } else if (!satelliteStreamerReady) {
                 worldDisableReason = "satellite streamer unavailable";
             }
@@ -2233,6 +2433,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         ImGui::Separator();
         ImGui::Text("Start/Respawn");
+        ImGui::SetNextItemWidth(190.0f);
+        ImGui::Combo("Start Preset", &startCityPresetIndex, kCityPresetItems);
+        ImGui::SameLine();
+        if (ImGui::Button("Apply Start Preset")) {
+            CityPresetLatLon(startCityPresetIndex, editableStart.latitudeDeg, editableStart.longitudeDeg);
+            editableStart.longitudeDeg = WrapLonDeg(editableStart.longitudeDeg);
+            vehicleModeStatus = "Updated start location preset";
+        }
         ImGui::InputDouble("Start Latitude", &editableStart.latitudeDeg, 0.1, 1.0, "%.6f");
         ImGui::InputDouble("Start Longitude", &editableStart.longitudeDeg, 0.1, 1.0, "%.6f");
         if (useImperialUnits) {
@@ -2254,14 +2462,89 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         ImGui::Separator();
         ImGui::Text("Controls");
         if (!VehicleModeIsMissile(vehicleMode)) {
+            if (sim.IsAltitudeHoldEnabled()) {
+                if (ImGui::Button("Disable Altitude Hold")) {
+                    sim.DisableAltitudeHold();
+                    vehicleModeStatus = "Altitude hold disabled";
+                }
+            } else {
+                if (ImGui::Button("Enable Altitude Hold")) {
+                    sim.EnableAltitudeHoldAtCurrentAltitude();
+                    vehicleModeStatus = "Altitude hold captured current altitude";
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset Pitch")) {
+                sim.ResetPitch();
+                vehicleModeStatus = "Pitch reset to level";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset Roll")) {
+                sim.ResetRoll();
+                vehicleModeStatus = "Roll reset to wings level";
+            }
+
+            if (ImGui::Button("Reset Yaw")) {
+                sim.EnableHeadingHoldAtCurrentHeading();
+                vehicleModeStatus = "Yaw hold captured current heading";
+            }
+            ImGui::SameLine();
+            if (sim.IsHeadingHoldEnabled()) {
+                if (ImGui::Button("Release Yaw Hold")) {
+                    sim.DisableHeadingHold();
+                    vehicleModeStatus = "Yaw hold released";
+                }
+            } else {
+                ImGui::BeginDisabled();
+                ImGui::Button("Release Yaw Hold");
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Steady Flight")) {
+                sim.StabilizeFlight();
+                vehicleModeStatus = "Steady flight engaged";
+            }
+
             ImGui::Text("Pitch W/S, Roll A/D, Yaw Q/E");
             ImGui::Text("Throttle Up/Down arrows");
             ImGui::Text("Altitude R/F, Reset Backspace");
+            ImGui::TextUnformatted("Steady Flight levels pitch/roll and holds the current altitude and heading.");
         } else {
             ImGui::TextUnformatted("Missile mode: autonomous guidance");
             ImGui::TextUnformatted("Switch back to Airplane mode for manual controls");
         }
         ImGui::Text("Landmask: %s", renderer.HasLandmask() ? "loaded" : "fallback");
+        ImGui::End();
+
+        ImGui::Begin("World Map");
+        const double mapHeadingDeg = NormalizeHeadingDeg360(activeSim.HeadingDeg());
+        const uint64_t landmaskTextureHandle = renderer.LandmaskImGuiTextureHandle();
+        const bool hasMapTexture = renderer.HasLandmask() && landmaskTextureHandle != 0;
+        const float availableMapWidth = std::max(ImGui::GetContentRegionAvail().x, 280.0f);
+        const ImVec2 mapSize{
+            std::clamp(availableMapWidth, 280.0f, 560.0f),
+            std::clamp(availableMapWidth * 0.5f, 150.0f, 280.0f),
+        };
+        const ImVec2 mapMin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##world_map_canvas", mapSize);
+        const ImVec2 mapMax = {mapMin.x + mapSize.x, mapMin.y + mapSize.y};
+        ImDrawList* const mapDrawList = ImGui::GetWindowDrawList();
+        mapDrawList->AddRectFilled(mapMin, mapMax, IM_COL32(8, 15, 23, 255), 6.0f);
+        if (hasMapTexture) {
+            const ImTextureID mapTexture = static_cast<ImTextureID>(landmaskTextureHandle);
+            mapDrawList->AddImage(mapTexture, mapMin, mapMax, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), IM_COL32(255, 255, 255, 235));
+        }
+        DrawWorldMapGrid(mapDrawList, mapMin, mapMax);
+        DrawWorldMapMarker(mapDrawList, mapMin, mapMax, activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), mapHeadingDeg);
+        mapDrawList->AddRect(mapMin, mapMax, IM_COL32(255, 255, 255, 120), 6.0f, 0, 1.5f);
+
+        ImGui::Text("Heading: %.1f deg %s", mapHeadingDeg, HeadingCardinalName(mapHeadingDeg));
+        ImGui::Text("Position: %.2f, %.2f", activeSim.LatitudeDeg(), activeSim.LongitudeDeg());
+        if (!hasMapTexture) {
+            ImGui::TextUnformatted("Map texture unavailable, using graticule fallback.");
+        } else {
+            ImGui::TextUnformatted("Marker shows aircraft position and nose direction.");
+        }
         ImGui::End();
 
         ImGui::Begin("Graphics Tuning");
@@ -2329,11 +2612,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (ImGui::Checkbox("Satellite Imagery", &graphicsTuning.satelliteEnabled)) {
             visualTuningChanged = true;
         }
+        if (ImGui::Checkbox("Streamed Satellite Imagery", &graphicsTuning.streamedSatelliteEnabled)) {
+            visualTuningChanged = true;
+        }
         if (ImGui::SliderFloat("Satellite Blend", &graphicsTuning.satelliteBlend, 0.0f, 1.0f, "%.2f")) {
             visualTuningChanged = true;
         }
         if (ImGui::Checkbox("World-Locked Satellite (Phase 4-6)", &graphicsTuning.worldLockedSatelliteEnabled)) {
             visualTuningChanged = true;
+        }
+        if (!graphicsTuning.streamedSatelliteEnabled) {
+            ImGui::TextUnformatted("Streamed satellite imagery is off; terrain uses the local fallback texture only.");
         }
 
         ImGui::Separator();

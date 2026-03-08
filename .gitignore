@@ -46,7 +46,9 @@ imgui.ini
 # vcpkg artifacts (manifest mode in build tree)
 /build/vcpkg_installed/
 /build/vcpkg-manifest-install.log
+/build/Debug/cache/
+/build/Release/cache/
 
 # Large map files
 world.200406.3x21600x21600.A1_geo.tif
-assets/textures/satellite/world.200406.3x21600x21600.A1_geo.tif
+assets/textures/satellite/

@@ -379,6 +379,195 @@ bool LoadGeoTiffRgbWithGeoTransform(
     return true;
 }
 
+struct GeoRasterLayer {
+    std::filesystem::path path;
+    std::vector<uint8_t> pixelsRgba;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::array<double, 6> geoTransform{};
+    double lonWest = 0.0;
+    double lonEast = 0.0;
+    double latSouth = 0.0;
+    double latNorth = 0.0;
+};
+
+void ComputeGeoBounds(
+    const std::array<double, 6>& geoTransform,
+    uint32_t width,
+    uint32_t height,
+    double& outLonWest,
+    double& outLonEast,
+    double& outLatSouth,
+    double& outLatNorth) {
+    const double w = static_cast<double>(width);
+    const double h = static_cast<double>(height);
+    const double lonA = geoTransform[0];
+    const double latA = geoTransform[3];
+    const double lonB = geoTransform[0] + geoTransform[1] * w + geoTransform[2] * h;
+    const double latB = geoTransform[3] + geoTransform[4] * w + geoTransform[5] * h;
+    outLonWest = std::min(lonA, lonB);
+    outLonEast = std::max(lonA, lonB);
+    outLatSouth = std::min(latA, latB);
+    outLatNorth = std::max(latA, latB);
+}
+
+bool LoadGeoRasterLayer(
+    const std::filesystem::path& path,
+    uint32_t maxDim,
+    GeoRasterLayer& outLayer,
+    std::string& error) {
+    outLayer = {};
+    outLayer.path = path;
+    bool hasGeoTransform = false;
+    if (!LoadGeoTiffRgbWithGeoTransform(
+            path,
+            maxDim,
+            outLayer.pixelsRgba,
+            outLayer.width,
+            outLayer.height,
+            outLayer.geoTransform,
+            hasGeoTransform,
+            error)) {
+        return false;
+    }
+    if (!hasGeoTransform || outLayer.width == 0 || outLayer.height == 0) {
+        error = "GeoTIFF missing usable geotransform: " + path.string();
+        return false;
+    }
+    ComputeGeoBounds(
+        outLayer.geoTransform,
+        outLayer.width,
+        outLayer.height,
+        outLayer.lonWest,
+        outLayer.lonEast,
+        outLayer.latSouth,
+        outLayer.latNorth);
+    return true;
+}
+
+bool CompositeGeoRasterLayers(
+    const std::vector<GeoRasterLayer>& layers,
+    uint32_t maxDim,
+    std::vector<uint8_t>& outPixelsRgba,
+    uint32_t& outWidth,
+    uint32_t& outHeight,
+    std::array<double, 6>& outGeoTransform) {
+    if (layers.empty()) {
+        return false;
+    }
+
+    double lonWest = layers.front().lonWest;
+    double lonEast = layers.front().lonEast;
+    double latSouth = layers.front().latSouth;
+    double latNorth = layers.front().latNorth;
+    double pixelsPerLonDegree = 0.0;
+    double pixelsPerLatDegree = 0.0;
+
+    for (const GeoRasterLayer& layer : layers) {
+        lonWest = std::min(lonWest, layer.lonWest);
+        lonEast = std::max(lonEast, layer.lonEast);
+        latSouth = std::min(latSouth, layer.latSouth);
+        latNorth = std::max(latNorth, layer.latNorth);
+
+        const double lonSpan = std::max(1e-6, layer.lonEast - layer.lonWest);
+        const double latSpan = std::max(1e-6, layer.latNorth - layer.latSouth);
+        pixelsPerLonDegree = std::max(pixelsPerLonDegree, static_cast<double>(layer.width) / lonSpan);
+        pixelsPerLatDegree = std::max(pixelsPerLatDegree, static_cast<double>(layer.height) / latSpan);
+    }
+
+    const double lonSpan = std::max(1e-6, lonEast - lonWest);
+    const double latSpan = std::max(1e-6, latNorth - latSouth);
+    double widthF = std::max(1.0, std::round(lonSpan * std::max(pixelsPerLonDegree, 1.0)));
+    double heightF = std::max(1.0, std::round(latSpan * std::max(pixelsPerLatDegree, 1.0)));
+
+    if (maxDim > 0 && std::max(widthF, heightF) > static_cast<double>(maxDim)) {
+        const double scale = static_cast<double>(maxDim) / std::max(widthF, heightF);
+        widthF = std::max(1.0, std::floor(widthF * scale));
+        heightF = std::max(1.0, std::floor(heightF * scale));
+    }
+
+    outWidth = static_cast<uint32_t>(std::max(1.0, widthF));
+    outHeight = static_cast<uint32_t>(std::max(1.0, heightF));
+    outPixelsRgba.assign(static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 4u, 0u);
+
+    const double pixelLonSpan = lonSpan / static_cast<double>(outWidth);
+    const double pixelLatSpan = latSpan / static_cast<double>(outHeight);
+    outGeoTransform = {
+        lonWest,
+        pixelLonSpan,
+        0.0,
+        latNorth,
+        0.0,
+        -pixelLatSpan,
+    };
+
+    auto sampleLayer = [](const GeoRasterLayer& layer, double lonDeg, double latDeg, uint8_t outRgba[4]) -> bool {
+        const double lonSpanLocal = std::max(1e-6, layer.lonEast - layer.lonWest);
+        const double latSpanLocal = std::max(1e-6, layer.latNorth - layer.latSouth);
+        const double u = (lonDeg - layer.lonWest) / lonSpanLocal;
+        const double v = (layer.latNorth - latDeg) / latSpanLocal;
+        if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {
+            return false;
+        }
+
+        const double x = std::clamp(u * static_cast<double>(layer.width - 1), 0.0, static_cast<double>(layer.width - 1));
+        const double y = std::clamp(v * static_cast<double>(layer.height - 1), 0.0, static_cast<double>(layer.height - 1));
+        const int x0 = std::clamp(static_cast<int>(std::floor(x)), 0, static_cast<int>(layer.width) - 1);
+        const int y0 = std::clamp(static_cast<int>(std::floor(y)), 0, static_cast<int>(layer.height) - 1);
+        const int x1 = std::min(x0 + 1, static_cast<int>(layer.width) - 1);
+        const int y1 = std::min(y0 + 1, static_cast<int>(layer.height) - 1);
+        const double tx = x - static_cast<double>(x0);
+        const double ty = y - static_cast<double>(y0);
+
+        auto channelAt = [&](int ix, int iy, int channel) -> double {
+            const size_t idx =
+                ((static_cast<size_t>(iy) * static_cast<size_t>(layer.width)) + static_cast<size_t>(ix)) * 4u + static_cast<size_t>(channel);
+            return static_cast<double>(layer.pixelsRgba[idx]);
+        };
+
+        for (int c = 0; c < 3; ++c) {
+            const double c00 = channelAt(x0, y0, c);
+            const double c10 = channelAt(x1, y0, c);
+            const double c01 = channelAt(x0, y1, c);
+            const double c11 = channelAt(x1, y1, c);
+            const double cx0 = c00 + (c10 - c00) * tx;
+            const double cx1 = c01 + (c11 - c01) * tx;
+            outRgba[c] = static_cast<uint8_t>(std::clamp(std::lround(cx0 + (cx1 - cx0) * ty), 0l, 255l));
+        }
+        outRgba[3] = 255u;
+        return true;
+    };
+
+    for (const GeoRasterLayer& layer : layers) {
+        const int xBegin = std::max(0, static_cast<int>(std::floor((layer.lonWest - lonWest) / pixelLonSpan)));
+        const int xEnd = std::min(
+            static_cast<int>(outWidth),
+            static_cast<int>(std::ceil((layer.lonEast - lonWest) / pixelLonSpan)));
+        const int yBegin = std::max(0, static_cast<int>(std::floor((latNorth - layer.latNorth) / pixelLatSpan)));
+        const int yEnd = std::min(
+            static_cast<int>(outHeight),
+            static_cast<int>(std::ceil((latNorth - layer.latSouth) / pixelLatSpan)));
+
+        for (int y = yBegin; y < yEnd; ++y) {
+            const double latDeg = latNorth - (static_cast<double>(y) + 0.5) * pixelLatSpan;
+            for (int x = xBegin; x < xEnd; ++x) {
+                const double lonDeg = lonWest + (static_cast<double>(x) + 0.5) * pixelLonSpan;
+                uint8_t sampled[4]{};
+                if (!sampleLayer(layer, lonDeg, latDeg, sampled)) {
+                    continue;
+                }
+                const size_t dstIdx = ((static_cast<size_t>(y) * static_cast<size_t>(outWidth)) + static_cast<size_t>(x)) * 4u;
+                outPixelsRgba[dstIdx + 0] = sampled[0];
+                outPixelsRgba[dstIdx + 1] = sampled[1];
+                outPixelsRgba[dstIdx + 2] = sampled[2];
+                outPixelsRgba[dstIdx + 3] = sampled[3];
+            }
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 bool D3D12Renderer::Initialize(
@@ -1356,7 +1545,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             m_terrainVisualSettings.satelliteEnabled ? 1.0f : 0.0f,
             m_terrainVisualSettings.satelliteBlend,
             m_earthAlbedoWrapLon,
-            m_satelliteLodValid[0] + m_satelliteLodValid[1] + m_satelliteLodValid[2],
+            m_terrainVisualSettings.streamedSatelliteEnabled ? (m_satelliteLodValid[0] + m_satelliteLodValid[1] + m_satelliteLodValid[2]) : 0.0f,
         };
         obj.tuning3 = m_earthAlbedoBoundsLonLat;
         obj.tuning4 = m_satelliteLodBounds[0];
@@ -1367,7 +1556,8 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning9 = m_satellitePrevLodBounds[1];
         obj.tuning10 = m_satellitePrevLodBounds[2];
         obj.tuning11 = {m_satellitePrevLodValid[0], m_satellitePrevLodValid[1], m_satellitePrevLodValid[2], m_satelliteTransitionT};
-        const bool worldSamplingEnabled = m_worldLockedSatelliteEnabled && m_worldStreamingResourcesReady;
+        const bool worldSamplingEnabled =
+            m_terrainVisualSettings.streamedSatelliteEnabled && m_worldLockedSatelliteEnabled && m_worldStreamingResourcesReady;
         obj.tuning12 = {layerAlpha, worldSamplingEnabled ? 1.0f : 0.0f, 1.0f, 0.0f};
         obj.tuning13 = {
             static_cast<float>(kWorldSatelliteAtlasPagesX),
@@ -1981,6 +2171,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
 
     D3D12_RASTERIZER_DESC rasterizer{};
@@ -2037,6 +2228,7 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
 
     pso.VS = {basicVs->GetBufferPointer(), basicVs->GetBufferSize()};
     pso.PS = {basicPs->GetBufferPointer(), basicPs->GetBufferSize()};
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 
     hr = m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(m_planePso.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
@@ -3007,31 +3199,32 @@ bool D3D12Renderer::CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandL
     // Missing/failed loads fall back to a 1x1 neutral pixel so the game keeps running.
     error.clear();
 
+    const std::filesystem::path topoWorldRel =
+        std::filesystem::path("textures") / "satellite" / "world.topo.200407.3x21600x21600.B1_geo.tif";
     const std::filesystem::path blueMarbleRel = std::filesystem::path("textures") / "satellite" / "world.200406.3x21600x21600.A1_geo.tif";
-    std::filesystem::path found;
-    auto toLowerAscii = [](std::string s) {
-        for (char& c : s) {
-            if (c >= 'A' && c <= 'Z') {
-                c = static_cast<char>(c - 'A' + 'a');
+    std::vector<std::filesystem::path> foundLayers;
+    std::filesystem::path foundGeneric;
+    auto toLowerAsciiWide = [](std::wstring s) {
+        for (wchar_t& c : s) {
+            if (c >= L'A' && c <= L'Z') {
+                c = static_cast<wchar_t>(c - L'A' + L'a');
             }
         }
         return s;
     };
 
-    auto consider = [&](const std::filesystem::path& p) {
-        if (!found.empty()) {
-            return;
-        }
+    auto containsPath = [](const std::vector<std::filesystem::path>& paths, const std::filesystem::path& candidate) {
+        return std::find(paths.begin(), paths.end(), candidate) != paths.end();
+    };
+
+    auto considerLayer = [&](const std::filesystem::path& p) {
         std::error_code ec;
-        if (std::filesystem::exists(p, ec) && !ec) {
-            found = p;
+        if (std::filesystem::exists(p, ec) && !ec && !containsPath(foundLayers, p)) {
+            foundLayers.push_back(p);
         }
     };
 
     auto considerWorldGeoInDir = [&](const std::filesystem::path& dir) {
-        if (!found.empty()) {
-            return;
-        }
         std::error_code ec;
         if (!std::filesystem::exists(dir, ec) || ec) {
             return;
@@ -3043,26 +3236,35 @@ bool D3D12Renderer::CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandL
             if (!entry.is_regular_file(ec) || ec) {
                 continue;
             }
-            const std::string nameLower = toLowerAscii(entry.path().filename().string());
-            const bool isWorldPrefix = nameLower.rfind("world.", 0) == 0;
+            const std::wstring nameLower = toLowerAsciiWide(entry.path().filename().wstring());
+            const bool isWorldPrefix = nameLower.rfind(L"world.", 0) == 0;
             const bool hasGeoSuffix =
-                (nameLower.size() >= 8 && nameLower.compare(nameLower.size() - 8, 8, "_geo.tif") == 0) ||
-                (nameLower.size() >= 9 && nameLower.compare(nameLower.size() - 9, 9, "_geo.tiff") == 0);
-            if (isWorldPrefix && hasGeoSuffix) {
-                found = entry.path();
-                return;
+                (nameLower.size() >= 8 && nameLower.compare(nameLower.size() - 8, 8, L"_geo.tif") == 0) ||
+                (nameLower.size() >= 9 && nameLower.compare(nameLower.size() - 9, 9, L"_geo.tiff") == 0);
+            if (!isWorldPrefix || !hasGeoSuffix) {
+                continue;
+            }
+            if (nameLower == L"world.topo.200407.3x21600x21600.b1_geo.tif" ||
+                nameLower == L"world.topo.200407.3x21600x21600.b1_geo.tiff" ||
+                nameLower == L"world.200406.3x21600x21600.a1_geo.tif" ||
+                nameLower == L"world.200406.3x21600x21600.a1_geo.tiff") {
+                considerLayer(entry.path());
+            } else if (foundGeneric.empty()) {
+                foundGeneric = entry.path();
             }
         }
     };
 
     // Prefer an assets-based canonical location.
-    consider(m_assetDir / blueMarbleRel);
+    considerLayer(m_assetDir / topoWorldRel);
+    considerLayer(m_assetDir / blueMarbleRel);
     considerWorldGeoInDir(m_assetDir / "textures" / "satellite");
 
     // Also search upwards from the working directory so running from build/Debug still finds repo-root world.*_geo.tif.
     std::filesystem::path dir = std::filesystem::current_path();
     for (int i = 0; i < 8 && !dir.empty(); ++i) {
-        consider(dir / blueMarbleRel);
+        considerLayer(dir / topoWorldRel);
+        considerLayer(dir / blueMarbleRel);
         considerWorldGeoInDir(dir);
         considerWorldGeoInDir(dir / "assets" / "textures" / "satellite");
         const std::filesystem::path parent = dir.parent_path();
@@ -3082,64 +3284,80 @@ bool D3D12Renderer::CreateEarthAlbedoTexture(ID3D12GraphicsCommandList* commandL
     m_hasEarthAlbedoSourceFile = false;
     m_earthAlbedoBoundsLonLat = {-180.0f, 180.0f, -90.0f, 90.0f};
     m_earthAlbedoWrapLon = 1.0f;
-    if (!found.empty()) {
-        std::string loadError;
-        // Downscale to keep memory reasonable. This is a single global/large texture.
-        const uint32_t maxDim = 6144;
-
-        const std::wstring ext = found.extension().wstring();
-        const bool isTiff = (ext == L".tif") || (ext == L".tiff") || (ext == L".TIF") || (ext == L".TIFF");
-        if (isTiff) {
-            if (LoadGeoTiffRgbWithGeoTransform(found, maxDim, basePixels, width, height, geoTransform, hasGeoTransform, loadError)) {
-                loaded = true;
-            }
-        } else {
-            if (LoadColorPixels(found, basePixels, width, height, maxDim, loadError)) {
-                loaded = true;
+    // Downscale to keep memory reasonable. This is a single global/large texture.
+    const uint32_t maxDim = 6144;
+    if (!foundLayers.empty()) {
+        std::vector<GeoRasterLayer> layers;
+        for (const std::filesystem::path& layerPath : foundLayers) {
+            GeoRasterLayer layer{};
+            std::string loadError;
+            if (LoadGeoRasterLayer(layerPath, maxDim, layer, loadError)) {
+                layers.push_back(std::move(layer));
             }
         }
-
-        if (loaded && hasGeoTransform) {
-            // Compute bounds from geotransform (lon/lat degrees).
-            const double gt0 = geoTransform[0];
-            const double gt1 = geoTransform[1];
-            const double gt2 = geoTransform[2];
-            const double gt3 = geoTransform[3];
-            const double gt4 = geoTransform[4];
-            const double gt5 = geoTransform[5];
-
-            const double w = static_cast<double>(width);
-            const double h = static_cast<double>(height);
-            const double lonA = gt0;
-            const double latA = gt3;
-            const double lonB = gt0 + gt1 * w + gt2 * h;
-            const double latB = gt3 + gt4 * w + gt5 * h;
-
-            const double lonW = std::min(lonA, lonB);
-            const double lonE = std::max(lonA, lonB);
-            const double latS = std::min(latA, latB);
-            const double latN = std::max(latA, latB);
-
+        if (!layers.empty() && CompositeGeoRasterLayers(layers, maxDim, basePixels, width, height, geoTransform)) {
+            loaded = true;
+            hasGeoTransform = true;
+            double lonW = 0.0;
+            double lonE = 0.0;
+            double latS = 0.0;
+            double latN = 0.0;
+            ComputeGeoBounds(geoTransform, width, height, lonW, lonE, latS, latN);
             m_earthAlbedoBoundsLonLat = {
                 static_cast<float>(lonW),
                 static_cast<float>(lonE),
                 static_cast<float>(latS),
                 static_cast<float>(latN),
             };
-
             const double lonSpan = lonE - lonW;
             m_earthAlbedoWrapLon = (std::abs(lonSpan - 360.0) < 0.1) ? 1.0f : 0.0f;
+            if (layers.size() == 1) {
+                m_earthAlbedoSourcePath = layers.front().path;
+            } else {
+                m_earthAlbedoSourcePath = std::filesystem::path(layers.front().path.filename().string() + " + " + layers.back().path.filename().string());
+            }
+        }
+    } else if (!foundGeneric.empty()) {
+        std::string loadError;
+        const std::wstring ext = foundGeneric.extension().wstring();
+        const bool isTiff = (ext == L".tif") || (ext == L".tiff") || (ext == L".TIF") || (ext == L".TIFF");
+        if (isTiff) {
+            if (LoadGeoTiffRgbWithGeoTransform(foundGeneric, maxDim, basePixels, width, height, geoTransform, hasGeoTransform, loadError)) {
+                loaded = true;
+            }
+        } else {
+            if (LoadColorPixels(foundGeneric, basePixels, width, height, maxDim, loadError)) {
+                loaded = true;
+            }
+        }
+
+        if (loaded && hasGeoTransform) {
+            double lonW = 0.0;
+            double lonE = 0.0;
+            double latS = 0.0;
+            double latN = 0.0;
+            ComputeGeoBounds(geoTransform, width, height, lonW, lonE, latS, latN);
+            m_earthAlbedoBoundsLonLat = {
+                static_cast<float>(lonW),
+                static_cast<float>(lonE),
+                static_cast<float>(latS),
+                static_cast<float>(latN),
+            };
+            const double lonSpan = lonE - lonW;
+            m_earthAlbedoWrapLon = (std::abs(lonSpan - 360.0) < 0.1) ? 1.0f : 0.0f;
+        }
+        if (loaded) {
+            m_earthAlbedoSourcePath = foundGeneric;
         }
     }
 
     if (!loaded) {
         // Neutral mid-gray; used when imagery is missing.
-        basePixels = {128, 128, 128, 255};
+        basePixels = {128, 128, 128, 0};
         width = 1;
         height = 1;
     } else {
         m_hasEarthAlbedoSourceFile = true;
-        m_earthAlbedoSourcePath = found;
     }
 
     // Build a CPU mip chain to reduce shimmer (hardware will pick proper mips at distance).

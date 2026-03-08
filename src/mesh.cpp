@@ -144,7 +144,7 @@ MeshData CreatePlaceholderPlane() {
     const DirectX::XMFLOAT3 bottom{0.0f, -3.0f, -10.0f};
 
     auto addVertex = [&](const DirectX::XMFLOAT3& p, const DirectX::XMFLOAT3& n, float u, float v) {
-        mesh.vertices.push_back(Vertex{p, n, DirectX::XMFLOAT2{u, v}});
+        mesh.vertices.push_back(Vertex{p, n, DirectX::XMFLOAT2{u, v}, DirectX::XMFLOAT4{1.0f, 1.0f, 1.0f, 1.0f}});
     };
 
     // Main body tetra-like hull.

@@ -23,6 +23,12 @@ bool LoadGlbMesh(
     const std::filesystem::path& glbPath,
     MeshData& outMesh,
     GlbMaterialTexture& outBaseColorTexture,
+    bool bakeMaterialColor,
+    std::string& error);
+bool LoadGlbMesh(
+    const std::filesystem::path& glbPath,
+    MeshData& outMesh,
+    GlbMaterialTexture& outBaseColorTexture,
     std::string& error);
 
 } // namespace flight

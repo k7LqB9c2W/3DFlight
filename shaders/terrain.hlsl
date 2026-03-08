@@ -348,16 +348,24 @@ float4 PSMain(VSOutput input) : SV_Target
         {
             u = frac(u);
             v = saturate(v);
-            satelliteColor = gEarthAlbedo.Sample(gWrapSampler, float2(u, v)).rgb;
-            haveFallback = true;
+            const float4 fallbackSample = gEarthAlbedo.Sample(gWrapSampler, float2(u, v));
+            if (fallbackSample.a > 0.001)
+            {
+                satelliteColor = fallbackSample.rgb;
+                haveFallback = true;
+            }
         }
         else
         {
             // For regional datasets, avoid smearing edges by skipping samples outside the covered bounds.
             if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0)
             {
-                satelliteColor = gEarthAlbedo.Sample(gClampSampler, float2(u, v)).rgb;
-                haveFallback = true;
+                const float4 fallbackSample = gEarthAlbedo.Sample(gClampSampler, float2(u, v));
+                if (fallbackSample.a > 0.001)
+                {
+                    satelliteColor = fallbackSample.rgb;
+                    haveFallback = true;
+                }
             }
         }
 

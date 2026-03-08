@@ -8,13 +8,18 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
+double WrapRadiansPi(double angle) {
+    while (angle > kPi) {
+        angle -= 2.0 * kPi;
+    }
+    while (angle < -kPi) {
+        angle += 2.0 * kPi;
+    }
+    return angle;
+}
+
 void WrapLongitude(double& lon) {
-    while (lon > kPi) {
-        lon -= 2.0 * kPi;
-    }
-    while (lon < -kPi) {
-        lon += 2.0 * kPi;
-    }
+    lon = WrapRadiansPi(lon);
 }
 
 } // namespace
@@ -108,6 +113,10 @@ void FlightSim::Respawn() {
     m_headingRad = DegToRad(m_start.headingDeg);
     m_pitchRad = 0.0;
     m_rollRad = 0.0;
+    m_altitudeHoldEnabled = false;
+    m_altitudeHoldTargetMeters = m_altitudeMeters;
+    m_headingHoldEnabled = false;
+    m_headingHoldTargetRad = m_headingRad;
     WrapLongitude(m_longitudeRad);
 }
 
@@ -131,10 +140,18 @@ void FlightSim::Update(double dtSeconds, const InputState& input, double timeSca
     constexpr double kThrottleAccel = 40.0;
     constexpr double kManualClimbRate = 120.0;
     constexpr double kGravity = 9.80665;
+    constexpr double kHeadingHoldRate = 1.10;
+    constexpr double kAltitudeHoldGain = 0.45;
+    constexpr double kAltitudeHoldMaxVerticalSpeed = 120.0;
+    constexpr double kAltitudeHoldMaxAssistRate = 220.0;
 
     m_pitchRad += pitchInput * kPitchRate * dt;
     m_rollRad += rollInput * kRollRate * dt;
     m_headingRad += yawInput * kYawRate * dt;
+    if (m_headingHoldEnabled && std::abs(yawInput) > 1e-6) {
+        m_headingHoldTargetRad += yawInput * kYawRate * dt;
+        WrapLongitude(m_headingHoldTargetRad);
+    }
 
     m_pitchRad = std::clamp(m_pitchRad, DegToRad(-40.0), DegToRad(40.0));
     m_rollRad = std::clamp(m_rollRad, DegToRad(-75.0), DegToRad(75.0));
@@ -150,13 +167,42 @@ void FlightSim::Update(double dtSeconds, const InputState& input, double timeSca
     m_headingRad += bankTurnRate * dt;
     WrapLongitude(m_headingRad);
 
+    if (m_headingHoldEnabled) {
+        const bool steeringInputActive = (std::abs(yawInput) > 1e-6) || (std::abs(rollInput) > 1e-6);
+        if (steeringInputActive) {
+            m_headingHoldTargetRad = m_headingRad;
+        } else {
+            const double headingError = WrapRadiansPi(m_headingHoldTargetRad - m_headingRad);
+            m_headingRad += std::clamp(headingError, -kHeadingHoldRate * dt, kHeadingHoldRate * dt);
+            WrapLongitude(m_headingRad);
+        }
+    }
+
     const double verticalFromPitch = m_speedMps * std::sin(m_pitchRad);
+    double climbRateCommand = climbInput * kManualClimbRate;
+    if (m_altitudeHoldEnabled) {
+        if (std::abs(climbInput) > 1e-6) {
+            m_altitudeHoldTargetMeters = std::max(10.0, m_altitudeHoldTargetMeters + climbInput * kManualClimbRate * dt);
+        }
+        const double altitudeError = m_altitudeHoldTargetMeters - m_altitudeMeters;
+        const double targetVerticalSpeed = std::clamp(
+            altitudeError * kAltitudeHoldGain,
+            -kAltitudeHoldMaxVerticalSpeed,
+            kAltitudeHoldMaxVerticalSpeed);
+        climbRateCommand = std::clamp(
+            targetVerticalSpeed - verticalFromPitch,
+            -kAltitudeHoldMaxAssistRate,
+            kAltitudeHoldMaxAssistRate);
+    }
 
     const double dNorth = std::cos(m_headingRad) * horizontalSpeed * dt;
     const double dEast = std::sin(m_headingRad) * horizontalSpeed * dt;
-    const double dUp = (verticalFromPitch + climbInput * kManualClimbRate) * dt;
+    const double dUp = (verticalFromPitch + climbRateCommand) * dt;
 
     m_altitudeMeters = std::max(10.0, m_altitudeMeters + dUp);
+    if (m_altitudeHoldEnabled) {
+        m_altitudeHoldTargetMeters = std::max(10.0, m_altitudeHoldTargetMeters);
+    }
 
     const double r = kEarthRadiusMeters + m_altitudeMeters;
     m_latitudeRad += dNorth / r;
@@ -184,6 +230,49 @@ void FlightSim::SetKinematicStateRadians(
     WrapLongitude(m_headingRad);
     m_pitchRad = std::clamp(pitchRad, DegToRad(-89.0), DegToRad(89.0));
     m_rollRad = std::clamp(rollRad, DegToRad(-89.0), DegToRad(89.0));
+    if (m_altitudeHoldEnabled) {
+        m_altitudeHoldTargetMeters = m_altitudeMeters;
+    }
+    if (m_headingHoldEnabled) {
+        m_headingHoldTargetRad = m_headingRad;
+    }
+}
+
+void FlightSim::EnableAltitudeHoldAtCurrentAltitude() {
+    m_altitudeHoldEnabled = true;
+    m_altitudeHoldTargetMeters = std::max(10.0, m_altitudeMeters);
+}
+
+void FlightSim::DisableAltitudeHold() {
+    m_altitudeHoldEnabled = false;
+    m_altitudeHoldTargetMeters = std::max(10.0, m_altitudeMeters);
+}
+
+void FlightSim::EnableHeadingHoldAtCurrentHeading() {
+    m_headingHoldEnabled = true;
+    m_headingHoldTargetRad = m_headingRad;
+    WrapLongitude(m_headingHoldTargetRad);
+}
+
+void FlightSim::DisableHeadingHold() {
+    m_headingHoldEnabled = false;
+    m_headingHoldTargetRad = m_headingRad;
+    WrapLongitude(m_headingHoldTargetRad);
+}
+
+void FlightSim::ResetPitch() {
+    m_pitchRad = 0.0;
+}
+
+void FlightSim::ResetRoll() {
+    m_rollRad = 0.0;
+}
+
+void FlightSim::StabilizeFlight() {
+    EnableAltitudeHoldAtCurrentAltitude();
+    EnableHeadingHoldAtCurrentHeading();
+    ResetPitch();
+    ResetRoll();
 }
 
 Double3 FlightSim::PlaneEcef() const {

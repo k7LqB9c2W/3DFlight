@@ -67,6 +67,13 @@ public:
         double headingRad,
         double pitchRad,
         double rollRad);
+    void EnableAltitudeHoldAtCurrentAltitude();
+    void DisableAltitudeHold();
+    void EnableHeadingHoldAtCurrentHeading();
+    void DisableHeadingHold();
+    void ResetPitch();
+    void ResetRoll();
+    void StabilizeFlight();
 
     [[nodiscard]] double LatitudeRad() const { return m_latitudeRad; }
     [[nodiscard]] double LongitudeRad() const { return m_longitudeRad; }
@@ -75,10 +82,15 @@ public:
     [[nodiscard]] double HeadingRad() const { return m_headingRad; }
     [[nodiscard]] double PitchRad() const { return m_pitchRad; }
     [[nodiscard]] double RollRad() const { return m_rollRad; }
+    [[nodiscard]] bool IsAltitudeHoldEnabled() const { return m_altitudeHoldEnabled; }
+    [[nodiscard]] double AltitudeHoldTargetMeters() const { return m_altitudeHoldTargetMeters; }
+    [[nodiscard]] bool IsHeadingHoldEnabled() const { return m_headingHoldEnabled; }
+    [[nodiscard]] double HeadingHoldRad() const { return m_headingHoldTargetRad; }
 
     [[nodiscard]] double LatitudeDeg() const { return RadToDeg(m_latitudeRad); }
     [[nodiscard]] double LongitudeDeg() const { return RadToDeg(m_longitudeRad); }
     [[nodiscard]] double HeadingDeg() const { return RadToDeg(m_headingRad); }
+    [[nodiscard]] double HeadingHoldDeg() const { return RadToDeg(m_headingHoldTargetRad); }
 
     [[nodiscard]] Double3 PlaneEcef() const;
     [[nodiscard]] Double3 ForwardEcef() const;
@@ -93,6 +105,10 @@ private:
     double m_headingRad = 0.0;
     double m_pitchRad = 0.0;
     double m_rollRad = 0.0;
+    bool m_altitudeHoldEnabled = false;
+    double m_altitudeHoldTargetMeters = 0.0;
+    bool m_headingHoldEnabled = false;
+    double m_headingHoldTargetRad = 0.0;
 };
 
 } // namespace flight
