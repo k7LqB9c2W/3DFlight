@@ -927,6 +927,7 @@ struct VehicleRenderAsset {
     VehicleRenderKind renderKind = VehicleRenderKind::ExteriorAircraft;
     float modelScale = 1.0f;
     VehicleAxisTransform axisTransform{{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
+    bool loadComplete = false;
 };
 
 struct MissileAutopilotState {
@@ -955,6 +956,11 @@ struct TerrainBuildAsyncResult {
     TerrainPatchBuildResult patch{};
     std::string error;
     bool success = false;
+};
+
+struct VehicleAssetLoadResult {
+    VehicleMode mode = VehicleMode::Airplane;
+    VehicleRenderAsset asset{};
 };
 
 double WrapRadiansPi(double angleRad) {
@@ -1530,8 +1536,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         return 1;
     }
 
-    ShowWindow(hwnd, showCmd);
-
     D3D12Renderer renderer;
     g_renderer = &renderer;
 
@@ -1550,86 +1554,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             (axisTransform[2][0] * value.x + axisTransform[2][1] * value.y + axisTransform[2][2] * value.z) * scale,
         };
     };
-    auto configureAircraftAsset =
-        [&](VehicleMode mode,
-            const std::filesystem::path& path,
-            float scale,
-            float minZoomMeters,
-            const VehicleAxisTransform& axisTransform,
-            VehicleRenderKind renderKind = VehicleRenderKind::ExteriorAircraft,
-            flight::GlbLoadOptions loadOptions = {}) {
-            auto& asset = vehicleAssets[VehicleModeToIndex(mode)];
-            asset.minZoomMeters = minZoomMeters;
-            asset.renderKind = renderKind;
-            asset.modelScale = scale;
-            asset.axisTransform = axisTransform;
-
-            std::string loadError;
-            const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, loadOptions, loadError);
-            if (!loaded) {
-                asset.mesh = flight::CreatePlaceholderPlane();
-            }
-            if (loadOptions.bakeMaterialColor) {
-                asset.texture = {};
-            }
-
-            // Imported aircraft do not share one local basis. Apply a per-model remap before upload.
-            for (auto& v : asset.mesh.vertices) {
-                v.position = transformVertexAxis(v.position, axisTransform, scale);
-                v.normal = transformVertexAxis(v.normal, axisTransform, 1.0f);
-            }
-
-            if (!loaded) {
-                asset.modelStatus = std::string(VehicleModeDisplayName(mode)) + " model load failed, using placeholder: " + loadError;
-                asset.textureStatus =
-                    std::string(VehicleModeDisplayName(mode)) + " texture: fallback default (model load failed)";
-            } else {
-                asset.modelStatus = std::string(VehicleModeDisplayName(mode)) + " model loaded: " + path.string();
-                if (asset.texture.IsValid()) {
-                    asset.textureStatus =
-                        std::string(VehicleModeDisplayName(mode)) + " texture loaded (" + std::to_string(asset.texture.width) + "x" +
-                        std::to_string(asset.texture.height) + ")";
-                } else {
-                    asset.textureStatus = std::string(VehicleModeDisplayName(mode)) + " texture: none in GLB, using default";
-                }
-            }
-        };
-    auto configureMissileAsset = [&](const std::filesystem::path& path) {
-        auto& asset = vehicleAssets[VehicleModeToIndex(VehicleMode::Missile)];
-        asset.minZoomMeters = 8.0f;
-        asset.renderKind = VehicleRenderKind::Missile;
-
-        std::string loadError;
-        const bool loaded = flight::LoadGlbMesh(path, asset.mesh, asset.texture, loadError);
-        if (!loaded) {
-            asset.mesh = flight::CreatePlaceholderPlane();
-        }
-
-        // Missile GLB already points the correct way for the chase camera; keep orientation and only scale it down.
-        for (auto& v : asset.mesh.vertices) {
-            v.position.x *= 0.08f;
-            v.position.y *= 0.08f;
-            v.position.z *= 0.08f;
-        }
-
-        if (!loaded) {
-            asset.modelStatus = "Missile model load failed, using placeholder: " + loadError;
-            asset.textureStatus = "Missile texture: fallback default (model load failed)";
-        } else {
-            asset.modelStatus = "Missile model loaded: " + path.string();
-            if (asset.texture.IsValid()) {
-                asset.textureStatus =
-                    "Missile texture loaded (" + std::to_string(asset.texture.width) + "x" + std::to_string(asset.texture.height) + ")";
-            } else {
-                asset.textureStatus = "Missile texture: none in GLB, using default";
-            }
-        }
-    };
 
     constexpr VehicleAxisTransform kAirplaneAxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}};
     constexpr VehicleAxisTransform kA320AxisTransform = {{{0.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f}}};
-    constexpr VehicleAxisTransform kF35AxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, -1.0f, 0.0f}}};
-    constexpr VehicleAxisTransform kB2AxisTransform = {{{0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f}}};
+    constexpr VehicleAxisTransform kF35AxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}};
+    constexpr VehicleAxisTransform kB2AxisTransform = {{{-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}};
     constexpr VehicleAxisTransform kCockpitAxisTransform = {{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
     flight::GlbLoadOptions defaultAircraftLoadOptions;
     flight::GlbLoadOptions bakedColorAircraftLoadOptions;
@@ -1637,63 +1566,145 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     flight::GlbLoadOptions cockpitLoadOptions;
     cockpitLoadOptions.targetExtentMeters = 8.0f;
     cockpitLoadOptions.bakeMaterialColor = true;
-
-    configureAircraftAsset(
+    struct VehicleAssetLoadSpec {
+        VehicleMode mode = VehicleMode::Airplane;
+        std::filesystem::path path;
+        float scale = 1.0f;
+        float minZoomMeters = 45.0f;
+        VehicleAxisTransform axisTransform{{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
+        VehicleRenderKind renderKind = VehicleRenderKind::ExteriorAircraft;
+        flight::GlbLoadOptions loadOptions{};
+        bool missileAsset = false;
+    };
+    const std::array<VehicleAssetLoadSpec, kVehicleModeCount> vehicleLoadSpecs{{
+        VehicleAssetLoadSpec{
+            VehicleMode::Airplane,
+            std::filesystem::path("assets") / "models" / "Airplane.glb",
+            1.0f,
+            45.0f,
+            kAirplaneAxisTransform,
+            VehicleRenderKind::ExteriorAircraft,
+            defaultAircraftLoadOptions,
+            false},
+        VehicleAssetLoadSpec{
+            VehicleMode::A320,
+            std::filesystem::path("assets") / "models" / "A320-200.glb",
+            1.0f,
+            75.0f,
+            kA320AxisTransform,
+            VehicleRenderKind::ExteriorAircraft,
+            bakedColorAircraftLoadOptions,
+            false},
+        VehicleAssetLoadSpec{
+            VehicleMode::F35,
+            std::filesystem::path("assets") / "models" / "F35.glb",
+            0.27f,
+            18.0f,
+            kF35AxisTransform,
+            VehicleRenderKind::ExteriorAircraft,
+            defaultAircraftLoadOptions,
+            false},
+        VehicleAssetLoadSpec{
+            VehicleMode::B2,
+            std::filesystem::path("assets") / "models" / "B2.glb",
+            0.88f,
+            30.0f,
+            kB2AxisTransform,
+            VehicleRenderKind::ExteriorAircraft,
+            defaultAircraftLoadOptions,
+            false},
+        VehicleAssetLoadSpec{
+            VehicleMode::Missile,
+            std::filesystem::path("assets") / "models" / "AIM120D.glb",
+            0.08f,
+            8.0f,
+            kCockpitAxisTransform,
+            VehicleRenderKind::Missile,
+            {},
+            true},
+        VehicleAssetLoadSpec{
+            VehicleMode::Cockpit737,
+            std::filesystem::path("assets") / "models" / "737cockpit.glb",
+            1.0f,
+            5.0f,
+            kCockpitAxisTransform,
+            VehicleRenderKind::InteriorCockpit,
+            cockpitLoadOptions,
+            false},
+    }};
+    const std::array<VehicleMode, kVehicleModeCount> vehicleLoadOrder{
         VehicleMode::Airplane,
-        std::filesystem::path("assets") / "models" / "Airplane.glb",
-        1.0f,
-        45.0f,
-        kAirplaneAxisTransform,
-        VehicleRenderKind::ExteriorAircraft,
-        defaultAircraftLoadOptions);
-    configureAircraftAsset(
         VehicleMode::A320,
-        std::filesystem::path("assets") / "models" / "A320-200.glb",
-        1.0f,
-        75.0f,
-        kA320AxisTransform,
-        VehicleRenderKind::ExteriorAircraft,
-        bakedColorAircraftLoadOptions);
-    configureAircraftAsset(
         VehicleMode::F35,
-        std::filesystem::path("assets") / "models" / "F35.glb",
-        0.27f,
-        18.0f,
-        kF35AxisTransform,
-        VehicleRenderKind::ExteriorAircraft,
-        defaultAircraftLoadOptions);
-    configureAircraftAsset(
         VehicleMode::B2,
-        std::filesystem::path("assets") / "models" / "B2.glb",
-        0.88f,
-        30.0f,
-        kB2AxisTransform,
-        VehicleRenderKind::ExteriorAircraft,
-        defaultAircraftLoadOptions);
-    configureAircraftAsset(
         VehicleMode::Cockpit737,
-        std::filesystem::path("assets") / "models" / "737cockpit.glb",
-        1.0f,
-        5.0f,
-        kCockpitAxisTransform,
-        VehicleRenderKind::InteriorCockpit,
-        cockpitLoadOptions);
-    configureMissileAsset(std::filesystem::path("assets") / "models" / "AIM120D.glb");
-
-    const auto& initialVehicleAsset = vehicleAssets[VehicleModeToIndex(VehicleMode::Airplane)];
-
-    std::string uploadError;
-    if (!renderer.SetPlaneMesh(initialVehicleAsset.mesh, uploadError)) {
-        MessageBoxA(hwnd, uploadError.c_str(), "Plane Upload Error", MB_OK | MB_ICONERROR);
+        VehicleMode::Missile,
+    };
+    auto initializeVehiclePlaceholder = [&](const VehicleAssetLoadSpec& spec) {
+        auto& asset = vehicleAssets[VehicleModeToIndex(spec.mode)];
+        asset = {};
+        asset.mesh = flight::CreatePlaceholderPlane();
+        asset.minZoomMeters = spec.minZoomMeters;
+        asset.renderKind = spec.renderKind;
+        asset.modelScale = spec.scale;
+        asset.axisTransform = spec.axisTransform;
+        asset.modelStatus = std::string(VehicleModeDisplayName(spec.mode)) + " model loading in background";
+        asset.textureStatus = std::string(VehicleModeDisplayName(spec.mode)) + " texture: using default while model loads";
+        asset.loadComplete = false;
+    };
+    for (const auto& spec : vehicleLoadSpecs) {
+        initializeVehiclePlaceholder(spec);
     }
-    std::string textureUploadError;
-    if (!renderer.SetPlaneTexture(
-            initialVehicleAsset.texture.IsValid() ? initialVehicleAsset.texture.rgbaPixels.data() : nullptr,
-            initialVehicleAsset.texture.width,
-            initialVehicleAsset.texture.height,
-            textureUploadError)) {
-        MessageBoxA(hwnd, textureUploadError.c_str(), "Plane Texture Upload Error", MB_OK | MB_ICONERROR);
-    }
+    auto buildVehicleAsset = [&](const VehicleAssetLoadSpec& spec) {
+        VehicleAssetLoadResult result{};
+        result.mode = spec.mode;
+
+        auto& asset = result.asset;
+        asset.minZoomMeters = spec.minZoomMeters;
+        asset.renderKind = spec.renderKind;
+        asset.modelScale = spec.scale;
+        asset.axisTransform = spec.axisTransform;
+
+        std::string loadError;
+        const bool loaded = flight::LoadGlbMesh(spec.path, asset.mesh, asset.texture, spec.loadOptions, loadError);
+        if (!loaded) {
+            asset.mesh = flight::CreatePlaceholderPlane();
+        }
+        if (spec.loadOptions.bakeMaterialColor) {
+            asset.texture = {};
+        }
+
+        if (spec.missileAsset) {
+            // Missile GLB already points the correct way for the chase camera; keep orientation and only scale it down.
+            for (auto& v : asset.mesh.vertices) {
+                v.position.x *= spec.scale;
+                v.position.y *= spec.scale;
+                v.position.z *= spec.scale;
+            }
+        } else {
+            // Imported aircraft do not share one local basis. Apply a per-model remap before upload.
+            for (auto& v : asset.mesh.vertices) {
+                v.position = transformVertexAxis(v.position, spec.axisTransform, spec.scale);
+                v.normal = transformVertexAxis(v.normal, spec.axisTransform, 1.0f);
+            }
+        }
+
+        if (!loaded) {
+            asset.modelStatus = std::string(VehicleModeDisplayName(spec.mode)) + " model load failed, using placeholder: " + loadError;
+            asset.textureStatus = std::string(VehicleModeDisplayName(spec.mode)) + " texture: fallback default (model load failed)";
+        } else {
+            asset.modelStatus = std::string(VehicleModeDisplayName(spec.mode)) + " model loaded: " + spec.path.string();
+            if (asset.texture.IsValid()) {
+                asset.textureStatus =
+                    std::string(VehicleModeDisplayName(spec.mode)) + " texture loaded (" + std::to_string(asset.texture.width) + "x" +
+                    std::to_string(asset.texture.height) + ")";
+            } else {
+                asset.textureStatus = std::string(VehicleModeDisplayName(spec.mode)) + " texture: none in GLB, using default";
+            }
+        }
+        asset.loadComplete = true;
+        return result;
+    };
 
     FlightSim sim;
     FlightSim missileViewSim;
@@ -1701,6 +1712,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     int startCityPresetIndex = kCityPresetSanFrancisco;
     VehicleMode vehicleMode = VehicleMode::Airplane;
     VehicleMode appliedRenderMode = VehicleMode::Airplane;
+    bool appliedVehicleAssetReady = false;
     MissileAutopilotState missileState{};
     missileState.launchLatDeg = editableStart.latitudeDeg;
     missileState.launchLonDeg = editableStart.longitudeDeg;
@@ -1868,7 +1880,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
     std::string terrainRuntimeError;
     std::string vehicleModeStatus;
-    std::string vehicleTextureStatus = initialVehicleAsset.textureStatus;
+    std::string vehicleTextureStatus =
+        std::string(VehicleModeDisplayName(vehicleMode)) + " texture: using renderer default placeholder";
     StreamStats satelliteStats{};
     std::string satelliteRuntimeStatus;
     flight::satellite::WorldTileSystemStats worldTileStats{};
@@ -1905,6 +1918,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     std::future<SatelliteComposeAsyncResult> satelliteComposeFuture;
     std::chrono::steady_clock::time_point satelliteComposeLaunchTime{};
     bool satelliteComposeLaunchValid = false;
+    bool vehicleAssetLoadInFlight = false;
+    std::future<VehicleAssetLoadResult> vehicleAssetLoadFuture;
     bool terrainBuildInFlight = false;
     std::future<TerrainBuildAsyncResult> terrainBuildFuture;
 
@@ -1976,11 +1991,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             cockpitViewRuntime.freelookActive = false;
             cockpitViewRuntime.hasLastMousePos = false;
         }
-        if (mode == appliedRenderMode) {
+        const auto& asset = vehicleAssets[VehicleModeToIndex(mode)];
+        if (!asset.loadComplete) {
+            appliedRenderMode = mode;
+            appliedVehicleAssetReady = false;
+            applyVehicleZoomRange(mode);
+            vehicleTextureStatus = asset.textureStatus;
+            vehicleModeStatus = std::string(VehicleModeDisplayName(mode)) + " is still loading; using placeholder";
+            return;
+        }
+        if (mode == appliedRenderMode && appliedVehicleAssetReady) {
             applyVehicleZoomRange(mode);
             return;
         }
-        const auto& asset = vehicleAssets[VehicleModeToIndex(mode)];
         std::string meshUploadError;
         const bool ok = renderer.SetPlaneMesh(asset.mesh, meshUploadError);
         if (!ok) {
@@ -1998,39 +2021,49 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             return;
         }
         appliedRenderMode = mode;
+        appliedVehicleAssetReady = true;
         applyVehicleZoomRange(mode);
         vehicleTextureStatus = asset.textureStatus;
         vehicleModeStatus = std::string("Switched to ") + VehicleModeDisplayName(mode) +
             (VehicleModeIsCockpit(mode) ? " cockpit view" : " vehicle view");
     };
+    auto launchVehicleAssetLoad = [&](VehicleMode mode) {
+        const VehicleAssetLoadSpec spec = vehicleLoadSpecs[VehicleModeToIndex(mode)];
+        vehicleAssetLoadInFlight = true;
+        vehicleAssetLoadFuture = std::async(std::launch::async, [buildVehicleAsset, spec]() { return buildVehicleAsset(spec); });
+    };
+    auto tryStartNextVehicleAssetLoad = [&]() {
+        if (vehicleAssetLoadInFlight) {
+            return;
+        }
+        const size_t activeModeIndex = VehicleModeToIndex(vehicleMode);
+        if (!vehicleAssets[activeModeIndex].loadComplete) {
+            launchVehicleAssetLoad(vehicleMode);
+            return;
+        }
+        for (const VehicleMode mode : vehicleLoadOrder) {
+            if (!vehicleAssets[VehicleModeToIndex(mode)].loadComplete) {
+                launchVehicleAssetLoad(mode);
+                return;
+            }
+        }
+    };
     applyVehicleZoomRange(vehicleMode);
+    vehicleModeStatus = "Loading vehicle models in background";
+    tryStartNextVehicleAssetLoad();
 
     if (satelliteStreamerReady && graphicsTuning.streamedSatelliteEnabled) {
         if (!renderer.IsWorldLockedSatelliteEnabled()) {
-            satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
-            const auto preloadStart = std::chrono::steady_clock::now();
-            while (std::chrono::steady_clock::now() - preloadStart < std::chrono::seconds(3)) {
-                satelliteStreamer.PrefetchForView(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), sim.HeadingDeg());
-                std::array<flight::satellite::RingTexture, 3> rings{};
-                std::string composeError;
-                const bool composed =
-                    satelliteStreamer.ComposeLodRings(sim.LatitudeDeg(), sim.LongitudeDeg(), sim.AltitudeMeters(), true, rings, composeError);
-                if (composed && uploadSatelliteRings(rings)) {
-                    satelliteRuntimeStatus = "Satellite preload complete";
-                    break;
-                }
-                if (!composeError.empty()) {
-                    satelliteRuntimeStatus = "Satellite preload compose failed: " + composeError;
-                }
-                satelliteStats = satelliteStreamer.GetStats();
-                Sleep(60);
-            }
+            satelliteRuntimeStatus = "Satellite streaming warm-up will happen after the first frame";
         } else {
             satelliteRuntimeStatus = "World-locked mode active: world tile scheduler owns prefetch";
         }
     } else if (satelliteStreamerReady) {
         satelliteRuntimeStatus = "Streamed satellite imagery disabled; using fallback texture only";
     }
+
+    ShowWindow(hwnd, showCmd);
+    UpdateWindow(hwnd);
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -2048,6 +2081,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
         if (!running) {
             break;
+        }
+
+        if (vehicleAssetLoadInFlight &&
+            vehicleAssetLoadFuture.valid() &&
+            vehicleAssetLoadFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            VehicleAssetLoadResult loadedAsset = vehicleAssetLoadFuture.get();
+            vehicleAssetLoadInFlight = false;
+            vehicleAssets[VehicleModeToIndex(loadedAsset.mode)] = std::move(loadedAsset.asset);
+            if (vehicleMode == loadedAsset.mode || appliedRenderMode == loadedAsset.mode) {
+                applyVehicleMesh(vehicleMode);
+            }
+            tryStartNextVehicleAssetLoad();
+        } else if (!vehicleAssetLoadInFlight) {
+            tryStartNextVehicleAssetLoad();
         }
 
         const auto now = std::chrono::high_resolution_clock::now();
@@ -3314,6 +3361,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
     if (terrainBuildInFlight && terrainBuildFuture.valid()) {
         terrainBuildFuture.wait();
+    }
+    if (vehicleAssetLoadInFlight && vehicleAssetLoadFuture.valid()) {
+        vehicleAssetLoadFuture.wait();
     }
 
     renderer.Shutdown();
