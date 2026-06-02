@@ -48,6 +48,7 @@ struct WorldAtlasUpload {
     uint32_t atlasPageX = 0;
     uint32_t atlasPageY = 0;
     std::shared_ptr<const std::vector<uint8_t>> rgbaPixels;
+    std::shared_ptr<const std::vector<uint8_t>> parentRgbaPixels;
     std::array<std::shared_ptr<const std::vector<uint8_t>>, NeighborCount> neighborRgbaPixels{};
 };
 
@@ -110,6 +111,7 @@ public:
         size_t minProtectedRequestsPerFrame = 48;
         size_t minProtectedUploadsPerFrame = 3;
         size_t nearResidentReservePages = 96;
+        double farTerrainCoverageRadiusKm = 2400.0;
         uint64_t requestCooldownFrames = 2;
         uint64_t staleNonResidentFrames = 240;
         uint64_t zoomSwitchHoldFrames = 45;

@@ -91,6 +91,17 @@ bool HasDecodedTilePixels(const std::shared_ptr<const std::vector<uint8_t>>& pix
     return pixels && pixels->size() >= (256u * 256u * 4u);
 }
 
+WorldTileKey ParentWorldTileKey(const WorldTileKey& key) {
+    if (key.z <= 0) {
+        return key;
+    }
+    WorldTileKey parent{};
+    parent.z = key.z - 1;
+    parent.x = key.x / 2;
+    parent.y = key.y / 2;
+    return parent;
+}
+
 WorldTileKey OffsetWorldTileKey(const WorldTileKey& key, int dx, int dy) {
     const int n = 1 << key.z;
     WorldTileKey shifted = key;
@@ -121,6 +132,15 @@ void PopulateUploadNeighborPixels(
         if (streamer.TryGetCachedTileRgba(neighborKey.z, neighborKey.x, neighborKey.y, neighborPixels) &&
             HasDecodedTilePixels(neighborPixels)) {
             upload.neighborRgbaPixels[i] = std::move(neighborPixels);
+        }
+    }
+
+    if (key.z > 0) {
+        const WorldTileKey parentKey = ParentWorldTileKey(key);
+        std::shared_ptr<const std::vector<uint8_t>> parentPixels;
+        if (streamer.TryGetCachedTileRgba(parentKey.z, parentKey.x, parentKey.y, parentPixels) &&
+            HasDecodedTilePixels(parentPixels)) {
+            upload.parentRgbaPixels = std::move(parentPixels);
         }
     }
 }
@@ -157,6 +177,7 @@ bool WorldTileSystem::Initialize(const Config& config, std::string& error) {
     cfg.maxUploadsPerFrame = std::clamp<size_t>(cfg.maxUploadsPerFrame, 1, 256);
     cfg.minProtectedRequestsPerFrame = std::clamp<size_t>(cfg.minProtectedRequestsPerFrame, 8, cfg.maxRequestsPerFrame);
     cfg.minProtectedUploadsPerFrame = std::clamp<size_t>(cfg.minProtectedUploadsPerFrame, 1, cfg.maxUploadsPerFrame);
+    cfg.farTerrainCoverageRadiusKm = std::clamp(cfg.farTerrainCoverageRadiusKm, 120.0, 6000.0);
     cfg.requestCooldownFrames = std::clamp<uint64_t>(cfg.requestCooldownFrames, 1, 60);
     cfg.staleNonResidentFrames = std::clamp<uint64_t>(cfg.staleNonResidentFrames, 30, 2000);
     cfg.zoomSwitchHoldFrames = std::clamp<uint64_t>(cfg.zoomSwitchHoldFrames, 5, 300);
@@ -462,6 +483,57 @@ std::vector<WorldTileSystem::VisibleTileCandidate> WorldTileSystem::ComputeVisib
                 s.nearProtected = s.nearProtected || nearProtect;
                 s.highPriority = s.highPriority ||
                     (band.nearProtected && (distNorm < 0.55f || (distNorm < 0.92f && forwardNorm >= 0.24f)));
+            }
+        }
+    }
+
+    // Coarse render-footprint coverage. This parent layer is deliberately scheduled
+    // before detail tiles so every visible terrain pixel can fall back to imagery.
+    {
+        int z = std::clamp(m_activeZooms[2] - 2, 0, m_config.maxZoom);
+        for (int candidateZ = z; candidateZ >= 5; --candidateZ) {
+            const double candidateKmPerTile = std::max(0.02, ApproxKmPerTile(lat, candidateZ));
+            const int candidateRadiusTiles = static_cast<int>(std::ceil(m_config.farTerrainCoverageRadiusKm / candidateKmPerTile)) + 1;
+            if (candidateRadiusTiles <= 8 || candidateZ == 5) {
+                z = candidateZ;
+                break;
+            }
+        }
+        const int n = 1 << z;
+        const double centerX = LonToTileXUnwrapped(lon, z);
+        const double centerY = LatToTileY(lat, z);
+        const int centerXi = static_cast<int>(std::floor(centerX));
+        const int centerYi = static_cast<int>(std::floor(centerY));
+        const double kmPerTile = std::max(0.02, ApproxKmPerTile(lat, z));
+        const int radiusTiles = std::clamp(
+            static_cast<int>(std::ceil(m_config.farTerrainCoverageRadiusKm / kmPerTile)) + 1,
+            2,
+            96);
+
+        for (int y = centerYi - radiusTiles; y <= centerYi + radiusTiles; ++y) {
+            const int yClamp = std::clamp(y, 0, n - 1);
+            for (int x = centerXi - radiusTiles; x <= centerXi + radiusTiles; ++x) {
+                const double dx = static_cast<double>(x) - centerX;
+                const double dy = static_cast<double>(y) - centerY;
+                const double distSq = dx * dx + dy * dy;
+                if (distSq > static_cast<double>(radiusTiles * radiusTiles) * 1.08) {
+                    continue;
+                }
+
+                WorldTileKey key{};
+                key.z = z;
+                key.x = WrapTileX(x, n);
+                key.y = yClamp;
+
+                const float distNorm = static_cast<float>(std::sqrt(distSq) / std::max(1, radiusTiles));
+                auto& s = unique[key];
+                const float priority = -2.0f + distNorm * 0.25f;
+                if (priority < s.priority) {
+                    s.priority = priority;
+                    s.bandIndex = 2;
+                }
+                s.nearProtected = true;
+                s.highPriority = true;
             }
         }
     }
@@ -833,6 +905,20 @@ void WorldTileSystem::Tick(const ViewState& view, SatelliteStreamer& streamer) {
             const bool allowRequest = (m_frameId - state.lastRequestFrame) >= m_config.requestCooldownFrames;
             if (!allowRequest) {
                 continue;
+            }
+            if (candidate.key.z > 0) {
+                const WorldTileKey parentKey = ParentWorldTileKey(candidate.key);
+                std::shared_ptr<const std::vector<uint8_t>> parentPixels;
+                if (!streamer.TryGetCachedTileRgba(parentKey.z, parentKey.x, parentKey.y, parentPixels)) {
+                    if (streamer.QueueTileRequest(parentKey.z, parentKey.x, parentKey.y, true)) {
+                        phaseBudget -= 1;
+                        requestBudget -= 1;
+                        m_streamerRequests += 1;
+                        if (phaseBudget == 0 || requestBudget == 0) {
+                            break;
+                        }
+                    }
+                }
             }
             if (streamer.QueueTileRequest(candidate.key.z, candidate.key.x, candidate.key.y, candidate.highPriority)) {
                 state.lastRequestFrame = m_frameId;

@@ -33,8 +33,8 @@ UINT64 Align256(UINT64 v) {
 }
 
 constexpr uint32_t kWorldUploadTileSize = 256;
-constexpr uint32_t kWorldTopLevelStitchPixels = 1;
-constexpr uint32_t kWorldMipStitchPixels = 4;
+constexpr uint32_t kWorldUploadGutterTexels = 8;
+constexpr uint32_t kWorldUploadPhysicalTileSize = kWorldUploadTileSize + kWorldUploadGutterTexels * 2u;
 
 const std::array<float, 256>& SrgbToLinearLut() {
     static const std::array<float, 256> lut = []() {
@@ -68,6 +68,10 @@ const uint8_t* TilePixelPtr(const uint8_t* pixels, uint32_t x, uint32_t y) {
     return pixels + ((static_cast<size_t>(y) * kWorldUploadTileSize + static_cast<size_t>(x)) * 4u);
 }
 
+uint8_t* PhysicalTilePixelPtr(std::vector<uint8_t>& pixels, uint32_t x, uint32_t y) {
+    return pixels.data() + ((static_cast<size_t>(y) * kWorldUploadPhysicalTileSize + static_cast<size_t>(x)) * 4u);
+}
+
 void ReadPixelLinear(const uint8_t* pixel, std::array<float, 4>& out) {
     out[0] = SrgbByteToLinear(pixel[0]);
     out[1] = SrgbByteToLinear(pixel[1]);
@@ -92,125 +96,113 @@ void LerpPixelLinear(
     }
 }
 
-void BuildStitchedWorldTile(
+void SampleTileLinear(const uint8_t* pixels, float u, float v, std::array<float, 4>& out) {
+    const float x = std::clamp(u, 0.0f, 1.0f) * static_cast<float>(kWorldUploadTileSize - 1u);
+    const float y = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(kWorldUploadTileSize - 1u);
+    const uint32_t x0 = static_cast<uint32_t>(std::floor(x));
+    const uint32_t y0 = static_cast<uint32_t>(std::floor(y));
+    const uint32_t x1 = std::min(x0 + 1u, kWorldUploadTileSize - 1u);
+    const uint32_t y1 = std::min(y0 + 1u, kWorldUploadTileSize - 1u);
+    const float tx = x - static_cast<float>(x0);
+    const float ty = y - static_cast<float>(y0);
+
+    std::array<float, 4> p00{};
+    std::array<float, 4> p10{};
+    std::array<float, 4> p01{};
+    std::array<float, 4> p11{};
+    ReadPixelLinear(TilePixelPtr(pixels, x0, y0), p00);
+    ReadPixelLinear(TilePixelPtr(pixels, x1, y0), p10);
+    ReadPixelLinear(TilePixelPtr(pixels, x0, y1), p01);
+    ReadPixelLinear(TilePixelPtr(pixels, x1, y1), p11);
+
+    std::array<float, 4> top{};
+    std::array<float, 4> bottom{};
+    LerpPixelLinear(p00, p10, tx, top);
+    LerpPixelLinear(p01, p11, tx, bottom);
+    LerpPixelLinear(top, bottom, ty, out);
+}
+
+const uint8_t* NeighborPixelsForOffset(
     const D3D12Renderer::WorldAtlasPageUpload& upload,
-    uint32_t stitchPixels,
+    int dx,
+    int dy) {
+    using Upload = D3D12Renderer::WorldAtlasPageUpload;
+    if (dx < 0 && dy == 0) {
+        return upload.neighborRgbaPixels[Upload::Left];
+    }
+    if (dx > 0 && dy == 0) {
+        return upload.neighborRgbaPixels[Upload::Right];
+    }
+    if (dx == 0 && dy < 0) {
+        return upload.neighborRgbaPixels[Upload::Top];
+    }
+    if (dx == 0 && dy > 0) {
+        return upload.neighborRgbaPixels[Upload::Bottom];
+    }
+    if (dx < 0 && dy < 0) {
+        return upload.neighborRgbaPixels[Upload::TopLeft];
+    }
+    if (dx > 0 && dy < 0) {
+        return upload.neighborRgbaPixels[Upload::TopRight];
+    }
+    if (dx < 0 && dy > 0) {
+        return upload.neighborRgbaPixels[Upload::BottomLeft];
+    }
+    if (dx > 0 && dy > 0) {
+        return upload.neighborRgbaPixels[Upload::BottomRight];
+    }
+    return upload.rgbaPixels;
+}
+
+void BuildPaddedWorldTile(
+    const D3D12Renderer::WorldAtlasPageUpload& upload,
     std::vector<uint8_t>& out) {
     if (!HasWorldUploadPixels(upload.rgbaPixels)) {
-        out.assign(static_cast<size_t>(kWorldUploadTileSize) * static_cast<size_t>(kWorldUploadTileSize) * 4u, 0u);
+        out.assign(static_cast<size_t>(kWorldUploadPhysicalTileSize) * static_cast<size_t>(kWorldUploadPhysicalTileSize) * 4u, 0u);
         return;
     }
 
-    out.assign(
-        upload.rgbaPixels,
-        upload.rgbaPixels + static_cast<size_t>(kWorldUploadTileSize) * static_cast<size_t>(kWorldUploadTileSize) * 4u);
+    out.assign(static_cast<size_t>(kWorldUploadPhysicalTileSize) * static_cast<size_t>(kWorldUploadPhysicalTileSize) * 4u, 0u);
 
-    const uint32_t clampedStitchPixels = std::clamp(stitchPixels, 1u, kWorldUploadTileSize / 2u);
-    auto edgeWeight = [clampedStitchPixels](uint32_t distToEdge) -> float {
-        const float t = 1.0f - (static_cast<float>(distToEdge) / static_cast<float>(clampedStitchPixels));
-        return 0.5f * std::clamp(t, 0.0f, 1.0f);
-    };
+    const int parentX = (upload.keyZ > 0) ? (upload.keyX / 2) : upload.keyX;
+    const int parentY = (upload.keyZ > 0) ? (upload.keyY / 2) : upload.keyY;
 
-    for (uint32_t y = 0; y < kWorldUploadTileSize; ++y) {
-        for (uint32_t x = 0; x < kWorldUploadTileSize; ++x) {
-            const bool onLeft = x < clampedStitchPixels;
-            const bool onRight = x >= (kWorldUploadTileSize - clampedStitchPixels);
-            const bool onTop = y < clampedStitchPixels;
-            const bool onBottom = y >= (kWorldUploadTileSize - clampedStitchPixels);
-            if (!onLeft && !onRight && !onTop && !onBottom) {
-                continue;
-            }
+    for (uint32_t y = 0; y < kWorldUploadPhysicalTileSize; ++y) {
+        for (uint32_t x = 0; x < kWorldUploadPhysicalTileSize; ++x) {
+            const float localX = (static_cast<float>(x) + 0.5f - static_cast<float>(kWorldUploadGutterTexels)) /
+                static_cast<float>(kWorldUploadTileSize);
+            const float localY = (static_cast<float>(y) + 0.5f - static_cast<float>(kWorldUploadGutterTexels)) /
+                static_cast<float>(kWorldUploadTileSize);
 
-            const uint8_t* centerPixel = TilePixelPtr(upload.rgbaPixels, x, y);
-            const uint8_t* horizPixel = centerPixel;
-            const uint8_t* vertPixel = centerPixel;
-            const uint8_t* diagPixel = centerPixel;
-            float hW = 0.0f;
-            float vW = 0.0f;
-            int hDir = 0;
-            int vDir = 0;
+            const bool inCenter =
+                x >= kWorldUploadGutterTexels &&
+                x < (kWorldUploadGutterTexels + kWorldUploadTileSize) &&
+                y >= kWorldUploadGutterTexels &&
+                y < (kWorldUploadGutterTexels + kWorldUploadTileSize);
 
-            if (onLeft && HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Left])) {
-                horizPixel = TilePixelPtr(
-                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Left],
-                    kWorldUploadTileSize - 1u - x,
-                    y);
-                hW = edgeWeight(x);
-                hDir = -1;
-            } else if (
-                onRight &&
-                HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Right])) {
-                const uint32_t dist = (kWorldUploadTileSize - 1u) - x;
-                horizPixel = TilePixelPtr(
-                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Right],
-                    dist,
-                    y);
-                hW = edgeWeight(dist);
-                hDir = 1;
-            }
-
-            if (onTop && HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Top])) {
-                vertPixel = TilePixelPtr(
-                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Top],
-                    x,
-                    kWorldUploadTileSize - 1u - y);
-                vW = edgeWeight(y);
-                vDir = -1;
-            } else if (
-                onBottom &&
-                HasWorldUploadPixels(upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Bottom])) {
-                const uint32_t dist = (kWorldUploadTileSize - 1u) - y;
-                vertPixel = TilePixelPtr(
-                    upload.neighborRgbaPixels[D3D12Renderer::WorldAtlasPageUpload::Bottom],
-                    x,
-                    dist);
-                vW = edgeWeight(dist);
-                vDir = 1;
-            }
-
-            if (hDir != 0 && vDir != 0) {
-                size_t diagIndex = D3D12Renderer::WorldAtlasPageUpload::TopLeft;
-                if (hDir > 0 && vDir < 0) {
-                    diagIndex = D3D12Renderer::WorldAtlasPageUpload::TopRight;
-                } else if (hDir < 0 && vDir > 0) {
-                    diagIndex = D3D12Renderer::WorldAtlasPageUpload::BottomLeft;
-                } else if (hDir > 0 && vDir > 0) {
-                    diagIndex = D3D12Renderer::WorldAtlasPageUpload::BottomRight;
+            std::array<float, 4> sampled{};
+            if (inCenter) {
+                ReadPixelLinear(
+                    TilePixelPtr(upload.rgbaPixels, x - kWorldUploadGutterTexels, y - kWorldUploadGutterTexels),
+                    sampled);
+            } else {
+                const int dx = (localX < 0.0f) ? -1 : ((localX >= 1.0f) ? 1 : 0);
+                const int dy = (localY < 0.0f) ? -1 : ((localY >= 1.0f) ? 1 : 0);
+                const uint8_t* sourcePixels = NeighborPixelsForOffset(upload, dx, dy);
+                if (HasWorldUploadPixels(sourcePixels)) {
+                    SampleTileLinear(sourcePixels, localX - static_cast<float>(dx), localY - static_cast<float>(dy), sampled);
+                } else if (HasWorldUploadPixels(upload.parentRgbaPixels) && upload.keyZ > 0) {
+                    const float childGlobalX = static_cast<float>(upload.keyX) + localX;
+                    const float childGlobalY = static_cast<float>(upload.keyY) + localY;
+                    const float parentU = (childGlobalX - static_cast<float>(parentX * 2)) * 0.5f;
+                    const float parentV = (childGlobalY - static_cast<float>(parentY * 2)) * 0.5f;
+                    SampleTileLinear(upload.parentRgbaPixels, parentU, parentV, sampled);
+                } else {
+                    SampleTileLinear(upload.rgbaPixels, localX, localY, sampled);
                 }
-
-                if (HasWorldUploadPixels(upload.neighborRgbaPixels[diagIndex])) {
-                    const uint32_t diagX = (hDir < 0) ? (kWorldUploadTileSize - 1u - x) : ((kWorldUploadTileSize - 1u) - x);
-                    const uint32_t diagY = (vDir < 0) ? (kWorldUploadTileSize - 1u - y) : ((kWorldUploadTileSize - 1u) - y);
-                    diagPixel = TilePixelPtr(upload.neighborRgbaPixels[diagIndex], diagX, diagY);
-                } else if (hW > 0.0f) {
-                    diagPixel = horizPixel;
-                } else if (vW > 0.0f) {
-                    diagPixel = vertPixel;
-                }
-            } else if (hW > 0.0f) {
-                diagPixel = horizPixel;
-            } else if (vW > 0.0f) {
-                diagPixel = vertPixel;
             }
 
-            std::array<float, 4> center{};
-            std::array<float, 4> horiz{};
-            std::array<float, 4> vert{};
-            std::array<float, 4> diag{};
-            ReadPixelLinear(centerPixel, center);
-            ReadPixelLinear(horizPixel, horiz);
-            ReadPixelLinear(vertPixel, vert);
-            ReadPixelLinear(diagPixel, diag);
-
-            std::array<float, 4> blend0{};
-            std::array<float, 4> blend1{};
-            std::array<float, 4> blended{};
-            LerpPixelLinear(center, horiz, hW, blend0);
-            LerpPixelLinear(vert, diag, hW, blend1);
-            LerpPixelLinear(blend0, blend1, vW, blended);
-
-            uint8_t* outPixel = out.data() + ((static_cast<size_t>(y) * kWorldUploadTileSize + static_cast<size_t>(x)) * 4u);
-            WritePixelLinear(outPixel, blended);
+            WritePixelLinear(PhysicalTilePixelPtr(out, x, y), sampled);
         }
     }
 }
@@ -1633,6 +1625,12 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
             static_cast<float>(std::clamp(m_worldSamplingZooms[1], 0, 22)),
             static_cast<float>(std::clamp(m_worldSamplingZooms[2], 0, 22)),
             8.0f,
+        };
+        obj.tuning15 = {
+            static_cast<float>(kWorldSatelliteTileSize),
+            static_cast<float>(kWorldSatellitePhysicalTileSize),
+            static_cast<float>(kWorldSatelliteGutterTexels),
+            static_cast<float>(kWorldSatelliteAtlasMipCount - 1u),
         };
 
         std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 2), &obj, sizeof(obj));
@@ -3629,8 +3627,8 @@ bool D3D12Renderer::CreateWorldStreamingResources(ID3D12GraphicsCommandList* com
 
     D3D12_RESOURCE_DESC atlasDesc{};
     atlasDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    atlasDesc.Width = static_cast<UINT64>(kWorldSatelliteTileSize) * static_cast<UINT64>(kWorldSatelliteAtlasPagesX);
-    atlasDesc.Height = kWorldSatelliteTileSize * kWorldSatelliteAtlasPagesY;
+    atlasDesc.Width = static_cast<UINT64>(kWorldSatellitePhysicalTileSize) * static_cast<UINT64>(kWorldSatelliteAtlasPagesX);
+    atlasDesc.Height = kWorldSatellitePhysicalTileSize * kWorldSatelliteAtlasPagesY;
     atlasDesc.DepthOrArraySize = 1;
     atlasDesc.MipLevels = static_cast<UINT16>(kWorldSatelliteAtlasMipCount);
     atlasDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
@@ -3891,16 +3889,12 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
                 continue;
             }
 
-            // Match the outermost texel on the full-resolution tile so the page-edge clamp path
-            // does not expose JPEG tile deltas, then use a slightly wider stitched seed for mips.
-            std::vector<uint8_t> topLevelPixels;
-            BuildStitchedWorldTile(upload, kWorldTopLevelStitchPixels, topLevelPixels);
-            std::vector<uint8_t> mipSeedPixels;
-            BuildStitchedWorldTile(upload, kWorldMipStitchPixels, mipSeedPixels);
+            std::vector<uint8_t> paddedPixels;
+            BuildPaddedWorldTile(upload, paddedPixels);
 
-            const uint8_t* mipPixels = topLevelPixels.data();
-            uint32_t mipWidth = kWorldSatelliteTileSize;
-            uint32_t mipHeight = kWorldSatelliteTileSize;
+            const uint8_t* mipPixels = paddedPixels.data();
+            uint32_t mipWidth = kWorldSatellitePhysicalTileSize;
+            uint32_t mipHeight = kWorldSatellitePhysicalTileSize;
             std::vector<uint8_t> mipStorage;
             std::vector<uint8_t> nextMipStorage;
 
@@ -3937,14 +3931,13 @@ bool D3D12Renderer::UploadWorldLockedSatelliteData(
                 srcLoc.PlacedFootprint.Footprint.Depth = 1;
                 srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
 
-                const UINT dstX = upload.atlasPageX * std::max(1u, kWorldSatelliteTileSize >> mip);
-                const UINT dstY = upload.atlasPageY * std::max(1u, kWorldSatelliteTileSize >> mip);
+                const UINT dstX = upload.atlasPageX * std::max(1u, kWorldSatellitePhysicalTileSize >> mip);
+                const UINT dstY = upload.atlasPageY * std::max(1u, kWorldSatellitePhysicalTileSize >> mip);
                 slot.commandList->CopyTextureRegion(&dstLoc, dstX, dstY, 0, &srcLoc, nullptr);
 
                 uploadedBytes += mipUploadBytes;
                 if (mip + 1u < kWorldSatelliteAtlasMipCount) {
-                    const uint8_t* downsampleSource = (mip == 0u) ? mipSeedPixels.data() : mipPixels;
-                    DownsampleRgbaBox2x2Linear(downsampleSource, mipWidth, mipHeight, nextMipStorage);
+                    DownsampleRgbaBox2x2Linear(mipPixels, mipWidth, mipHeight, nextMipStorage);
                     mipStorage.swap(nextMipStorage);
                     nextMipStorage.clear();
                     mipPixels = mipStorage.data();

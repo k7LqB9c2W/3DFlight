@@ -76,6 +76,10 @@ public:
         };
 
         const uint8_t* rgbaPixels = nullptr;
+        const uint8_t* parentRgbaPixels = nullptr;
+        int keyZ = 0;
+        int keyX = 0;
+        int keyY = 0;
         uint32_t atlasPageX = 0;
         uint32_t atlasPageY = 0;
         std::array<const uint8_t*, NeighborCount> neighborRgbaPixels{};
@@ -212,9 +216,11 @@ private:
     static constexpr UINT kMultipleScatteringUavIndex = kUavTableStartIndex + 2;
     static constexpr UINT kAerialPerspectiveUavIndex = kUavTableStartIndex + 3;
     static constexpr uint32_t kWorldSatelliteTileSize = 256;
+    static constexpr uint32_t kWorldSatelliteGutterTexels = 8;
+    static constexpr uint32_t kWorldSatellitePhysicalTileSize = kWorldSatelliteTileSize + kWorldSatelliteGutterTexels * 2u;
     static constexpr uint32_t kWorldSatelliteAtlasPagesX = 24;
     static constexpr uint32_t kWorldSatelliteAtlasPagesY = 24;
-    static constexpr uint32_t kWorldSatelliteAtlasMipCount = 9;
+    static constexpr uint32_t kWorldSatelliteAtlasMipCount = 5;
     static constexpr uint32_t kWorldSatellitePageTableWidth = 1024;
     static constexpr uint32_t kWorldSatellitePageTableHeight = 1024;
     static constexpr uint32_t kWorldUploadSlotCount = 3;
@@ -287,6 +293,7 @@ private:
         DirectX::XMFLOAT4 tuning12{};
         DirectX::XMFLOAT4 tuning13{};
         DirectX::XMFLOAT4 tuning14{};
+        DirectX::XMFLOAT4 tuning15{};
     };
 
     bool CreateDeviceResources(std::string& error);

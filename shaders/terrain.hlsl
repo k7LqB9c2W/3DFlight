@@ -39,6 +39,7 @@ cbuffer ObjectCB : register(b1)
     float4 gTuning12; // x terrain layer alpha, y worldLockedEnabled, z worldLockedBlend, w unused
     float4 gTuning13; // x atlasPagesX, y atlasPagesY, z pageTableWidth, w pageTableHeight
     float4 gTuning14; // x nearZoom, y midZoom, z farZoom, w maxPageTableProbeCount
+    float4 gTuning15; // x contentTileSize, y physicalTileSize, z gutterTexels, w maxAtlasMip
 };
 
 struct VSInput
@@ -200,7 +201,7 @@ float ComputeWorldAtlasLod(float2 tileCoord)
     const float2 gradXTexels = ddx(tileCoord) * 256.0;
     const float2 gradYTexels = ddy(tileCoord) * 256.0;
     const float rho2 = max(dot(gradXTexels, gradXTexels), dot(gradYTexels, gradYTexels));
-    return clamp(0.5 * log2(max(rho2, 1.0e-8)) - 0.15, 0.0, 8.0);
+    return clamp(0.5 * log2(max(rho2, 1.0e-8)) - 0.15, 0.0, max(gTuning15.w, 0.0));
 }
 
 bool SampleWorldAtlasPageLevel(int z, int tileXi, int tileYi, float2 localUv, float lod, out float4 sampleOut)
@@ -232,12 +233,13 @@ bool SampleWorldAtlasPageLevel(int z, int tileXi, int tileYi, float2 localUv, fl
     const uint pageX = atlasPageIndex % atlasPagesX;
     const uint pageY = atlasPageIndex / atlasPagesX;
 
+    const float contentSize = max(gTuning15.x, 1.0);
+    const float physicalSize = max(gTuning15.y, contentSize);
+    const float gutter = max(gTuning15.z, 0.0);
     const float2 atlasPageScale = rcp(float2(atlasPagesX, atlasPagesY));
-    // Expand the border guard with mip level so filtering never pulls from a neighboring atlas page.
-    const float mipGuardPixels = 0.5 * exp2(lod) + 1.0;
-    const float guard = saturate(mipGuardPixels / 256.0);
-    const float2 guardedUv = clamp(localUv, float2(guard, guard), float2(1.0 - guard, 1.0 - guard));
-    const float2 atlasUv = (float2(pageX, pageY) + guardedUv) * atlasPageScale;
+    const float2 physicalUv = (float2(gutter, gutter) + saturate(localUv) * float2(contentSize, contentSize)) /
+        float2(physicalSize, physicalSize);
+    const float2 atlasUv = (float2(pageX, pageY) + physicalUv) * atlasPageScale;
     sampleOut = gWorldSatelliteAtlas.SampleLevel(gClampSampler, atlasUv, lod);
     return sampleOut.a > 0.001;
 }
@@ -286,14 +288,24 @@ bool SampleWorldHierarchical(
     sampleOut = 0.0;
     const int z0 = clamp(preferredZoom, 0, 22);
     const int z1 = clamp(preferredZoom - 1, 0, 22);
-    const int z2 = clamp(fallbackZoomA, 0, 22);
-    const int z3 = clamp(fallbackZoomB, 0, 22);
+    const int z2 = clamp(preferredZoom - 2, 0, 22);
+    const int z3 = clamp(preferredZoom - 3, 0, 22);
+    const int z4 = clamp(preferredZoom - 4, 0, 22);
+    const int z5 = clamp(fallbackZoomA, 0, 22);
+    const int z6 = clamp(fallbackZoomA - 1, 0, 22);
+    const int z7 = clamp(fallbackZoomA - 2, 0, 22);
+    const int z8 = clamp(fallbackZoomB, 0, 22);
 
     float4 s = 0.0;
     if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z0, s)) { sampleOut = s; return true; }
     if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z1, s)) { sampleOut = s; return true; }
     if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z2, s)) { sampleOut = s; return true; }
     if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z3, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z4, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z5, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z6, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z7, s)) { sampleOut = s; return true; }
+    if (SampleWorldLonLatSeamAware(lonDeg, latDeg, z8, s)) { sampleOut = s; return true; }
     return false;
 }
 

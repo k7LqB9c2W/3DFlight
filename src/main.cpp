@@ -1782,6 +1782,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         worldCfg.minProtectedRequestsPerFrame = 72;
         worldCfg.minProtectedUploadsPerFrame = 6;
         worldCfg.nearResidentReservePages = 96;
+        worldCfg.farTerrainCoverageRadiusKm = 2600.0;
         worldCfg.requestCooldownFrames = 2;
         worldCfg.zoomSwitchHoldFrames = 45;
         worldCfg.altitudeBandHysteresisMeters = 180.0;
@@ -2303,6 +2304,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                         }
                         D3D12Renderer::WorldAtlasPageUpload item{};
                         item.rgbaPixels = upload.rgbaPixels->data();
+                        item.parentRgbaPixels = (upload.parentRgbaPixels && upload.parentRgbaPixels->size() >= (256u * 256u * 4u))
+                            ? upload.parentRgbaPixels->data()
+                            : nullptr;
+                        item.keyZ = upload.key.z;
+                        item.keyX = upload.key.x;
+                        item.keyY = upload.key.y;
                         item.atlasPageX = upload.atlasPageX;
                         item.atlasPageY = upload.atlasPageY;
                         for (size_t neighborIndex = 0; neighborIndex < upload.neighborRgbaPixels.size(); ++neighborIndex) {
