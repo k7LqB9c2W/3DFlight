@@ -753,6 +753,7 @@ bool D3D12Renderer::Initialize(
         upload.Reset();
     }
     m_modelAlbedoUpload.Reset();
+    m_hudMapUpload.Reset();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -872,6 +873,9 @@ void D3D12Renderer::Shutdown() {
     m_modelAlbedoTexture.Reset();
     m_modelAlbedoUpload.Reset();
     m_hasModelAlbedoTexture = false;
+    m_hudMapTexture.Reset();
+    m_hudMapUpload.Reset();
+    m_hasHudMapTexture = false;
     m_transmittanceLut.Reset();
     m_skyViewLut.Reset();
     m_multipleScatteringLut.Reset();
@@ -1017,6 +1021,80 @@ bool D3D12Renderer::SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, u
     WaitForGpu();
     m_modelAlbedoUpload.Reset();
 
+    return true;
+}
+
+bool D3D12Renderer::SetHudMapTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error) {
+    constexpr uint8_t kFallbackPixel[4] = {8, 15, 23, 255};
+    const uint8_t* srcPixels = rgbaPixels;
+    uint32_t srcWidth = width;
+    uint32_t srcHeight = height;
+    if (srcPixels == nullptr || srcWidth == 0 || srcHeight == 0) {
+        srcPixels = kFallbackPixel;
+        srcWidth = 1;
+        srcHeight = 1;
+    }
+
+    if (!m_satelliteUploadAllocator || !m_satelliteUploadCommandList || !m_fence) {
+        error = "SetHudMapTexture upload resources are not initialized";
+        return false;
+    }
+
+    WaitForFenceValue(m_satelliteUploadFenceValue);
+    CleanupDeferredTerrainResources();
+
+    if (FAILED(m_satelliteUploadAllocator->Reset())) {
+        error = "SetHudMapTexture upload allocator reset failed";
+        return false;
+    }
+    if (FAILED(m_satelliteUploadCommandList->Reset(m_satelliteUploadAllocator.Get(), nullptr))) {
+        error = "SetHudMapTexture command list reset failed";
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> newTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> newUpload;
+    if (!CreateSatelliteTextureFromPixels(
+            m_satelliteUploadCommandList.Get(),
+            kHudMapSrvIndex,
+            newTexture,
+            newUpload,
+            srcPixels,
+            srcWidth,
+            srcHeight,
+            error)) {
+        return false;
+    }
+
+    if (FAILED(m_satelliteUploadCommandList->Close())) {
+        error = "SetHudMapTexture command list close failed";
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_satelliteUploadCommandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    const UINT64 oldFenceSnapshot = m_fenceValue;
+    const UINT64 uploadFence = ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), uploadFence);
+
+    if (m_hudMapTexture) {
+        DeferredResource retired{};
+        retired.resource = std::move(m_hudMapTexture);
+        retired.safeFenceValue = oldFenceSnapshot;
+        m_retiredResources.push_back(std::move(retired));
+    }
+    if (m_hudMapUpload) {
+        DeferredResource retiredUpload{};
+        retiredUpload.resource = std::move(m_hudMapUpload);
+        retiredUpload.safeFenceValue = oldFenceSnapshot;
+        m_retiredResources.push_back(std::move(retiredUpload));
+    }
+
+    m_hudMapTexture = std::move(newTexture);
+    m_hudMapUpload = std::move(newUpload);
+    m_satelliteUploadFenceValue = uploadFence;
+    m_hasHudMapTexture = true;
     return true;
 }
 

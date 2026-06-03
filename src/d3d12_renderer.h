@@ -135,6 +135,7 @@ public:
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
     bool SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
+    bool SetHudMapTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
     bool SetSatelliteLodTextures(const std::array<SatelliteLodTexture, 3>& lods, std::string& error);
     bool UploadWorldLockedSatelliteData(
         const std::vector<WorldAtlasPageUpload>& pageUploads,
@@ -152,6 +153,10 @@ public:
     [[nodiscard]] bool HasLandmask() const { return m_hasLandmaskTexture; }
     [[nodiscard]] uint64_t LandmaskImGuiTextureHandle() const {
         return (m_srvHeap && m_landmaskTexture) ? GpuSrv(kLandmaskSrvIndex).ptr : 0ull;
+    }
+    [[nodiscard]] bool HasHudMapTexture() const { return m_hasHudMapTexture; }
+    [[nodiscard]] uint64_t HudMapImGuiTextureHandle() const {
+        return (m_srvHeap && m_hudMapTexture) ? GpuSrv(kHudMapSrvIndex).ptr : 0ull;
     }
     void SetAtmosphereEnabled(bool enabled) { m_atmosphereEnabled = enabled; }
     [[nodiscard]] bool IsAtmosphereEnabled() const { return m_atmosphereEnabled; }
@@ -210,6 +215,7 @@ private:
     static constexpr UINT kWorldSatelliteAtlasSrvIndex = 20;
     static constexpr UINT kWorldSatellitePageTableSrvIndex = 21;
     static constexpr UINT kWorldSatellitePageKeySrvIndex = 22;
+    static constexpr UINT kHudMapSrvIndex = 23;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
@@ -464,6 +470,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_modelAlbedoUpload;
     bool m_hasModelAlbedoTexture = false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_hudMapTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_hudMapUpload;
+    bool m_hasHudMapTexture = false;
     std::array<DirectX::XMFLOAT4, 3> m_satelliteLodBounds{
         DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f},
         DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, 0.0f},

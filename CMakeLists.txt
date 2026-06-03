@@ -18,6 +18,8 @@ add_executable(3DFlight WIN32
     src/mesh.h
     src/gltf_loader.cpp
     src/gltf_loader.h
+    src/hud_map_tile_streamer.cpp
+    src/hud_map_tile_streamer.h
     src/earth.cpp
     src/earth.h
     src/sim.cpp

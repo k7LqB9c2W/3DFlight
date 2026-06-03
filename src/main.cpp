@@ -13,9 +13,11 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 
 #include <imgui.h>
@@ -25,6 +27,7 @@
 
 #include "d3d12_renderer.h"
 #include "gltf_loader.h"
+#include "hud_map_tile_streamer.h"
 #include "mesh.h"
 #include "satellite/satellite_streamer.h"
 #include "satellite/world_tile_system.h"
@@ -38,6 +41,8 @@ using flight::FlightStart;
 using flight::GlbMaterialTexture;
 using flight::InputState;
 using flight::MeshData;
+using flight::hud::HudMapTileStats;
+using flight::hud::HudMapTileStreamer;
 using flight::satellite::SatelliteStreamer;
 using flight::satellite::StreamStats;
 using flight::satellite::WorldTileSystem;
@@ -501,7 +506,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             }
             return 0;
         case WM_MOUSEWHEEL:
-            if (g_renderer != nullptr && !(g_cockpitViewSelected != nullptr && *g_cockpitViewSelected)) {
+            if (g_renderer != nullptr && !ImGui::GetIO().WantCaptureMouse && !(g_cockpitViewSelected != nullptr && *g_cockpitViewSelected)) {
                 const short wheelDelta = GET_WHEEL_DELTA_WPARAM(wparam);
                 const float wheelSteps = static_cast<float>(wheelDelta) / static_cast<float>(WHEEL_DELTA);
                 g_renderer->AddCameraZoomSteps(wheelSteps);
@@ -570,6 +575,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
 bool IsKeyDown(int vk) {
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+bool IsWindowFocused(HWND hwnd) {
+    return hwnd != nullptr && GetForegroundWindow() == hwnd;
 }
 
 double LonDeltaDeg(double aDeg, double bDeg) {
@@ -776,6 +785,286 @@ void DrawWorldMapMarker(ImDrawList* drawList, const ImVec2& mapMin, const ImVec2
     drawList->AddTriangleFilled(nose, left, right, IM_COL32(255, 184, 77, 235));
     drawList->AddTriangle(nose, left, right, IM_COL32(24, 24, 24, 255), 2.0f);
     drawList->AddCircle(center, markerRadius + 2.0f, IM_COL32(255, 255, 255, 190), 24, 1.5f);
+}
+
+constexpr double kHudMapMaxLatitudeDeg = 85.05112878;
+constexpr int kHudMapTileSize = 256;
+constexpr int kHudMapMinZoom = 2;
+constexpr int kHudMapMaxZoom = 18;
+constexpr int kHudMapFallbackZoomDepth = 6;
+
+struct HudMapState {
+    bool focusedOnAircraft = true;
+    bool initialized = false;
+    double centerLatDeg = 37.6188056;
+    double centerLonDeg = -122.3754167;
+    int zoom = 11;
+    double refreshCooldownSeconds = 0.0;
+    uint32_t textureWidth = 768;
+    uint32_t textureHeight = 384;
+    size_t visibleTileCount = 0;
+    size_t residentTileCount = 0;
+    uint64_t composeGeneration = 0;
+    uint64_t uploadFailures = 0;
+    std::string status;
+};
+
+struct HudMapTileKey {
+    int z = 0;
+    int x = 0;
+    int y = 0;
+    friend bool operator==(const HudMapTileKey& a, const HudMapTileKey& b) {
+        return a.z == b.z && a.x == b.x && a.y == b.y;
+    }
+};
+
+struct HudMapTileKeyHasher {
+    size_t operator()(const HudMapTileKey& key) const noexcept {
+        const uint64_t a = static_cast<uint64_t>(static_cast<uint32_t>(key.z));
+        const uint64_t b = static_cast<uint64_t>(static_cast<uint32_t>(key.x));
+        const uint64_t c = static_cast<uint64_t>(static_cast<uint32_t>(key.y));
+        return static_cast<size_t>((a << 48u) ^ (b << 24u) ^ c);
+    }
+};
+
+struct HudMapComposeResult {
+    std::vector<uint8_t> rgbaPixels;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    size_t visibleTileCount = 0;
+    size_t residentTileCount = 0;
+    size_t sampledPixelCount = 0;
+};
+
+double ClampHudMapLatDeg(double latDeg) {
+    return std::clamp(latDeg, -kHudMapMaxLatitudeDeg, kHudMapMaxLatitudeDeg);
+}
+
+int WrapHudMapTileX(int x, int n) {
+    int r = x % n;
+    if (r < 0) {
+        r += n;
+    }
+    return r;
+}
+
+double HudMapLonToTileX(double lonDeg, int zoom) {
+    const double n = static_cast<double>(1u << zoom);
+    return (WrapLonDeg(lonDeg) + 180.0) / 360.0 * n;
+}
+
+double HudMapLatToTileY(double latDeg, int zoom) {
+    const double n = static_cast<double>(1u << zoom);
+    const double latRad = flight::DegToRad(ClampHudMapLatDeg(latDeg));
+    const double y = (1.0 - std::log(std::tan(latRad) + 1.0 / std::cos(latRad)) / kPi) * 0.5 * n;
+    return std::clamp(y, 0.0, n - 1.0e-6);
+}
+
+double HudMapTileXToLon(double tileX, int zoom) {
+    const double n = static_cast<double>(1u << zoom);
+    return WrapLonDeg((tileX / n) * 360.0 - 180.0);
+}
+
+double HudMapTileYToLat(double tileY, int zoom) {
+    const double n = static_cast<double>(1u << zoom);
+    const double merc = kPi * (1.0 - 2.0 * (tileY / n));
+    return ClampHudMapLatDeg(flight::RadToDeg(std::atan(std::sinh(merc))));
+}
+
+ImVec2 HudMapLonLatToScreen(
+    const HudMapState& state,
+    const ImVec2& mapMin,
+    const ImVec2& mapMax,
+    double latDeg,
+    double lonDeg) {
+    const double centerX = HudMapLonToTileX(state.centerLonDeg, state.zoom) * static_cast<double>(kHudMapTileSize);
+    const double centerY = HudMapLatToTileY(state.centerLatDeg, state.zoom) * static_cast<double>(kHudMapTileSize);
+    const double pointX = HudMapLonToTileX(lonDeg, state.zoom) * static_cast<double>(kHudMapTileSize);
+    const double pointY = HudMapLatToTileY(latDeg, state.zoom) * static_cast<double>(kHudMapTileSize);
+    const double worldWidthPixels = static_cast<double>(1u << state.zoom) * static_cast<double>(kHudMapTileSize);
+    double dx = pointX - centerX;
+    if (dx > worldWidthPixels * 0.5) {
+        dx -= worldWidthPixels;
+    } else if (dx < -worldWidthPixels * 0.5) {
+        dx += worldWidthPixels;
+    }
+    const double displayW = static_cast<double>(mapMax.x - mapMin.x);
+    const double displayH = static_cast<double>(mapMax.y - mapMin.y);
+    return {
+        static_cast<float>(0.5 * (static_cast<double>(mapMin.x) + static_cast<double>(mapMax.x)) +
+            dx * displayW / static_cast<double>(std::max<uint32_t>(state.textureWidth, 1u))),
+        static_cast<float>(0.5 * (static_cast<double>(mapMin.y) + static_cast<double>(mapMax.y)) +
+            (pointY - centerY) * displayH / static_cast<double>(std::max<uint32_t>(state.textureHeight, 1u))),
+    };
+}
+
+void DrawHudMapMarker(
+    ImDrawList* drawList,
+    const HudMapState& state,
+    const ImVec2& mapMin,
+    const ImVec2& mapMax,
+    double latDeg,
+    double lonDeg,
+    double headingDeg) {
+    if (drawList == nullptr) {
+        return;
+    }
+
+    const ImVec2 center = HudMapLonLatToScreen(state, mapMin, mapMax, latDeg, lonDeg);
+    if (center.x < mapMin.x - 40.0f || center.x > mapMax.x + 40.0f || center.y < mapMin.y - 40.0f || center.y > mapMax.y + 40.0f) {
+        return;
+    }
+
+    const float mapSpan = std::min(mapMax.x - mapMin.x, mapMax.y - mapMin.y);
+    const float markerRadius = std::clamp(mapSpan * 0.020f, 4.0f, 8.0f);
+    const float arrowLength = std::clamp(mapSpan * 0.10f, 16.0f, 30.0f);
+    const float arrowWidth = arrowLength * 0.42f;
+
+    const double headingRad = flight::DegToRad(NormalizeHeadingDeg360(headingDeg));
+    const float dirX = static_cast<float>(std::sin(headingRad));
+    const float dirY = static_cast<float>(-std::cos(headingRad));
+    const float perpX = -dirY;
+    const float perpY = dirX;
+
+    const ImVec2 nose = {center.x + dirX * arrowLength, center.y + dirY * arrowLength};
+    const ImVec2 left = {
+        center.x - dirX * (arrowLength * 0.48f) + perpX * arrowWidth,
+        center.y - dirY * (arrowLength * 0.48f) + perpY * arrowWidth,
+    };
+    const ImVec2 right = {
+        center.x - dirX * (arrowLength * 0.48f) - perpX * arrowWidth,
+        center.y - dirY * (arrowLength * 0.48f) - perpY * arrowWidth,
+    };
+
+    drawList->AddCircleFilled(center, markerRadius + 2.0f, IM_COL32(0, 0, 0, 185), 24);
+    drawList->AddTriangleFilled(nose, left, right, IM_COL32(255, 184, 77, 245));
+    drawList->AddTriangle(nose, left, right, IM_COL32(24, 24, 24, 255), 2.0f);
+    drawList->AddCircle(center, markerRadius + 2.0f, IM_COL32(255, 255, 255, 215), 24, 1.5f);
+}
+
+uint8_t HudMapSampleChannel(const std::vector<uint8_t>& pixels, int x, int y, int channel) {
+    const size_t idx = (static_cast<size_t>(std::clamp(y, 0, 255)) * 256u + static_cast<size_t>(std::clamp(x, 0, 255))) * 4u +
+        static_cast<size_t>(channel);
+    return pixels[idx];
+}
+
+void QueueAndGatherHudMapTiles(
+    HudMapTileStreamer& streamer,
+    const HudMapState& state,
+    std::unordered_map<HudMapTileKey, std::shared_ptr<const std::vector<uint8_t>>, HudMapTileKeyHasher>& cachedTiles,
+    size_t& outVisibleTiles,
+    size_t& outResidentVisibleTiles) {
+    cachedTiles.clear();
+    outVisibleTiles = 0;
+    outResidentVisibleTiles = 0;
+
+    const int targetZoom = std::clamp(state.zoom, kHudMapMinZoom, kHudMapMaxZoom);
+    const int minZoom = std::max(0, targetZoom - kHudMapFallbackZoomDepth);
+    for (int z = targetZoom; z >= minZoom; --z) {
+        const double scale = std::ldexp(1.0, targetZoom - z);
+        const double centerX = HudMapLonToTileX(state.centerLonDeg, z);
+        const double centerY = HudMapLatToTileY(state.centerLatDeg, z);
+        const double halfTilesX = 0.5 * static_cast<double>(state.textureWidth) / (static_cast<double>(kHudMapTileSize) * scale);
+        const double halfTilesY = 0.5 * static_cast<double>(state.textureHeight) / (static_cast<double>(kHudMapTileSize) * scale);
+        const int n = 1 << z;
+        const int x0 = static_cast<int>(std::floor(centerX - halfTilesX)) - 1;
+        const int x1 = static_cast<int>(std::ceil(centerX + halfTilesX)) + 1;
+        const int y0 = std::max(0, static_cast<int>(std::floor(centerY - halfTilesY)) - 1);
+        const int y1 = std::min(n - 1, static_cast<int>(std::ceil(centerY + halfTilesY)) + 1);
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const int wrappedX = WrapHudMapTileX(x, n);
+                if (z == targetZoom) {
+                    outVisibleTiles += 1;
+                }
+
+                std::shared_ptr<const std::vector<uint8_t>> pixels;
+                if (streamer.TryGetCachedTileRgba(z, wrappedX, y, pixels) && pixels && pixels->size() >= (256u * 256u * 4u)) {
+                    cachedTiles.emplace(HudMapTileKey{z, wrappedX, y}, std::move(pixels));
+                    if (z == targetZoom) {
+                        outResidentVisibleTiles += 1;
+                    }
+                } else {
+                    const bool highPriority = (z == targetZoom);
+                    (void)streamer.QueueTileRequest(z, wrappedX, y, highPriority);
+                }
+            }
+        }
+    }
+}
+
+HudMapComposeResult ComposeHudMapTexture(HudMapTileStreamer& streamer, const HudMapState& state) {
+    HudMapComposeResult result{};
+    result.width = std::max<uint32_t>(state.textureWidth, 1u);
+    result.height = std::max<uint32_t>(state.textureHeight, 1u);
+    result.rgbaPixels.assign(static_cast<size_t>(result.width) * static_cast<size_t>(result.height) * 4u, 255u);
+
+    std::unordered_map<HudMapTileKey, std::shared_ptr<const std::vector<uint8_t>>, HudMapTileKeyHasher> cachedTiles;
+    QueueAndGatherHudMapTiles(streamer, state, cachedTiles, result.visibleTileCount, result.residentTileCount);
+
+    const int targetZoom = std::clamp(state.zoom, kHudMapMinZoom, kHudMapMaxZoom);
+    const int minZoom = std::max(0, targetZoom - kHudMapFallbackZoomDepth);
+    const double centerPxX = HudMapLonToTileX(state.centerLonDeg, targetZoom) * static_cast<double>(kHudMapTileSize);
+    const double centerPxY = HudMapLatToTileY(state.centerLatDeg, targetZoom) * static_cast<double>(kHudMapTileSize);
+    const double halfW = static_cast<double>(result.width) * 0.5;
+    const double halfH = static_cast<double>(result.height) * 0.5;
+
+    for (uint32_t y = 0; y < result.height; ++y) {
+        const double targetPxY = centerPxY + (static_cast<double>(y) + 0.5 - halfH);
+        for (uint32_t x = 0; x < result.width; ++x) {
+            const double targetPxX = centerPxX + (static_cast<double>(x) + 0.5 - halfW);
+
+            std::array<uint8_t, 4> color{20, 29, 37, 255};
+            bool sampled = false;
+            for (int z = targetZoom; z >= minZoom; --z) {
+                const double scale = std::ldexp(1.0, targetZoom - z);
+                const double samplePxX = targetPxX / scale;
+                const double samplePxY = targetPxY / scale;
+                const double tileXd = std::floor(samplePxX / static_cast<double>(kHudMapTileSize));
+                const double tileYd = std::floor(samplePxY / static_cast<double>(kHudMapTileSize));
+                const int n = 1 << z;
+                const int tileX = WrapHudMapTileX(static_cast<int>(tileXd), n);
+                const int tileY = std::clamp(static_cast<int>(tileYd), 0, n - 1);
+                const auto found = cachedTiles.find(HudMapTileKey{z, tileX, tileY});
+                if (found == cachedTiles.end() || !found->second || found->second->size() < (256u * 256u * 4u)) {
+                    continue;
+                }
+
+                const std::vector<uint8_t>& tile = *found->second;
+                const double localX = std::clamp(samplePxX - tileXd * static_cast<double>(kHudMapTileSize), 0.0, 255.999);
+                const double localY = std::clamp(samplePxY - tileYd * static_cast<double>(kHudMapTileSize), 0.0, 255.999);
+                const int px0 = std::clamp(static_cast<int>(std::floor(localX)), 0, 255);
+                const int py0 = std::clamp(static_cast<int>(std::floor(localY)), 0, 255);
+                const int px1 = std::min(px0 + 1, 255);
+                const int py1 = std::min(py0 + 1, 255);
+                const float tx = static_cast<float>(localX - static_cast<double>(px0));
+                const float ty = static_cast<float>(localY - static_cast<double>(py0));
+                for (int c = 0; c < 3; ++c) {
+                    const float c00 = static_cast<float>(HudMapSampleChannel(tile, px0, py0, c));
+                    const float c10 = static_cast<float>(HudMapSampleChannel(tile, px1, py0, c));
+                    const float c01 = static_cast<float>(HudMapSampleChannel(tile, px0, py1, c));
+                    const float c11 = static_cast<float>(HudMapSampleChannel(tile, px1, py1, c));
+                    const float c0 = c00 + (c10 - c00) * tx;
+                    const float c1 = c01 + (c11 - c01) * tx;
+                    color[static_cast<size_t>(c)] = static_cast<uint8_t>(std::clamp(std::lround(c0 + (c1 - c0) * ty), 0l, 255l));
+                }
+                color[3] = 255u;
+                sampled = true;
+                break;
+            }
+
+            if (sampled) {
+                result.sampledPixelCount += 1;
+            }
+            const size_t dst = (static_cast<size_t>(y) * static_cast<size_t>(result.width) + static_cast<size_t>(x)) * 4u;
+            result.rgbaPixels[dst + 0] = color[0];
+            result.rgbaPixels[dst + 1] = color[1];
+            result.rgbaPixels[dst + 2] = color[2];
+            result.rgbaPixels[dst + 3] = color[3];
+        }
+    }
+
+    return result;
 }
 
 constexpr int kCityPresetSanFrancisco = 0;
@@ -2149,6 +2438,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
     }
 
+    HudMapTileStreamer hudMapStreamer;
+    bool hudMapStreamerReady = false;
+    std::string hudMapInitStatus;
+    {
+        HudMapTileStreamer::Config hudMapCfg{};
+        hudMapCfg.urlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+        hudMapCfg.diskCacheDirectory = std::filesystem::path("cache") / "hud_map" / "osm";
+        hudMapCfg.maxMemoryTiles = 1536;
+        hudMapCfg.workerCount = 2;
+        std::string hudMapError;
+        if (hudMapStreamer.Initialize(hudMapCfg, hudMapError)) {
+            hudMapStreamerReady = true;
+            hudMapInitStatus = "HUD map stream ready";
+        } else {
+            hudMapInitStatus = "HUD map stream init failed: " + hudMapError;
+        }
+    }
+    HudMapState hudMapState{};
+    HudMapTileStats hudMapStats{};
+
     TerrainPatchSettings patchSettings{};
     GraphicsTuningConfig graphicsTuning = MakeRealisticTuningPreset();
     const std::filesystem::path graphicsConfigPath = std::filesystem::path("config") / "graphics_tuning.json";
@@ -2481,18 +2790,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         InputState input{};
-        input.pitchUp = IsKeyDown('W');
-        input.pitchDown = IsKeyDown('S');
-        input.rollLeft = IsKeyDown('A');
-        input.rollRight = IsKeyDown('D');
-        input.yawLeft = IsKeyDown('Q');
-        input.yawRight = IsKeyDown('E');
-        input.throttleUp = IsKeyDown(VK_UP);
-        input.throttleDown = IsKeyDown(VK_DOWN);
-        input.altitudeUp = IsKeyDown('R');
-        input.altitudeDown = IsKeyDown('F');
+        const bool flightInputFocused = IsWindowFocused(hwnd);
+        if (flightInputFocused) {
+            input.pitchUp = IsKeyDown('W');
+            input.pitchDown = IsKeyDown('S');
+            input.rollLeft = IsKeyDown('A');
+            input.rollRight = IsKeyDown('D');
+            input.yawLeft = IsKeyDown('Q');
+            input.yawRight = IsKeyDown('E');
+            input.throttleUp = IsKeyDown(VK_UP);
+            input.throttleDown = IsKeyDown(VK_DOWN);
+            input.altitudeUp = IsKeyDown('R');
+            input.altitudeDown = IsKeyDown('F');
+        }
 
-        const bool backspaceDown = IsKeyDown(VK_BACK);
+        const bool backspaceDown = flightInputFocused && IsKeyDown(VK_BACK);
         input.resetPressed = backspaceDown && !previousBackspace;
         previousBackspace = backspaceDown;
 
@@ -3364,32 +3676,150 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         ImGui::Begin("World Map");
         const double mapHeadingDeg = NormalizeHeadingDeg360(activeSim.HeadingDeg());
-        const uint64_t landmaskTextureHandle = renderer.LandmaskImGuiTextureHandle();
-        const bool hasMapTexture = renderer.HasLandmask() && landmaskTextureHandle != 0;
         const float availableMapWidth = std::max(ImGui::GetContentRegionAvail().x, 280.0f);
         const ImVec2 mapSize{
             std::clamp(availableMapWidth, 280.0f, 560.0f),
             std::clamp(availableMapWidth * 0.5f, 150.0f, 280.0f),
         };
+
+        if (!hudMapState.initialized) {
+            hudMapState.centerLatDeg = ClampHudMapLatDeg(activeSim.LatitudeDeg());
+            hudMapState.centerLonDeg = WrapLonDeg(activeSim.LongitudeDeg());
+            hudMapState.initialized = true;
+            hudMapState.refreshCooldownSeconds = 0.0;
+        }
+        if (hudMapState.focusedOnAircraft) {
+            hudMapState.centerLatDeg = ClampHudMapLatDeg(activeSim.LatitudeDeg());
+            hudMapState.centerLonDeg = WrapLonDeg(activeSim.LongitudeDeg());
+        }
+
+        const uint32_t desiredMapTexWidth = static_cast<uint32_t>(std::clamp(std::lround(mapSize.x * 1.5f), 512l, 1024l));
+        const uint32_t desiredMapTexHeight = static_cast<uint32_t>(std::clamp(std::lround(mapSize.y * 1.5f), 256l, 512l));
+        if (hudMapState.textureWidth != desiredMapTexWidth || hudMapState.textureHeight != desiredMapTexHeight) {
+            hudMapState.textureWidth = desiredMapTexWidth;
+            hudMapState.textureHeight = desiredMapTexHeight;
+            hudMapState.refreshCooldownSeconds = 0.0;
+        }
+
+        if (ImGui::Button(hudMapState.focusedOnAircraft ? "Focused" : "Focus")) {
+            hudMapState.focusedOnAircraft = true;
+            hudMapState.centerLatDeg = ClampHudMapLatDeg(activeSim.LatitudeDeg());
+            hudMapState.centerLonDeg = WrapLonDeg(activeSim.LongitudeDeg());
+            hudMapState.refreshCooldownSeconds = 0.0;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("-")) {
+            hudMapState.zoom = std::clamp(hudMapState.zoom - 1, kHudMapMinZoom, kHudMapMaxZoom);
+            hudMapState.refreshCooldownSeconds = 0.0;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("+")) {
+            hudMapState.zoom = std::clamp(hudMapState.zoom + 1, kHudMapMinZoom, kHudMapMaxZoom);
+            hudMapState.refreshCooldownSeconds = 0.0;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.0f);
+        if (ImGui::SliderInt("Zoom", &hudMapState.zoom, kHudMapMinZoom, kHudMapMaxZoom)) {
+            hudMapState.refreshCooldownSeconds = 0.0;
+        }
+
         const ImVec2 mapMin = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("##world_map_canvas", mapSize);
         const ImVec2 mapMax = {mapMin.x + mapSize.x, mapMin.y + mapSize.y};
+        const bool mapHovered = ImGui::IsItemHovered();
+        const bool mapActive = ImGui::IsItemActive();
+        const ImGuiIO& io = ImGui::GetIO();
+        if (mapHovered && std::abs(io.MouseWheel) > 0.0f) {
+            const int zoomDelta = (io.MouseWheel > 0.0f) ? 1 : -1;
+            const int nextZoom = std::clamp(hudMapState.zoom + zoomDelta, kHudMapMinZoom, kHudMapMaxZoom);
+            if (nextZoom != hudMapState.zoom) {
+                hudMapState.zoom = nextZoom;
+                hudMapState.refreshCooldownSeconds = 0.0;
+            }
+        }
+        if (mapActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.0f)) {
+            const ImVec2 drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+            if (std::abs(drag.x) > 0.0f || std::abs(drag.y) > 0.0f) {
+                const double displayW = std::max(1.0f, mapSize.x);
+                const double displayH = std::max(1.0f, mapSize.y);
+                const double texelsPerDisplayX = static_cast<double>(hudMapState.textureWidth) / displayW;
+                const double texelsPerDisplayY = static_cast<double>(hudMapState.textureHeight) / displayH;
+                const double centerPxX =
+                    HudMapLonToTileX(hudMapState.centerLonDeg, hudMapState.zoom) * static_cast<double>(kHudMapTileSize) -
+                    static_cast<double>(drag.x) * texelsPerDisplayX;
+                const double centerPxY =
+                    HudMapLatToTileY(hudMapState.centerLatDeg, hudMapState.zoom) * static_cast<double>(kHudMapTileSize) -
+                    static_cast<double>(drag.y) * texelsPerDisplayY;
+                const double n = static_cast<double>(1u << hudMapState.zoom);
+                hudMapState.centerLonDeg = HudMapTileXToLon(centerPxX / static_cast<double>(kHudMapTileSize), hudMapState.zoom);
+                hudMapState.centerLatDeg =
+                    HudMapTileYToLat(std::clamp(centerPxY / static_cast<double>(kHudMapTileSize), 0.0, n - 1.0e-6), hudMapState.zoom);
+                hudMapState.focusedOnAircraft = false;
+                hudMapState.refreshCooldownSeconds = 0.0;
+                ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
+            }
+        }
+
+        if (hudMapStreamerReady) {
+            hudMapState.refreshCooldownSeconds = std::max(0.0, hudMapState.refreshCooldownSeconds - dt);
+            if (hudMapState.refreshCooldownSeconds <= 0.0) {
+                HudMapComposeResult mapResult = ComposeHudMapTexture(hudMapStreamer, hudMapState);
+                std::string hudMapUploadError;
+                if (renderer.SetHudMapTexture(mapResult.rgbaPixels.data(), mapResult.width, mapResult.height, hudMapUploadError)) {
+                    hudMapState.visibleTileCount = mapResult.visibleTileCount;
+                    hudMapState.residentTileCount = mapResult.residentTileCount;
+                    hudMapState.composeGeneration += 1;
+                    const double coverage = (mapResult.width > 0 && mapResult.height > 0)
+                        ? static_cast<double>(mapResult.sampledPixelCount) /
+                            static_cast<double>(static_cast<uint64_t>(mapResult.width) * static_cast<uint64_t>(mapResult.height))
+                        : 0.0;
+                    std::ostringstream status;
+                    status << "HUD map composed " << mapResult.width << "x" << mapResult.height << " coverage "
+                           << std::fixed << std::setprecision(0) << (coverage * 100.0) << "%";
+                    hudMapState.status = status.str();
+                } else {
+                    hudMapState.uploadFailures += 1;
+                    hudMapState.status = "HUD map upload failed: " + hudMapUploadError;
+                }
+                hudMapStats = hudMapStreamer.GetStats();
+                const bool waitingForTiles = hudMapState.residentTileCount < hudMapState.visibleTileCount || hudMapStats.queuedRequests > 0;
+                hudMapState.refreshCooldownSeconds = waitingForTiles ? 0.25 : 0.75;
+            } else {
+                hudMapStats = hudMapStreamer.GetStats();
+            }
+        }
+
         ImDrawList* const mapDrawList = ImGui::GetWindowDrawList();
         mapDrawList->AddRectFilled(mapMin, mapMax, IM_COL32(8, 15, 23, 255), 6.0f);
+        const uint64_t hudMapTextureHandle = renderer.HudMapImGuiTextureHandle();
+        const bool hasMapTexture = renderer.HasHudMapTexture() && hudMapTextureHandle != 0;
         if (hasMapTexture) {
-            const ImTextureID mapTexture = static_cast<ImTextureID>(landmaskTextureHandle);
+            const ImTextureID mapTexture = static_cast<ImTextureID>(hudMapTextureHandle);
             mapDrawList->AddImage(mapTexture, mapMin, mapMax, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), IM_COL32(255, 255, 255, 235));
         }
-        DrawWorldMapGrid(mapDrawList, mapMin, mapMax);
-        DrawWorldMapMarker(mapDrawList, mapMin, mapMax, activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), mapHeadingDeg);
+        mapDrawList->PushClipRect(mapMin, mapMax, true);
+        DrawHudMapMarker(mapDrawList, hudMapState, mapMin, mapMax, activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), mapHeadingDeg);
+        mapDrawList->PopClipRect();
+        mapDrawList->AddText({mapMin.x + 8.0f, mapMax.y - 18.0f}, IM_COL32(255, 255, 255, 190), "OpenStreetMap");
         mapDrawList->AddRect(mapMin, mapMax, IM_COL32(255, 255, 255, 120), 6.0f, 0, 1.5f);
 
         ImGui::Text("Heading: %.1f deg %s", mapHeadingDeg, HeadingCardinalName(mapHeadingDeg));
         ImGui::Text("Position: %.2f, %.2f", activeSim.LatitudeDeg(), activeSim.LongitudeDeg());
-        if (!hasMapTexture) {
-            ImGui::TextUnformatted("Map texture unavailable, using graticule fallback.");
+        ImGui::Text(
+            "Map: %s z%d center %.4f, %.4f tiles %zu/%zu queued %zu",
+            hudMapState.focusedOnAircraft ? "focused" : "free",
+            hudMapState.zoom,
+            hudMapState.centerLatDeg,
+            hudMapState.centerLonDeg,
+            hudMapState.residentTileCount,
+            hudMapState.visibleTileCount,
+            hudMapStats.queuedRequests);
+        if (!hudMapStreamerReady) {
+            ImGui::TextWrapped("%s", hudMapInitStatus.c_str());
+        } else if (!hasMapTexture) {
+            ImGui::TextUnformatted("Map tiles are loading.");
         } else {
-            ImGui::TextUnformatted("Marker shows aircraft position and nose direction.");
+            ImGui::TextWrapped("%s", hudMapState.status.c_str());
         }
         ImGui::End();
 

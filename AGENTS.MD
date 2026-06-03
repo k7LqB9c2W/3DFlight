@@ -1,9 +1,9 @@
 HEADERS FOR DIRECT 3D 12 ARE AT D:\Include\10.0.26100.0
-
+Even if the "worktree" is dirty, you are allowed to modify the file!
 # AGENTS.MD
 
 ## Purpose
-Build and run the 3DFlight Direct3D 12 game in this repository using MSVC + CMake + vcpkg manifest mode.
+Build and run the 3DFlight Direct3D 12 game in this repository using MSVC + CMake + vcpkg manifest mode. ONLY DO RELEASE BUILDS UNLESS I TELL YOU TO DO A DEBUG BUILD
 
 ## Project assumptions
 - OS: Windows 10/11 x64
