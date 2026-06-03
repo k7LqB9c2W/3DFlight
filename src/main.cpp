@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -970,6 +971,68 @@ struct MissileAutopilotState {
     bool impacted = false;
 };
 
+struct AirportRoutePreset {
+    const char* label = "";
+    const char* ident = "";
+    double latitudeDeg = 0.0;
+    double longitudeDeg = 0.0;
+    double elevationMeters = 0.0;
+    double runwayHeadingDeg = 0.0;
+};
+
+enum class AirplaneRoutePhase {
+    Ready,
+    TakeoffRoll,
+    Climb,
+    Cruise,
+    Descent,
+    Final,
+    Arrived,
+};
+
+struct AirplaneRouteAutopilotState {
+    int originAirportIndex = 0;
+    int destinationAirportIndex = 1;
+    AirplaneRoutePhase phase = AirplaneRoutePhase::Ready;
+    bool active = false;
+    bool arrived = false;
+    double phaseElapsedSeconds = 0.0;
+    double originGroundMeters = 0.0;
+    double destinationGroundMeters = 0.0;
+    double cruiseAltitudeMeters = 5000.0;
+    double targetAltitudeMeters = 0.0;
+    double initialDistanceMeters = 0.0;
+    double distanceToDestinationMeters = 0.0;
+};
+
+constexpr int kRouteAirportSanFranciscoSfo = 0;
+constexpr int kRouteAirportLosAngelesLax = 1;
+constexpr int kRouteAirportSanDiegoSan = 2;
+constexpr int kRouteAirportNewYorkJfk = 3;
+constexpr int kRouteAirportChicagoOrd = 4;
+constexpr int kRouteAirportWashingtonDca = 5;
+constexpr int kRouteAirportWashingtonIad = 6;
+constexpr int kRouteAirportCount = 7;
+
+const std::array<AirportRoutePreset, kRouteAirportCount> kRouteAirports{{
+    {"San Francisco - SFO", "SFO", 37.618806, -122.375417, 4.0, 284.0},
+    {"Los Angeles - LAX", "LAX", 33.942496, -118.408049, 39.0, 251.0},
+    {"San Diego - SAN", "SAN", 32.733563, -117.189663, 5.0, 275.0},
+    {"New York - JFK", "JFK", 40.639928, -73.778692, 4.0, 121.0},
+    {"Chicago - ORD", "ORD", 41.976940, -87.908150, 207.0, 270.0},
+    {"Washington, D.C. - DCA", "DCA", 38.851440, -77.037721, 4.0, 175.0},
+    {"Washington, D.C. - IAD", "IAD", 38.947456, -77.459929, 95.0, 181.0},
+}};
+
+const char* kRouteAirportComboItems =
+    "San Francisco - SFO\0"
+    "Los Angeles - LAX\0"
+    "San Diego - SAN\0"
+    "New York - JFK\0"
+    "Chicago - ORD\0"
+    "Washington, D.C. - DCA\0"
+    "Washington, D.C. - IAD\0";
+
 struct TerrainBuildAsyncResult {
     TerrainPatchBuildResult patch{};
     std::string error;
@@ -989,6 +1052,273 @@ double WrapRadiansPi(double angleRad) {
         angleRad += 2.0 * kPi;
     }
     return angleRad;
+}
+
+double GreatCircleDistanceMeters(double latADeg, double lonADeg, double latBDeg, double lonBDeg) {
+    const double latA = flight::DegToRad(latADeg);
+    const double latB = flight::DegToRad(latBDeg);
+    const double dLat = flight::DegToRad(latBDeg - latADeg);
+    const double dLon = flight::DegToRad(LonDeltaDeg(lonBDeg, lonADeg));
+    const double sinHalfLat = std::sin(dLat * 0.5);
+    const double sinHalfLon = std::sin(dLon * 0.5);
+    const double a =
+        sinHalfLat * sinHalfLat + std::cos(latA) * std::cos(latB) * sinHalfLon * sinHalfLon;
+    const double c = 2.0 * std::atan2(std::sqrt(a), std::sqrt(std::max(0.0, 1.0 - a)));
+    return flight::kEarthRadiusMeters * c;
+}
+
+double BearingRadiansBetween(double latADeg, double lonADeg, double latBDeg, double lonBDeg) {
+    const double latA = flight::DegToRad(latADeg);
+    const double latB = flight::DegToRad(latBDeg);
+    const double dLon = flight::DegToRad(LonDeltaDeg(lonBDeg, lonADeg));
+    const double y = std::sin(dLon) * std::cos(latB);
+    const double x = std::cos(latA) * std::sin(latB) - std::sin(latA) * std::cos(latB) * std::cos(dLon);
+    return WrapRadiansPi(std::atan2(y, x));
+}
+
+double MoveToward(double current, double target, double maxStep) {
+    const double delta = target - current;
+    if (std::abs(delta) <= maxStep) {
+        return target;
+    }
+    return current + std::copysign(maxStep, delta);
+}
+
+double MoveTowardAngle(double currentRad, double targetRad, double maxStepRad) {
+    return WrapRadiansPi(currentRad + std::clamp(WrapRadiansPi(targetRad - currentRad), -maxStepRad, maxStepRad));
+}
+
+const char* AirplaneRoutePhaseName(AirplaneRoutePhase phase) {
+    switch (phase) {
+        case AirplaneRoutePhase::Ready:
+            return "Ready";
+        case AirplaneRoutePhase::TakeoffRoll:
+            return "Takeoff";
+        case AirplaneRoutePhase::Climb:
+            return "Climb";
+        case AirplaneRoutePhase::Cruise:
+            return "Cruise";
+        case AirplaneRoutePhase::Descent:
+            return "Descent";
+        case AirplaneRoutePhase::Final:
+            return "Landing";
+        case AirplaneRoutePhase::Arrived:
+            return "Arrived";
+        default:
+            return "Unknown";
+    }
+}
+
+void SetAirplaneRoutePhase(AirplaneRouteAutopilotState& route, AirplaneRoutePhase phase) {
+    if (route.phase != phase) {
+        route.phase = phase;
+        route.phaseElapsedSeconds = 0.0;
+    }
+}
+
+double AirportGroundMeters(const AirportRoutePreset& airport, TerrainSystem& terrainSystem, bool terrainSystemReady) {
+    if (!terrainSystemReady) {
+        return airport.elevationMeters;
+    }
+    bool tileLoaded = false;
+    const double terrainHeight = terrainSystem.SampleHeightMetersCached(airport.latitudeDeg, airport.longitudeDeg, &tileLoaded);
+    if (!tileLoaded) {
+        return airport.elevationMeters;
+    }
+    return std::max(airport.elevationMeters, terrainHeight);
+}
+
+void MoveSimAlongHeading(
+    FlightSim& sim,
+    double headingRad,
+    double altitudeMeters,
+    double speedMps,
+    double pitchRad,
+    double rollRad,
+    double distanceMeters) {
+    double nextLatDeg = sim.LatitudeDeg();
+    double nextLonDeg = sim.LongitudeDeg();
+    const double northMeters = std::cos(headingRad) * distanceMeters;
+    const double eastMeters = std::sin(headingRad) * distanceMeters;
+    OffsetLatLonMeters(sim.LatitudeDeg(), sim.LongitudeDeg(), northMeters, eastMeters, nextLatDeg, nextLonDeg);
+    sim.SetKinematicStateRadians(
+        flight::DegToRad(nextLatDeg),
+        flight::DegToRad(nextLonDeg),
+        altitudeMeters,
+        speedMps,
+        headingRad,
+        pitchRad,
+        rollRad);
+}
+
+void TeleportAirplaneRouteToOrigin(
+    FlightSim& sim,
+    AirplaneRouteAutopilotState& route,
+    TerrainSystem& terrainSystem,
+    bool terrainSystemReady) {
+    route.originAirportIndex = std::clamp(route.originAirportIndex, 0, kRouteAirportCount - 1);
+    route.destinationAirportIndex = std::clamp(route.destinationAirportIndex, 0, kRouteAirportCount - 1);
+    const AirportRoutePreset& origin = kRouteAirports[route.originAirportIndex];
+    const AirportRoutePreset& destination = kRouteAirports[route.destinationAirportIndex];
+    route.originGroundMeters = AirportGroundMeters(origin, terrainSystem, terrainSystemReady);
+    route.destinationGroundMeters = AirportGroundMeters(destination, terrainSystem, terrainSystemReady);
+    route.initialDistanceMeters =
+        GreatCircleDistanceMeters(origin.latitudeDeg, origin.longitudeDeg, destination.latitudeDeg, destination.longitudeDeg);
+    route.distanceToDestinationMeters = route.initialDistanceMeters;
+    route.cruiseAltitudeMeters = std::max(
+        std::max(route.originGroundMeters, route.destinationGroundMeters) + 1800.0,
+        std::clamp(route.initialDistanceMeters * 0.012 + 1800.0, 2500.0, 10500.0));
+    route.targetAltitudeMeters = route.originGroundMeters + 8.0;
+    route.phaseElapsedSeconds = 0.0;
+    route.phase = AirplaneRoutePhase::Ready;
+    route.active = false;
+    route.arrived = false;
+    sim.SetKinematicStateRadians(
+        flight::DegToRad(origin.latitudeDeg),
+        flight::DegToRad(origin.longitudeDeg),
+        route.originGroundMeters + 8.0,
+        0.0,
+        flight::DegToRad(origin.runwayHeadingDeg),
+        0.0,
+        0.0);
+}
+
+void StartAirplaneRouteAutopilot(
+    FlightSim& sim,
+    AirplaneRouteAutopilotState& route,
+    TerrainSystem& terrainSystem,
+    bool terrainSystemReady) {
+    TeleportAirplaneRouteToOrigin(sim, route, terrainSystem, terrainSystemReady);
+    if (route.originAirportIndex == route.destinationAirportIndex || route.initialDistanceMeters < 1000.0) {
+        route.arrived = true;
+        route.phase = AirplaneRoutePhase::Arrived;
+        return;
+    }
+    route.active = true;
+    route.arrived = false;
+    route.phase = AirplaneRoutePhase::TakeoffRoll;
+    route.phaseElapsedSeconds = 0.0;
+}
+
+void CancelAirplaneRouteAutopilot(AirplaneRouteAutopilotState& route) {
+    route.active = false;
+    route.phase = AirplaneRoutePhase::Ready;
+    route.phaseElapsedSeconds = 0.0;
+}
+
+void UpdateAirplaneRouteAutopilot(
+    FlightSim& sim,
+    AirplaneRouteAutopilotState& route,
+    double dtSeconds,
+    double timeScale) {
+    if (!route.active) {
+        return;
+    }
+
+    const double dt = dtSeconds * std::clamp(timeScale, 0.01, 100.0);
+    route.phaseElapsedSeconds += dt;
+    const AirportRoutePreset& destination = kRouteAirports[route.destinationAirportIndex];
+    const double latDeg = sim.LatitudeDeg();
+    const double lonDeg = sim.LongitudeDeg();
+    const double distanceToDestination =
+        GreatCircleDistanceMeters(latDeg, lonDeg, destination.latitudeDeg, destination.longitudeDeg);
+    route.distanceToDestinationMeters = distanceToDestination;
+
+    const double destinationHeadingRad =
+        BearingRadiansBetween(latDeg, lonDeg, destination.latitudeDeg, destination.longitudeDeg);
+    const double runwayHeadingRad = flight::DegToRad(destination.runwayHeadingDeg);
+    double desiredHeadingRad = destinationHeadingRad;
+    double desiredAltitudeMeters = sim.AltitudeMeters();
+    double desiredSpeedMps = sim.SpeedMps();
+    double desiredPitchRad = 0.0;
+    double desiredRollRad = 0.0;
+
+    if (route.phase == AirplaneRoutePhase::TakeoffRoll) {
+        const AirportRoutePreset& origin = kRouteAirports[route.originAirportIndex];
+        desiredHeadingRad = flight::DegToRad(origin.runwayHeadingDeg);
+        desiredSpeedMps = std::min(105.0, sim.SpeedMps() + 9.5 * dt);
+        const double liftFactor = std::clamp((desiredSpeedMps - 62.0) / 42.0, 0.0, 1.0);
+        desiredAltitudeMeters = route.originGroundMeters + 8.0 + liftFactor * route.phaseElapsedSeconds * 2.2;
+        desiredPitchRad = flight::DegToRad(7.0 * liftFactor);
+        if (desiredSpeedMps >= 96.0 || desiredAltitudeMeters > route.originGroundMeters + 38.0) {
+            SetAirplaneRoutePhase(route, AirplaneRoutePhase::Climb);
+        }
+    } else if (route.phase == AirplaneRoutePhase::Climb) {
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 175.0, 14.0 * dt);
+        desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.cruiseAltitudeMeters, 20.0 * dt);
+        desiredPitchRad = flight::DegToRad(10.0);
+        desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.9, flight::DegToRad(-35.0), flight::DegToRad(35.0));
+        if (sim.AltitudeMeters() >= route.cruiseAltitudeMeters - 80.0) {
+            SetAirplaneRoutePhase(route, AirplaneRoutePhase::Cruise);
+        }
+    } else if (route.phase == AirplaneRoutePhase::Cruise) {
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 215.0, 10.0 * dt);
+        desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.cruiseAltitudeMeters, 16.0 * dt);
+        desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.015, -3.0, 5.0));
+        desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.8, flight::DegToRad(-30.0), flight::DegToRad(30.0));
+        const double descentDistanceMeters = std::clamp(
+            (sim.AltitudeMeters() - route.destinationGroundMeters) / std::tan(flight::DegToRad(3.0)),
+            28000.0,
+            190000.0);
+        if (distanceToDestination <= descentDistanceMeters) {
+            SetAirplaneRoutePhase(route, AirplaneRoutePhase::Descent);
+        }
+    } else if (route.phase == AirplaneRoutePhase::Descent) {
+        const double approachOffsetMeters = 9500.0;
+        double approachLatDeg = destination.latitudeDeg;
+        double approachLonDeg = destination.longitudeDeg;
+        OffsetLatLonMeters(
+            destination.latitudeDeg,
+            destination.longitudeDeg,
+            -std::cos(runwayHeadingRad) * approachOffsetMeters,
+            -std::sin(runwayHeadingRad) * approachOffsetMeters,
+            approachLatDeg,
+            approachLonDeg);
+        const double distanceToApproach = GreatCircleDistanceMeters(latDeg, lonDeg, approachLatDeg, approachLonDeg);
+        desiredHeadingRad = BearingRadiansBetween(latDeg, lonDeg, approachLatDeg, approachLonDeg);
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 150.0, 12.0 * dt);
+        const double glideAltitude = route.destinationGroundMeters + 250.0 + distanceToDestination * std::tan(flight::DegToRad(3.0));
+        desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), std::min(route.cruiseAltitudeMeters, glideAltitude), 18.0 * dt);
+        desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.018, -6.0, 2.5));
+        desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.8, flight::DegToRad(-30.0), flight::DegToRad(30.0));
+        if (distanceToApproach < 1800.0 || distanceToDestination < 12000.0) {
+            SetAirplaneRoutePhase(route, AirplaneRoutePhase::Final);
+        }
+    } else if (route.phase == AirplaneRoutePhase::Final) {
+        desiredHeadingRad = destinationHeadingRad;
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 82.0, 10.0 * dt);
+        const double finalAltitude = route.destinationGroundMeters + std::max(8.0, distanceToDestination * std::tan(flight::DegToRad(2.8)));
+        desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), finalAltitude, 12.0 * dt);
+        desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.018, -5.0, 1.0));
+        desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.6, flight::DegToRad(-18.0), flight::DegToRad(18.0));
+        if ((distanceToDestination < 1000.0 && sim.AltitudeMeters() <= route.destinationGroundMeters + 45.0) ||
+            distanceToDestination < 260.0) {
+            sim.SetKinematicStateRadians(
+                flight::DegToRad(destination.latitudeDeg),
+                flight::DegToRad(destination.longitudeDeg),
+                route.destinationGroundMeters + 6.0,
+                0.0,
+                runwayHeadingRad,
+                0.0,
+                0.0);
+            route.distanceToDestinationMeters = 0.0;
+            route.targetAltitudeMeters = route.destinationGroundMeters + 6.0;
+            route.active = false;
+            route.arrived = true;
+            route.phase = AirplaneRoutePhase::Arrived;
+            route.phaseElapsedSeconds = 0.0;
+            return;
+        }
+    } else {
+        route.active = false;
+        return;
+    }
+
+    const double maxTurnRateRad = flight::DegToRad(route.phase == AirplaneRoutePhase::Final ? 10.0 : 18.0);
+    const double nextHeadingRad = MoveTowardAngle(sim.HeadingRad(), desiredHeadingRad, maxTurnRateRad * dt);
+    const double distanceStepMeters = std::max(0.0, desiredSpeedMps) * std::cos(desiredPitchRad) * dt;
+    route.targetAltitudeMeters = desiredAltitudeMeters;
+    MoveSimAlongHeading(sim, nextHeadingRad, desiredAltitudeMeters, desiredSpeedMps, desiredPitchRad, desiredRollRad, distanceStepMeters);
 }
 
 void PrepareMissileAtLaunch(MissileAutopilotState& missile) {
@@ -1741,6 +2071,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     PrepareMissileAtLaunch(missileState);
     int launchCityPresetIndex = kCityPresetSanFrancisco;
     int targetCityPresetIndex = kCityPresetLosAngeles;
+    AirplaneRouteAutopilotState airplaneRouteState{};
+    airplaneRouteState.originAirportIndex = kRouteAirportSanFranciscoSfo;
+    airplaneRouteState.destinationAirportIndex = kRouteAirportLosAngelesLax;
     float simTimeScale = 1.0f;
     bool useImperialUnits = false;
     float localSolarTimeHours = 14.0f;
@@ -2165,10 +2498,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         sim.SetStart(editableStart);
         if (!VehicleModeIsMissile(vehicleMode)) {
-            sim.Update(dt, input, static_cast<double>(simTimeScale));
+            if (airplaneRouteState.active && input.resetPressed) {
+                CancelAirplaneRouteAutopilot(airplaneRouteState);
+                sim.Update(dt, input, static_cast<double>(simTimeScale));
+                vehicleModeStatus = "Airport hop autopilot cancelled";
+            } else if (airplaneRouteState.active) {
+                UpdateAirplaneRouteAutopilot(sim, airplaneRouteState, dt, static_cast<double>(simTimeScale));
+            } else {
+                sim.Update(dt, input, static_cast<double>(simTimeScale));
+            }
         }
 
         if (VehicleModeIsMissile(vehicleMode)) {
+            if (airplaneRouteState.active) {
+                CancelAirplaneRouteAutopilot(airplaneRouteState);
+                vehicleModeStatus = "Airport hop autopilot cancelled for missile mode";
+            }
             if (!missileState.launched && !missileState.impacted) {
                 PrepareMissileAtLaunch(missileState);
             }
@@ -2926,6 +3271,95 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::TextUnformatted("Switch back to Airplane mode for manual controls");
         }
         ImGui::Text("Landmask: %s", renderer.HasLandmask() ? "loaded" : "fallback");
+        ImGui::End();
+
+        ImGui::Begin("Autopilot Route");
+        const bool airplaneRouteModeAvailable = !VehicleModeIsMissile(vehicleMode);
+        airplaneRouteState.originAirportIndex =
+            std::clamp(airplaneRouteState.originAirportIndex, 0, kRouteAirportCount - 1);
+        airplaneRouteState.destinationAirportIndex =
+            std::clamp(airplaneRouteState.destinationAirportIndex, 0, kRouteAirportCount - 1);
+        const AirportRoutePreset& routeOrigin = kRouteAirports[airplaneRouteState.originAirportIndex];
+        const AirportRoutePreset& routeDestination = kRouteAirports[airplaneRouteState.destinationAirportIndex];
+        const double routePreviewDistanceMeters = GreatCircleDistanceMeters(
+            routeOrigin.latitudeDeg,
+            routeOrigin.longitudeDeg,
+            routeDestination.latitudeDeg,
+            routeDestination.longitudeDeg);
+        const double routeDisplayDistanceMeters = (airplaneRouteState.active || airplaneRouteState.arrived)
+            ? airplaneRouteState.distanceToDestinationMeters
+            : routePreviewDistanceMeters;
+
+        ImGui::Text("State: %s", airplaneRouteState.active ? "Flying" : (airplaneRouteState.arrived ? "Arrived" : "Ready"));
+        ImGui::Text("Phase: %s", AirplaneRoutePhaseName(airplaneRouteState.phase));
+        if (useImperialUnits) {
+            ImGui::Text("Distance: %.1f mi", routeDisplayDistanceMeters * 0.000621371);
+            ImGui::Text("Target altitude: %.0f ft", ToDisplayAltitude(airplaneRouteState.targetAltitudeMeters, true));
+            ImGui::Text("Cruise altitude: %.0f ft", ToDisplayAltitude(airplaneRouteState.cruiseAltitudeMeters, true));
+        } else {
+            ImGui::Text("Distance: %.1f km", routeDisplayDistanceMeters * 0.001);
+            ImGui::Text("Target altitude: %.0f m", airplaneRouteState.targetAltitudeMeters);
+            ImGui::Text("Cruise altitude: %.0f m", airplaneRouteState.cruiseAltitudeMeters);
+        }
+
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::Combo("Origin Airport", &airplaneRouteState.originAirportIndex, kRouteAirportComboItems)) {
+            airplaneRouteState.arrived = false;
+        }
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::Combo("Destination Airport", &airplaneRouteState.destinationAirportIndex, kRouteAirportComboItems)) {
+            airplaneRouteState.arrived = false;
+        }
+        ImGui::Text("Origin: %s %.6f, %.6f", routeOrigin.ident, routeOrigin.latitudeDeg, routeOrigin.longitudeDeg);
+        ImGui::Text("Destination: %s %.6f, %.6f", routeDestination.ident, routeDestination.latitudeDeg, routeDestination.longitudeDeg);
+        ImGui::Text("Runway heading: %.0f deg", routeDestination.runwayHeadingDeg);
+
+        const bool routeAirportsValid = airplaneRouteState.originAirportIndex != airplaneRouteState.destinationAirportIndex;
+        if (!airplaneRouteModeAvailable || airplaneRouteState.active) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Teleport To Origin")) {
+            TeleportAirplaneRouteToOrigin(sim, airplaneRouteState, terrainSystem, terrainSystemReady);
+            regenerateTerrainRequested = true;
+            havePatchCenter = false;
+            vehicleModeStatus = std::string("Teleported to ") + routeOrigin.ident;
+        }
+        if (!airplaneRouteModeAvailable || airplaneRouteState.active) {
+            ImGui::EndDisabled();
+        }
+
+        ImGui::SameLine();
+        if (!airplaneRouteModeAvailable || !routeAirportsValid || airplaneRouteState.active) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Start Autopilot")) {
+            StartAirplaneRouteAutopilot(sim, airplaneRouteState, terrainSystem, terrainSystemReady);
+            regenerateTerrainRequested = true;
+            havePatchCenter = false;
+            vehicleModeStatus = std::string("Airport hop autopilot started: ") + routeOrigin.ident + " to " + routeDestination.ident;
+        }
+        if (!airplaneRouteModeAvailable || !routeAirportsValid || airplaneRouteState.active) {
+            ImGui::EndDisabled();
+        }
+
+        ImGui::SameLine();
+        if (!airplaneRouteState.active) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Cancel")) {
+            CancelAirplaneRouteAutopilot(airplaneRouteState);
+            vehicleModeStatus = "Airport hop autopilot cancelled";
+        }
+        if (!airplaneRouteState.active) {
+            ImGui::EndDisabled();
+        }
+
+        if (!airplaneRouteModeAvailable) {
+            ImGui::TextUnformatted("Switch out of Missile mode to fly an airport hop.");
+        } else if (!routeAirportsValid) {
+            ImGui::TextUnformatted("Choose different origin and destination airports.");
+        }
         ImGui::End();
 
         ImGui::Begin("World Map");

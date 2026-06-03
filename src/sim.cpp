@@ -157,7 +157,7 @@ void FlightSim::Update(double dtSeconds, const InputState& input, double timeSca
     m_rollRad = std::clamp(m_rollRad, DegToRad(-75.0), DegToRad(75.0));
 
     m_speedMps += throttleInput * kThrottleAccel * dt;
-    m_speedMps = std::clamp(m_speedMps, 60.0, 650.0);
+    m_speedMps = std::clamp(m_speedMps, 0.0, 650.0);
 
     const double horizontalSpeed = m_speedMps * std::cos(m_pitchRad);
     // Coordinated-turn approximation: bank angle induces heading change.
