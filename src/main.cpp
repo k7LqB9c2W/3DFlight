@@ -55,6 +55,7 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kMetersToFeet = 3.280839895013123;
 constexpr double kMetersPerSecondToMph = 2.2369362920544025;
 std::atomic_flag g_crashLogInProgress = ATOMIC_FLAG_INIT;
+std::atomic_bool g_normalExitInProgress = false;
 
 struct CockpitViewConfig {
     float modelScale = 1.0f;
@@ -355,6 +356,9 @@ bool WriteMiniDump(const std::filesystem::path& dumpPath, EXCEPTION_POINTERS* ex
 }
 
 void WriteCrashArtifacts(const char* crashType, EXCEPTION_POINTERS* exceptionPointers, const std::string& details) noexcept {
+    if (g_normalExitInProgress.load(std::memory_order_relaxed)) {
+        return;
+    }
     if (g_crashLogInProgress.test_and_set()) {
         return;
     }
@@ -421,6 +425,10 @@ LONG WINAPI UnhandledSehFilter(EXCEPTION_POINTERS* exceptionPointers) {
 }
 
 [[noreturn]] void TerminateHandler() {
+    if (g_normalExitInProgress.load(std::memory_order_relaxed)) {
+        std::_Exit(EXIT_SUCCESS);
+    }
+
     std::string details = "std::terminate invoked.";
     if (const std::exception_ptr ep = std::current_exception(); ep) {
         try {
@@ -442,6 +450,10 @@ void InvalidParameterHandler(
     const wchar_t* file,
     unsigned int line,
     uintptr_t) {
+    if (g_normalExitInProgress.load(std::memory_order_relaxed)) {
+        std::_Exit(EXIT_SUCCESS);
+    }
+
     std::ostringstream details;
     details << "CRT invalid parameter";
     if (expression) {
@@ -534,7 +546,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_KILLFOCUS:
             clearCockpitFreelook(true);
             return 0;
+        case WM_CLOSE:
+            g_normalExitInProgress.store(true, std::memory_order_relaxed);
+            clearCockpitFreelook(true);
+            DestroyWindow(hwnd);
+            return 0;
         case WM_DESTROY:
+            g_normalExitInProgress.store(true, std::memory_order_relaxed);
             clearCockpitFreelook(true);
             PostQuitMessage(0);
             return 0;
