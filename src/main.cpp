@@ -27,6 +27,7 @@
 #include <windowsx.h>
 
 #include "d3d12_renderer.h"
+#include "flightgear_ac_loader.h"
 #include "gltf_loader.h"
 #include "hud_map_tile_streamer.h"
 #include "mesh.h"
@@ -132,6 +133,22 @@ std::string UtcTimestampForFile() {
     std::ostringstream ss;
     ss << std::put_time(&utc, "%Y%m%d_%H%M%S");
     return ss.str();
+}
+
+std::filesystem::path ResolveExistingPathFromWorkingTree(const std::filesystem::path& relativePath) {
+    std::filesystem::path dir = std::filesystem::current_path();
+    for (int depth = 0; depth < 8; ++depth) {
+        const std::filesystem::path candidate = dir / relativePath;
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) {
+            return candidate;
+        }
+        if (!dir.has_parent_path() || dir.parent_path() == dir) {
+            break;
+        }
+        dir = dir.parent_path();
+    }
+    return relativePath;
 }
 
 const char* ExceptionCodeName(DWORD code) {
@@ -1040,6 +1057,42 @@ void DrawHudMapRoute(
     DrawHudMapPoint(drawList, state, mapMin, mapMax, destinationLatDeg, destinationLonDeg, IM_COL32(255, 110, 92, 245));
 }
 
+void DrawHudMapRoutePath(
+    ImDrawList* drawList,
+    const HudMapState& state,
+    const ImVec2& mapMin,
+    const ImVec2& mapMax,
+    const std::vector<DirectX::XMFLOAT2>& points) {
+    if (drawList == nullptr || points.size() < 2) {
+        return;
+    }
+
+    ImVec2 previous = HudMapLonLatToScreen(state, mapMin, mapMax, static_cast<double>(points.front().x), static_cast<double>(points.front().y));
+    for (size_t i = 1; i < points.size(); ++i) {
+        const ImVec2 screen = HudMapLonLatToScreen(state, mapMin, mapMax, static_cast<double>(points[i].x), static_cast<double>(points[i].y));
+        drawList->AddLine(previous, screen, IM_COL32(0, 0, 0, 190), 4.0f);
+        drawList->AddLine(previous, screen, IM_COL32(77, 190, 255, 245), 2.0f);
+        previous = screen;
+    }
+
+    DrawHudMapPoint(
+        drawList,
+        state,
+        mapMin,
+        mapMax,
+        static_cast<double>(points.front().x),
+        static_cast<double>(points.front().y),
+        IM_COL32(92, 230, 140, 245));
+    DrawHudMapPoint(
+        drawList,
+        state,
+        mapMin,
+        mapMax,
+        static_cast<double>(points.back().x),
+        static_cast<double>(points.back().y),
+        IM_COL32(255, 110, 92, 245));
+}
+
 uint8_t HudMapSampleChannel(const std::vector<uint8_t>& pixels, int x, int y, int channel) {
     const size_t idx = (static_cast<size_t>(std::clamp(y, 0, 255)) * 256u + static_cast<size_t>(std::clamp(x, 0, 255))) * 4u +
         static_cast<size_t>(channel);
@@ -1253,16 +1306,18 @@ enum class VehicleMode {
     A320 = 1,
     F35 = 2,
     B2 = 3,
-    Missile = 4,
-    Cockpit737 = 5,
+    FlightGear737 = 4,
+    Missile = 5,
+    Cockpit737 = 6,
 };
 
-constexpr size_t kVehicleModeCount = 6;
+constexpr size_t kVehicleModeCount = 7;
 const char* kVehicleModeComboItems =
     "Airplane\0"
     "A320-200\0"
     "F-35 Lightning II\0"
     "B-2 Spirit\0"
+    "FlightGear 737-800YV\0"
     "AIM-120D Missile\0"
     "737 Cockpit\0";
 
@@ -1276,6 +1331,8 @@ const char* VehicleModeDisplayName(VehicleMode mode) {
             return "F-35";
         case VehicleMode::B2:
             return "B-2";
+        case VehicleMode::FlightGear737:
+            return "FlightGear 737-800YV";
         case VehicleMode::Missile:
             return "Missile";
         case VehicleMode::Cockpit737:
@@ -1299,8 +1356,10 @@ VehicleMode VehicleModeFromIndex(int index) {
         case 3:
             return VehicleMode::B2;
         case 4:
-            return VehicleMode::Missile;
+            return VehicleMode::FlightGear737;
         case 5:
+            return VehicleMode::Missile;
+        case 6:
             return VehicleMode::Cockpit737;
         case 0:
         default:
@@ -1390,6 +1449,13 @@ struct AirplaneRouteAutopilotState {
     bool active = false;
     bool arrived = false;
     bool showRouteOnHudMap = false;
+    bool showAdvancedPanel = false;
+    bool realisticAcceleration = true;
+    bool departureTurnGateEnabled = true;
+    bool departureTurnAglGateEnabled = true;
+    bool departureTurnDistanceGateEnabled = true;
+    double departureTurnMinAglMeters = 800.0 / kMetersToFeet;
+    double departureTurnMinDistanceMeters = 3000.0;
     double phaseElapsedSeconds = 0.0;
     double originGroundMeters = 0.0;
     double destinationGroundMeters = 0.0;
@@ -1808,6 +1874,19 @@ void UpdateAirplaneRouteAutopilot(
     const double destinationHeadingRad =
         BearingRadiansBetween(latDeg, lonDeg, destinationEndpoint.latitudeDeg, destinationEndpoint.longitudeDeg);
     const double runwayHeadingRad = flight::DegToRad(destinationEndpoint.headingDeg);
+    const double departureRunwayHeadingRad = flight::DegToRad(originEndpoint.headingDeg);
+    const double altitudeAglMeters = sim.AltitudeMeters() - route.originGroundMeters;
+    const double departureDistanceMeters = GreatCircleDistanceMeters(latDeg, lonDeg, originEndpoint.latitudeDeg, originEndpoint.longitudeDeg);
+    const bool holdDepartureHeading =
+        route.departureTurnGateEnabled &&
+        ((route.departureTurnAglGateEnabled && altitudeAglMeters < route.departureTurnMinAglMeters) ||
+            (route.departureTurnDistanceGateEnabled && departureDistanceMeters < route.departureTurnMinDistanceMeters));
+    const double takeoffAccelMps2 = route.realisticAcceleration ? 3.2 : 9.5;
+    const double climbAccelMps2 = route.realisticAcceleration ? 2.4 : 14.0;
+    const double cruiseAccelMps2 = route.realisticAcceleration ? 1.5 : 10.0;
+    const double descentSpeedRateMps2 = route.realisticAcceleration ? 1.8 : 8.0;
+    const double finalSpeedRateMps2 = route.realisticAcceleration ? 1.4 : 8.0;
+    const double rolloutBrakeMps2 = route.realisticAcceleration ? 3.0 : 5.5;
     double desiredHeadingRad = destinationHeadingRad;
     double desiredAltitudeMeters = sim.AltitudeMeters();
     double desiredSpeedMps = sim.SpeedMps();
@@ -1816,8 +1895,8 @@ void UpdateAirplaneRouteAutopilot(
     bool finishRouteAfterMove = false;
 
     if (route.phase == AirplaneRoutePhase::TakeoffRoll) {
-        desiredHeadingRad = flight::DegToRad(originEndpoint.headingDeg);
-        desiredSpeedMps = std::min(105.0, sim.SpeedMps() + 9.5 * dt);
+        desiredHeadingRad = departureRunwayHeadingRad;
+        desiredSpeedMps = std::min(105.0, sim.SpeedMps() + takeoffAccelMps2 * dt);
         const double liftFactor = std::clamp((desiredSpeedMps - 62.0) / 42.0, 0.0, 1.0);
         desiredAltitudeMeters = route.originGroundMeters + 8.0 + liftFactor * route.phaseElapsedSeconds * 2.2;
         desiredPitchRad = flight::DegToRad(7.0 * liftFactor);
@@ -1825,7 +1904,8 @@ void UpdateAirplaneRouteAutopilot(
             SetAirplaneRoutePhase(route, AirplaneRoutePhase::Climb);
         }
     } else if (route.phase == AirplaneRoutePhase::Climb) {
-        desiredSpeedMps = MoveToward(sim.SpeedMps(), 175.0, 14.0 * dt);
+        desiredHeadingRad = holdDepartureHeading ? departureRunwayHeadingRad : destinationHeadingRad;
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 175.0, climbAccelMps2 * dt);
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.cruiseAltitudeMeters, 20.0 * dt);
         desiredPitchRad = flight::DegToRad(10.0);
         desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.9, flight::DegToRad(-35.0), flight::DegToRad(35.0));
@@ -1833,7 +1913,7 @@ void UpdateAirplaneRouteAutopilot(
             SetAirplaneRoutePhase(route, AirplaneRoutePhase::Cruise);
         }
     } else if (route.phase == AirplaneRoutePhase::Cruise) {
-        desiredSpeedMps = MoveToward(sim.SpeedMps(), 215.0, 10.0 * dt);
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 215.0, cruiseAccelMps2 * dt);
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.cruiseAltitudeMeters, 16.0 * dt);
         desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.015, -3.0, 5.0));
         desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.8, flight::DegToRad(-30.0), flight::DegToRad(30.0));
@@ -1857,7 +1937,7 @@ void UpdateAirplaneRouteAutopilot(
             approachLonDeg);
         const double distanceToApproach = GreatCircleDistanceMeters(latDeg, lonDeg, approachLatDeg, approachLonDeg);
         desiredHeadingRad = BearingRadiansBetween(latDeg, lonDeg, approachLatDeg, approachLonDeg);
-        desiredSpeedMps = MoveToward(sim.SpeedMps(), 165.0, 8.0 * dt);
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 165.0, descentSpeedRateMps2 * dt);
         const double glideAltitude = route.destinationGroundMeters + 250.0 + distanceToDestination * std::tan(flight::DegToRad(3.0));
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), std::min(route.cruiseAltitudeMeters, glideAltitude), 18.0 * dt);
         desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.018, -6.0, 2.5));
@@ -1878,7 +1958,7 @@ void UpdateAirplaneRouteAutopilot(
             runwayAimLonDeg);
         desiredHeadingRad = BearingRadiansBetween(latDeg, lonDeg, runwayAimLatDeg, runwayAimLonDeg);
         const double finalTargetSpeedMps = std::clamp(76.0 + distanceToDestination / 260.0, 76.0, 125.0);
-        desiredSpeedMps = MoveToward(sim.SpeedMps(), finalTargetSpeedMps, 8.0 * dt);
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), finalTargetSpeedMps, finalSpeedRateMps2 * dt);
         const double flareFloorMeters = distanceToDestination < 850.0 ? 5.5 : 8.0;
         const double finalAltitude = route.destinationGroundMeters + std::max(flareFloorMeters, distanceToDestination * std::tan(flight::DegToRad(3.0)));
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), finalAltitude, 12.0 * dt);
@@ -1889,13 +1969,13 @@ void UpdateAirplaneRouteAutopilot(
             SetAirplaneRoutePhase(route, AirplaneRoutePhase::Rollout);
             desiredHeadingRad = runwayHeadingRad;
             desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.destinationGroundMeters + 6.0, 4.0 * dt);
-            desiredSpeedMps = MoveToward(sim.SpeedMps(), 55.0, 10.0 * dt);
+            desiredSpeedMps = MoveToward(sim.SpeedMps(), 55.0, finalSpeedRateMps2 * dt);
             desiredPitchRad = 0.0;
             desiredRollRad = 0.0;
         }
     } else if (route.phase == AirplaneRoutePhase::Rollout) {
         desiredHeadingRad = runwayHeadingRad;
-        desiredSpeedMps = MoveToward(sim.SpeedMps(), 0.0, 5.5 * dt);
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 0.0, rolloutBrakeMps2 * dt);
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.destinationGroundMeters + 6.0, 4.0 * dt);
         desiredPitchRad = 0.0;
         desiredRollRad = 0.0;
@@ -1925,6 +2005,65 @@ void UpdateAirplaneRouteAutopilot(
         route.phase = AirplaneRoutePhase::Arrived;
         route.phaseElapsedSeconds = 0.0;
     }
+}
+
+bool GenerateAutopilotRoutePreviewPath(
+    const FlightSim& sourceSim,
+    const RunwayDatabase& runwayDatabase,
+    const AirplaneRouteAutopilotState& sourceRoute,
+    TerrainSystem& terrainSystem,
+    bool terrainSystemReady,
+    bool fromCurrentAircraftState,
+    std::vector<DirectX::XMFLOAT2>& outPoints) {
+    outPoints.clear();
+
+    FlightSim previewSim = sourceSim;
+    AirplaneRouteAutopilotState previewRoute = sourceRoute;
+    if (fromCurrentAircraftState) {
+        if (!previewRoute.active) {
+            return false;
+        }
+    } else {
+        StartAirplaneRouteAutopilot(previewSim, previewRoute, runwayDatabase, terrainSystem, terrainSystemReady);
+        if (!previewRoute.active && !previewRoute.arrived) {
+            return false;
+        }
+    }
+
+    auto appendPoint = [&]() {
+        const DirectX::XMFLOAT2 point{
+            static_cast<float>(previewSim.LatitudeDeg()),
+            static_cast<float>(WrapLonDeg(previewSim.LongitudeDeg())),
+        };
+        if (outPoints.empty()) {
+            outPoints.push_back(point);
+            return;
+        }
+
+        const DirectX::XMFLOAT2& last = outPoints.back();
+        const double distanceMeters = GreatCircleDistanceMeters(
+            static_cast<double>(last.x),
+            static_cast<double>(last.y),
+            static_cast<double>(point.x),
+            static_cast<double>(point.y));
+        if (distanceMeters >= 1200.0 || previewRoute.phase == AirplaneRoutePhase::Rollout || previewRoute.arrived) {
+            outPoints.push_back(point);
+        }
+    };
+
+    appendPoint();
+    constexpr double kPreviewStepSeconds = 2.0;
+    constexpr int kMaxPreviewSteps = 12000;
+    for (int step = 0; step < kMaxPreviewSteps && previewRoute.active; ++step) {
+        UpdateAirplaneRouteAutopilot(previewSim, runwayDatabase, previewRoute, kPreviewStepSeconds, 1.0);
+        appendPoint();
+        if (outPoints.size() >= 1800) {
+            break;
+        }
+    }
+
+    appendPoint();
+    return outPoints.size() >= 2;
 }
 
 void PrepareMissileAtLaunch(MissileAutopilotState& missile) {
@@ -2529,6 +2668,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         VehicleRenderKind renderKind = VehicleRenderKind::ExteriorAircraft;
         flight::GlbLoadOptions loadOptions{};
         bool missileAsset = false;
+        bool flightGearAircraft = false;
     };
     const std::array<VehicleAssetLoadSpec, kVehicleModeCount> vehicleLoadSpecs{{
         VehicleAssetLoadSpec{
@@ -2566,7 +2706,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             kB2AxisTransform,
             VehicleRenderKind::ExteriorAircraft,
             defaultAircraftLoadOptions,
+            false,
             false},
+        VehicleAssetLoadSpec{
+            VehicleMode::FlightGear737,
+            ResolveExistingPathFromWorkingTree(std::filesystem::path("737-800YV-master") / "737-800YV-master" / "Models" / "737-800.xml"),
+            1.0f,
+            75.0f,
+            kCockpitAxisTransform,
+            VehicleRenderKind::ExteriorAircraft,
+            {},
+            false,
+            true},
         VehicleAssetLoadSpec{
             VehicleMode::Missile,
             std::filesystem::path("assets") / "models" / "AIM120D.glb",
@@ -2575,7 +2726,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             kCockpitAxisTransform,
             VehicleRenderKind::Missile,
             {},
-            true},
+            true,
+            false},
         VehicleAssetLoadSpec{
             VehicleMode::Cockpit737,
             std::filesystem::path("assets") / "models" / "737cockpit.glb",
@@ -2584,6 +2736,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             kCockpitAxisTransform,
             VehicleRenderKind::InteriorCockpit,
             cockpitLoadOptions,
+            false,
             false},
     }};
     const std::array<VehicleMode, kVehicleModeCount> vehicleLoadOrder{
@@ -2591,6 +2744,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         VehicleMode::A320,
         VehicleMode::F35,
         VehicleMode::B2,
+        VehicleMode::FlightGear737,
         VehicleMode::Cockpit737,
         VehicleMode::Missile,
     };
@@ -2610,6 +2764,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         initializeVehiclePlaceholder(spec);
     }
     auto buildVehicleAsset = [&](const VehicleAssetLoadSpec& spec) {
+        const HRESULT comHr = CoInitializeEx(nullptr, COINITBASE_MULTITHREADED);
+        const bool shouldUninitializeCom = SUCCEEDED(comHr);
         VehicleAssetLoadResult result{};
         result.mode = spec.mode;
 
@@ -2620,11 +2776,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         asset.axisTransform = spec.axisTransform;
 
         std::string loadError;
-        const bool loaded = flight::LoadGlbMesh(spec.path, asset.mesh, asset.texture, spec.loadOptions, loadError);
+        flight::FlightGearLoadStats fgStats{};
+        bool loaded = false;
+        if (spec.flightGearAircraft) {
+            flight::FlightGearLoadOptions fgOptions{};
+            loaded = flight::LoadFlightGearAircraftMesh(spec.path, asset.mesh, asset.texture, fgStats, fgOptions, loadError);
+        } else {
+            loaded = flight::LoadGlbMesh(spec.path, asset.mesh, asset.texture, spec.loadOptions, loadError);
+        }
         if (!loaded) {
             asset.mesh = flight::CreatePlaceholderPlane();
         }
-        if (spec.loadOptions.bakeMaterialColor) {
+        if (spec.loadOptions.bakeMaterialColor || spec.flightGearAircraft) {
             asset.texture = {};
         }
 
@@ -2648,7 +2811,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             asset.textureStatus = std::string(VehicleModeDisplayName(spec.mode)) + " texture: fallback default (model load failed)";
         } else {
             asset.modelStatus = std::string(VehicleModeDisplayName(spec.mode)) + " model loaded: " + spec.path.string();
-            if (asset.texture.IsValid()) {
+            if (spec.flightGearAircraft) {
+                asset.textureStatus =
+                    "Baked FlightGear textures: " + std::to_string(fgStats.texturesLoaded) + " loaded, " +
+                    std::to_string(fgStats.texturesMissing) + " missing, " + std::to_string(fgStats.acFilesLoaded) +
+                    " AC files, " + std::to_string(fgStats.xmlFilesLoaded) + " XML files";
+            } else if (asset.texture.IsValid()) {
                 asset.textureStatus =
                     std::string(VehicleModeDisplayName(spec.mode)) + " texture loaded (" + std::to_string(asset.texture.width) + "x" +
                     std::to_string(asset.texture.height) + ")";
@@ -2657,6 +2825,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
         }
         asset.loadComplete = true;
+        if (shouldUninitializeCom) {
+            CoUninitialize();
+        }
         return result;
     };
 
@@ -2789,6 +2960,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     }
     HudMapState hudMapState{};
     HudMapTileStats hudMapStats{};
+    std::vector<DirectX::XMFLOAT2> autopilotRoutePreviewPath;
+    std::string autopilotRoutePreviewKey;
+    double autopilotRoutePreviewRefreshSeconds = 0.0;
 
     TerrainPatchSettings patchSettings{};
     GraphicsTuningConfig graphicsTuning = MakeRealisticTuningPreset();
@@ -4042,12 +4216,90 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             routeDestinationEndpoint.longitudeDeg);
         ImGui::Text("Departure heading: %.0f deg", routeOriginEndpoint.headingDeg);
         ImGui::Text("Arrival heading: %.0f deg", routeDestinationEndpoint.headingDeg);
-        if (airplaneRouteState.active) {
-            ImGui::BeginDisabled();
-        }
         ImGui::Checkbox("Show Route On Map", &airplaneRouteState.showRouteOnHudMap);
-        if (airplaneRouteState.active) {
-            ImGui::EndDisabled();
+        ImGui::Checkbox("Advanced Panel", &airplaneRouteState.showAdvancedPanel);
+        if (airplaneRouteState.showAdvancedPanel) {
+            ImGui::Separator();
+            ImGui::Checkbox("Realistic Acceleration", &airplaneRouteState.realisticAcceleration);
+            ImGui::Checkbox("Departure Turn Gate", &airplaneRouteState.departureTurnGateEnabled);
+            if (!airplaneRouteState.departureTurnGateEnabled) {
+                ImGui::BeginDisabled();
+            }
+            ImGui::Checkbox("AGL Gate", &airplaneRouteState.departureTurnAglGateEnabled);
+            ImGui::SameLine();
+            ImGui::Checkbox("Distance Gate", &airplaneRouteState.departureTurnDistanceGateEnabled);
+            if (useImperialUnits) {
+                float minAglFt = static_cast<float>(airplaneRouteState.departureTurnMinAglMeters * kMetersToFeet);
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::DragFloat("Turn Min AGL (ft)", &minAglFt, 25.0f, 0.0f, 5000.0f, "%.0f")) {
+                    airplaneRouteState.departureTurnMinAglMeters = std::max(0.0, static_cast<double>(minAglFt) / kMetersToFeet);
+                }
+                float minDistanceMiles = static_cast<float>(airplaneRouteState.departureTurnMinDistanceMeters * 0.000621371);
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::DragFloat("Turn Min Distance (mi)", &minDistanceMiles, 0.05f, 0.0f, 10.0f, "%.2f")) {
+                    airplaneRouteState.departureTurnMinDistanceMeters = std::max(0.0, static_cast<double>(minDistanceMiles) / 0.000621371);
+                }
+            } else {
+                float minAglMeters = static_cast<float>(airplaneRouteState.departureTurnMinAglMeters);
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::DragFloat("Turn Min AGL (m)", &minAglMeters, 5.0f, 0.0f, 1500.0f, "%.0f")) {
+                    airplaneRouteState.departureTurnMinAglMeters = std::max(0.0, static_cast<double>(minAglMeters));
+                }
+                float minDistanceKm = static_cast<float>(airplaneRouteState.departureTurnMinDistanceMeters * 0.001);
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::DragFloat("Turn Min Distance (km)", &minDistanceKm, 0.1f, 0.0f, 16.0f, "%.1f")) {
+                    airplaneRouteState.departureTurnMinDistanceMeters = std::max(0.0, static_cast<double>(minDistanceKm) * 1000.0);
+                }
+            }
+            if (!airplaneRouteState.departureTurnGateEnabled) {
+                ImGui::EndDisabled();
+            }
+        }
+
+        if (!airplaneRouteState.showRouteOnHudMap || !routeAirportsValid) {
+            autopilotRoutePreviewPath.clear();
+            autopilotRoutePreviewKey.clear();
+        } else {
+            autopilotRoutePreviewRefreshSeconds = std::max(0.0, autopilotRoutePreviewRefreshSeconds - dt);
+            std::ostringstream previewKey;
+            previewKey
+                << (airplaneRouteState.active ? "active" : "planned")
+                << ':' << static_cast<int>(airplaneRouteState.phase)
+                << ':' << airplaneRouteState.originAirportIndex
+                << ':' << airplaneRouteState.destinationAirportIndex
+                << ':' << RouteAirportIdentText(airplaneRouteState.originAirportIdentText)
+                << ':' << RouteAirportIdentText(airplaneRouteState.destinationAirportIdentText)
+                << ':' << airplaneRouteState.originRunwayEndIndex
+                << ':' << airplaneRouteState.destinationRunwayEndIndex
+                << ':' << airplaneRouteState.realisticAcceleration
+                << ':' << airplaneRouteState.departureTurnGateEnabled
+                << ':' << airplaneRouteState.departureTurnAglGateEnabled
+                << ':' << airplaneRouteState.departureTurnDistanceGateEnabled
+                << ':' << std::lround(airplaneRouteState.departureTurnMinAglMeters)
+                << ':' << std::lround(airplaneRouteState.departureTurnMinDistanceMeters);
+            const std::string nextPreviewKey = previewKey.str();
+            const bool shouldRefreshPreview =
+                autopilotRoutePreviewPath.empty() ||
+                nextPreviewKey != autopilotRoutePreviewKey ||
+                (airplaneRouteState.active && autopilotRoutePreviewRefreshSeconds <= 0.0);
+            if (shouldRefreshPreview) {
+                std::vector<DirectX::XMFLOAT2> nextPath;
+                if (GenerateAutopilotRoutePreviewPath(
+                        sim,
+                        runwayDatabase,
+                        airplaneRouteState,
+                        terrainSystem,
+                        terrainSystemReady,
+                        airplaneRouteState.active,
+                        nextPath)) {
+                    autopilotRoutePreviewPath = std::move(nextPath);
+                    autopilotRoutePreviewKey = nextPreviewKey;
+                } else {
+                    autopilotRoutePreviewPath.clear();
+                    autopilotRoutePreviewKey.clear();
+                }
+                autopilotRoutePreviewRefreshSeconds = airplaneRouteState.active ? 0.5 : 5.0;
+            }
         }
 
         if (!airplaneRouteModeAvailable || airplaneRouteState.active) {
@@ -4220,16 +4472,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             mapDrawList->AddImage(mapTexture, mapMin, mapMax, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), IM_COL32(255, 255, 255, 235));
         }
         mapDrawList->PushClipRect(mapMin, mapMax, true);
-        if (airplaneRouteState.showRouteOnHudMap && routeAirportsValid) {
-            DrawHudMapRoute(
+        if (airplaneRouteState.showRouteOnHudMap && routeAirportsValid && autopilotRoutePreviewPath.size() >= 2) {
+            DrawHudMapRoutePath(
                 mapDrawList,
                 hudMapState,
                 mapMin,
                 mapMax,
-                routeOriginEndpoint.latitudeDeg,
-                routeOriginEndpoint.longitudeDeg,
-                routeDestinationEndpoint.latitudeDeg,
-                routeDestinationEndpoint.longitudeDeg);
+                autopilotRoutePreviewPath);
         }
         DrawHudMapMarker(mapDrawList, hudMapState, mapMin, mapMax, activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), mapHeadingDeg);
         mapDrawList->PopClipRect();

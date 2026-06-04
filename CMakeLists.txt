@@ -20,6 +20,8 @@ add_executable(3DFlight WIN32
     src/runway_database.h
     src/gltf_loader.cpp
     src/gltf_loader.h
+    src/flightgear_ac_loader.cpp
+    src/flightgear_ac_loader.h
     src/hud_map_tile_streamer.cpp
     src/hud_map_tile_streamer.h
     src/earth.cpp
