@@ -725,6 +725,19 @@ const char* HeadingCardinalName(double headingDeg) {
     return kDirections[index];
 }
 
+std::string FormatDurationMinutes(double seconds) {
+    seconds = std::max(0.0, seconds);
+    const int totalMinutes = static_cast<int>(std::llround(seconds / 60.0));
+    const int hours = totalMinutes / 60;
+    const int minutes = totalMinutes % 60;
+    std::ostringstream ss;
+    if (hours > 0) {
+        ss << hours << "h ";
+    }
+    ss << minutes << "m";
+    return ss.str();
+}
+
 ImVec2 WorldMapLonLatToScreen(const ImVec2& mapMin, const ImVec2& mapMax, double latDeg, double lonDeg) {
     const float x = static_cast<float>((WrapLonDeg(lonDeg) + 180.0) / 360.0);
     const float y = static_cast<float>((90.0 - std::clamp(latDeg, -90.0, 90.0)) / 180.0);
@@ -942,6 +955,89 @@ void DrawHudMapMarker(
     drawList->AddTriangleFilled(nose, left, right, IM_COL32(255, 184, 77, 245));
     drawList->AddTriangle(nose, left, right, IM_COL32(24, 24, 24, 255), 2.0f);
     drawList->AddCircle(center, markerRadius + 2.0f, IM_COL32(255, 255, 255, 215), 24, 1.5f);
+}
+
+void DrawHudMapPoint(
+    ImDrawList* drawList,
+    const HudMapState& state,
+    const ImVec2& mapMin,
+    const ImVec2& mapMax,
+    double latDeg,
+    double lonDeg,
+    ImU32 color) {
+    if (drawList == nullptr) {
+        return;
+    }
+
+    const ImVec2 center = HudMapLonLatToScreen(state, mapMin, mapMax, latDeg, lonDeg);
+    if (center.x < mapMin.x - 24.0f || center.x > mapMax.x + 24.0f || center.y < mapMin.y - 24.0f || center.y > mapMax.y + 24.0f) {
+        return;
+    }
+
+    drawList->AddCircleFilled(center, 5.0f, IM_COL32(0, 0, 0, 185), 20);
+    drawList->AddCircleFilled(center, 3.5f, color, 20);
+    drawList->AddCircle(center, 5.0f, IM_COL32(255, 255, 255, 220), 20, 1.0f);
+}
+
+DirectX::XMFLOAT2 GreatCirclePointDeg(double latADeg, double lonADeg, double latBDeg, double lonBDeg, double t) {
+    const double latA = flight::DegToRad(latADeg);
+    const double lonA = flight::DegToRad(lonADeg);
+    const double latB = flight::DegToRad(latBDeg);
+    const double lonB = flight::DegToRad(lonBDeg);
+    const double sinLatA = std::sin(latA);
+    const double cosLatA = std::cos(latA);
+    const double sinLatB = std::sin(latB);
+    const double cosLatB = std::cos(latB);
+    const double cosDelta = std::clamp(
+        sinLatA * sinLatB + cosLatA * cosLatB * std::cos(lonB - lonA),
+        -1.0,
+        1.0);
+    const double delta = std::acos(cosDelta);
+    if (delta < 1.0e-6) {
+        return {static_cast<float>(latADeg), static_cast<float>(WrapLonDeg(lonADeg))};
+    }
+
+    const double invSinDelta = 1.0 / std::sin(delta);
+    const double a = std::sin((1.0 - t) * delta) * invSinDelta;
+    const double b = std::sin(t * delta) * invSinDelta;
+    const double x = a * cosLatA * std::cos(lonA) + b * cosLatB * std::cos(lonB);
+    const double y = a * cosLatA * std::sin(lonA) + b * cosLatB * std::sin(lonB);
+    const double z = a * sinLatA + b * sinLatB;
+    const double lat = std::atan2(z, std::sqrt(x * x + y * y));
+    const double lon = std::atan2(y, x);
+    return {static_cast<float>(flight::RadToDeg(lat)), static_cast<float>(WrapLonDeg(flight::RadToDeg(lon)))};
+}
+
+void DrawHudMapRoute(
+    ImDrawList* drawList,
+    const HudMapState& state,
+    const ImVec2& mapMin,
+    const ImVec2& mapMax,
+    double originLatDeg,
+    double originLonDeg,
+    double destinationLatDeg,
+    double destinationLonDeg) {
+    if (drawList == nullptr) {
+        return;
+    }
+
+    static constexpr int kSegmentCount = 64;
+    ImVec2 previous{};
+    bool havePrevious = false;
+    for (int i = 0; i <= kSegmentCount; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(kSegmentCount);
+        const DirectX::XMFLOAT2 point = GreatCirclePointDeg(originLatDeg, originLonDeg, destinationLatDeg, destinationLonDeg, t);
+        const ImVec2 screen = HudMapLonLatToScreen(state, mapMin, mapMax, static_cast<double>(point.x), static_cast<double>(point.y));
+        if (havePrevious) {
+            drawList->AddLine(previous, screen, IM_COL32(0, 0, 0, 190), 4.0f);
+            drawList->AddLine(previous, screen, IM_COL32(77, 190, 255, 245), 2.0f);
+        }
+        previous = screen;
+        havePrevious = true;
+    }
+
+    DrawHudMapPoint(drawList, state, mapMin, mapMax, originLatDeg, originLonDeg, IM_COL32(92, 230, 140, 245));
+    DrawHudMapPoint(drawList, state, mapMin, mapMax, destinationLatDeg, destinationLonDeg, IM_COL32(255, 110, 92, 245));
 }
 
 uint8_t HudMapSampleChannel(const std::vector<uint8_t>& pixels, int x, int y, int channel) {
@@ -1279,6 +1375,7 @@ enum class AirplaneRoutePhase {
     Cruise,
     Descent,
     Final,
+    Rollout,
     Arrived,
 };
 
@@ -1292,6 +1389,7 @@ struct AirplaneRouteAutopilotState {
     AirplaneRoutePhase phase = AirplaneRoutePhase::Ready;
     bool active = false;
     bool arrived = false;
+    bool showRouteOnHudMap = false;
     double phaseElapsedSeconds = 0.0;
     double originGroundMeters = 0.0;
     double destinationGroundMeters = 0.0;
@@ -1398,6 +1496,8 @@ const char* AirplaneRoutePhaseName(AirplaneRoutePhase phase) {
             return "Descent";
         case AirplaneRoutePhase::Final:
             return "Landing";
+        case AirplaneRoutePhase::Rollout:
+            return "Rollout";
         case AirplaneRoutePhase::Arrived:
             return "Arrived";
         default:
@@ -1523,6 +1623,12 @@ double RouteEndpointGroundMeters(const RouteEndpoint& endpoint, TerrainSystem& t
     return std::max(endpoint.elevationMeters, terrainHeight);
 }
 
+double EstimateRouteCruiseAltitudeMeters(double routeDistanceMeters, double originGroundMeters, double destinationGroundMeters) {
+    return std::max(
+        std::max(originGroundMeters, destinationGroundMeters) + 1800.0,
+        std::clamp(routeDistanceMeters * 0.012 + 1800.0, 2500.0, 10500.0));
+}
+
 std::string FormatRunwayEndLabel(const RunwayEndRecord& runwayEnd, bool useImperialUnits) {
     std::ostringstream ss;
     ss << runwayEnd.runwayIdent << " -> " << runwayEnd.oppositeRunwayIdent << "  ";
@@ -1632,9 +1738,8 @@ void TeleportAirplaneRouteToOrigin(
     route.initialDistanceMeters =
         GreatCircleDistanceMeters(originEndpoint.latitudeDeg, originEndpoint.longitudeDeg, destinationEndpoint.latitudeDeg, destinationEndpoint.longitudeDeg);
     route.distanceToDestinationMeters = route.initialDistanceMeters;
-    route.cruiseAltitudeMeters = std::max(
-        std::max(route.originGroundMeters, route.destinationGroundMeters) + 1800.0,
-        std::clamp(route.initialDistanceMeters * 0.012 + 1800.0, 2500.0, 10500.0));
+    route.cruiseAltitudeMeters =
+        EstimateRouteCruiseAltitudeMeters(route.initialDistanceMeters, route.originGroundMeters, route.destinationGroundMeters);
     route.targetAltitudeMeters = route.originGroundMeters + 8.0;
     route.phaseElapsedSeconds = 0.0;
     route.phase = AirplaneRoutePhase::Ready;
@@ -1708,6 +1813,7 @@ void UpdateAirplaneRouteAutopilot(
     double desiredSpeedMps = sim.SpeedMps();
     double desiredPitchRad = 0.0;
     double desiredRollRad = 0.0;
+    bool finishRouteAfterMove = false;
 
     if (route.phase == AirplaneRoutePhase::TakeoffRoll) {
         desiredHeadingRad = flight::DegToRad(originEndpoint.headingDeg);
@@ -1739,7 +1845,7 @@ void UpdateAirplaneRouteAutopilot(
             SetAirplaneRoutePhase(route, AirplaneRoutePhase::Descent);
         }
     } else if (route.phase == AirplaneRoutePhase::Descent) {
-        const double approachOffsetMeters = 9500.0;
+        const double approachOffsetMeters = 16000.0;
         double approachLatDeg = destinationEndpoint.latitudeDeg;
         double approachLonDeg = destinationEndpoint.longitudeDeg;
         OffsetLatLonMeters(
@@ -1751,12 +1857,12 @@ void UpdateAirplaneRouteAutopilot(
             approachLonDeg);
         const double distanceToApproach = GreatCircleDistanceMeters(latDeg, lonDeg, approachLatDeg, approachLonDeg);
         desiredHeadingRad = BearingRadiansBetween(latDeg, lonDeg, approachLatDeg, approachLonDeg);
-        desiredSpeedMps = MoveToward(sim.SpeedMps(), 150.0, 12.0 * dt);
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 165.0, 8.0 * dt);
         const double glideAltitude = route.destinationGroundMeters + 250.0 + distanceToDestination * std::tan(flight::DegToRad(3.0));
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), std::min(route.cruiseAltitudeMeters, glideAltitude), 18.0 * dt);
         desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.018, -6.0, 2.5));
         desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.8, flight::DegToRad(-30.0), flight::DegToRad(30.0));
-        if (distanceToApproach < 1800.0 || distanceToDestination < 12000.0) {
+        if (distanceToApproach < 2500.0 || distanceToDestination < 18000.0) {
             SetAirplaneRoutePhase(route, AirplaneRoutePhase::Final);
         }
     } else if (route.phase == AirplaneRoutePhase::Final) {
@@ -1771,29 +1877,32 @@ void UpdateAirplaneRouteAutopilot(
             runwayAimLatDeg,
             runwayAimLonDeg);
         desiredHeadingRad = BearingRadiansBetween(latDeg, lonDeg, runwayAimLatDeg, runwayAimLonDeg);
-        desiredSpeedMps = MoveToward(sim.SpeedMps(), 82.0, 10.0 * dt);
+        const double finalTargetSpeedMps = std::clamp(76.0 + distanceToDestination / 260.0, 76.0, 125.0);
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), finalTargetSpeedMps, 8.0 * dt);
         const double flareFloorMeters = distanceToDestination < 850.0 ? 5.5 : 8.0;
         const double finalAltitude = route.destinationGroundMeters + std::max(flareFloorMeters, distanceToDestination * std::tan(flight::DegToRad(3.0)));
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), finalAltitude, 12.0 * dt);
         desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.018, -5.0, 1.0));
-        desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.6, flight::DegToRad(-18.0), flight::DegToRad(18.0));
-        if ((distanceToDestination < 1000.0 && sim.AltitudeMeters() <= route.destinationGroundMeters + 45.0) ||
-            distanceToDestination < 260.0) {
-            sim.SetKinematicStateRadians(
-                flight::DegToRad(destinationEndpoint.latitudeDeg),
-                flight::DegToRad(destinationEndpoint.longitudeDeg),
-                route.destinationGroundMeters + 6.0,
-                0.0,
-                runwayHeadingRad,
-                0.0,
-                0.0);
-            route.distanceToDestinationMeters = 0.0;
-            route.targetAltitudeMeters = route.destinationGroundMeters + 6.0;
-            route.active = false;
-            route.arrived = true;
-            route.phase = AirplaneRoutePhase::Arrived;
-            route.phaseElapsedSeconds = 0.0;
-            return;
+        desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.55, flight::DegToRad(-14.0), flight::DegToRad(14.0));
+        if ((distanceToDestination < 450.0 && sim.AltitudeMeters() <= route.destinationGroundMeters + 12.0) ||
+            distanceToDestination < 120.0) {
+            SetAirplaneRoutePhase(route, AirplaneRoutePhase::Rollout);
+            desiredHeadingRad = runwayHeadingRad;
+            desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.destinationGroundMeters + 6.0, 4.0 * dt);
+            desiredSpeedMps = MoveToward(sim.SpeedMps(), 55.0, 10.0 * dt);
+            desiredPitchRad = 0.0;
+            desiredRollRad = 0.0;
+        }
+    } else if (route.phase == AirplaneRoutePhase::Rollout) {
+        desiredHeadingRad = runwayHeadingRad;
+        desiredSpeedMps = MoveToward(sim.SpeedMps(), 0.0, 5.5 * dt);
+        desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), route.destinationGroundMeters + 6.0, 4.0 * dt);
+        desiredPitchRad = 0.0;
+        desiredRollRad = 0.0;
+        route.distanceToDestinationMeters = 0.0;
+        if (sim.SpeedMps() <= 1.5 && route.phaseElapsedSeconds > 1.0) {
+            desiredSpeedMps = 0.0;
+            finishRouteAfterMove = true;
         }
     } else {
         route.active = false;
@@ -1809,6 +1918,13 @@ void UpdateAirplaneRouteAutopilot(
     const double distanceStepMeters = std::max(0.0, desiredSpeedMps) * std::cos(nextPitchRad) * dt;
     route.targetAltitudeMeters = desiredAltitudeMeters;
     MoveSimAlongHeading(sim, nextHeadingRad, desiredAltitudeMeters, desiredSpeedMps, nextPitchRad, nextRollRad, distanceStepMeters);
+    if (finishRouteAfterMove) {
+        route.distanceToDestinationMeters = 0.0;
+        route.active = false;
+        route.arrived = true;
+        route.phase = AirplaneRoutePhase::Arrived;
+        route.phaseElapsedSeconds = 0.0;
+    }
 }
 
 void PrepareMissileAtLaunch(MissileAutopilotState& missile) {
@@ -3831,6 +3947,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             routeOriginEndpoint.longitudeDeg,
             routeDestinationEndpoint.latitudeDeg,
             routeDestinationEndpoint.longitudeDeg);
+        const double routePreviewOriginGroundMeters = RouteEndpointGroundMeters(routeOriginEndpoint, terrainSystem, terrainSystemReady);
+        const double routePreviewDestinationGroundMeters = RouteEndpointGroundMeters(routeDestinationEndpoint, terrainSystem, terrainSystemReady);
+        const double routePreviewCruiseAltitudeMeters = EstimateRouteCruiseAltitudeMeters(
+            routePreviewDistanceMeters,
+            routePreviewOriginGroundMeters,
+            routePreviewDestinationGroundMeters);
+        const double routePreviewEstimatedSeconds = routePreviewDistanceMeters / 185.0;
+        const double routePreviewEstimatedScaledSeconds =
+            routePreviewEstimatedSeconds / std::max(1.0, static_cast<double>(simTimeScale));
         const double routeDisplayDistanceMeters = (airplaneRouteState.active || airplaneRouteState.arrived)
             ? airplaneRouteState.distanceToDestinationMeters
             : routePreviewDistanceMeters;
@@ -3843,11 +3968,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("Distance: %.1f mi", routeDisplayDistanceMeters * 0.000621371);
             ImGui::Text("Target altitude: %.0f ft", ToDisplayAltitude(airplaneRouteState.targetAltitudeMeters, true));
             ImGui::Text("Cruise altitude: %.0f ft", ToDisplayAltitude(airplaneRouteState.cruiseAltitudeMeters, true));
+            ImGui::Text("Preview cruise: %.0f ft", ToDisplayAltitude(routePreviewCruiseAltitudeMeters, true));
         } else {
             ImGui::Text("Distance: %.1f km", routeDisplayDistanceMeters * 0.001);
             ImGui::Text("Target altitude: %.0f m", airplaneRouteState.targetAltitudeMeters);
             ImGui::Text("Cruise altitude: %.0f m", airplaneRouteState.cruiseAltitudeMeters);
+            ImGui::Text("Preview cruise: %.0f m", routePreviewCruiseAltitudeMeters);
         }
+        ImGui::Text("Estimated time: %s at 1x / %s at %.1fx",
+            FormatDurationMinutes(routePreviewEstimatedSeconds).c_str(),
+            FormatDurationMinutes(routePreviewEstimatedScaledSeconds).c_str(),
+            simTimeScale);
 
         ImGui::Separator();
         const bool routeSelectionDisabled = !airplaneRouteModeAvailable || airplaneRouteState.active;
@@ -3911,6 +4042,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             routeDestinationEndpoint.longitudeDeg);
         ImGui::Text("Departure heading: %.0f deg", routeOriginEndpoint.headingDeg);
         ImGui::Text("Arrival heading: %.0f deg", routeDestinationEndpoint.headingDeg);
+        if (airplaneRouteState.active) {
+            ImGui::BeginDisabled();
+        }
+        ImGui::Checkbox("Show Route On Map", &airplaneRouteState.showRouteOnHudMap);
+        if (airplaneRouteState.active) {
+            ImGui::EndDisabled();
+        }
 
         if (!airplaneRouteModeAvailable || airplaneRouteState.active) {
             ImGui::BeginDisabled();
@@ -4082,6 +4220,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             mapDrawList->AddImage(mapTexture, mapMin, mapMax, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), IM_COL32(255, 255, 255, 235));
         }
         mapDrawList->PushClipRect(mapMin, mapMax, true);
+        if (airplaneRouteState.showRouteOnHudMap && routeAirportsValid) {
+            DrawHudMapRoute(
+                mapDrawList,
+                hudMapState,
+                mapMin,
+                mapMax,
+                routeOriginEndpoint.latitudeDeg,
+                routeOriginEndpoint.longitudeDeg,
+                routeDestinationEndpoint.latitudeDeg,
+                routeDestinationEndpoint.longitudeDeg);
+        }
         DrawHudMapMarker(mapDrawList, hudMapState, mapMin, mapMax, activeSim.LatitudeDeg(), activeSim.LongitudeDeg(), mapHeadingDeg);
         mapDrawList->PopClipRect();
         mapDrawList->AddText({mapMin.x + 8.0f, mapMax.y - 18.0f}, IM_COL32(255, 255, 255, 190), "OpenStreetMap");
