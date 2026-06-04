@@ -1801,10 +1801,14 @@ void UpdateAirplaneRouteAutopilot(
     }
 
     const double maxTurnRateRad = flight::DegToRad(route.phase == AirplaneRoutePhase::Final ? 10.0 : 18.0);
+    const double maxPitchRateRad = flight::DegToRad(12.0);
+    const double maxRollRateRad = flight::DegToRad(35.0);
     const double nextHeadingRad = MoveTowardAngle(sim.HeadingRad(), desiredHeadingRad, maxTurnRateRad * dt);
-    const double distanceStepMeters = std::max(0.0, desiredSpeedMps) * std::cos(desiredPitchRad) * dt;
+    const double nextPitchRad = MoveToward(sim.PitchRad(), desiredPitchRad, maxPitchRateRad * dt);
+    const double nextRollRad = MoveToward(sim.RollRad(), desiredRollRad, maxRollRateRad * dt);
+    const double distanceStepMeters = std::max(0.0, desiredSpeedMps) * std::cos(nextPitchRad) * dt;
     route.targetAltitudeMeters = desiredAltitudeMeters;
-    MoveSimAlongHeading(sim, nextHeadingRad, desiredAltitudeMeters, desiredSpeedMps, desiredPitchRad, desiredRollRad, distanceStepMeters);
+    MoveSimAlongHeading(sim, nextHeadingRad, desiredAltitudeMeters, desiredSpeedMps, nextPitchRad, nextRollRad, distanceStepMeters);
 }
 
 void PrepareMissileAtLaunch(MissileAutopilotState& missile) {
