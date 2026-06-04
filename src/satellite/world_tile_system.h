@@ -101,8 +101,8 @@ public:
     struct Config {
         int minZoom = 9;
         int maxZoom = 16;
-        int atlasPagesX = 24;
-        int atlasPagesY = 24;
+        int atlasPagesX = 36;
+        int atlasPagesY = 36;
         int pageTableWidth = 1024;
         int pageTableHeight = 1024;
         size_t maxVisibleTilesPerFrame = 1600;

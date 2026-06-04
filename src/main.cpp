@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
@@ -29,6 +30,7 @@
 #include "gltf_loader.h"
 #include "hud_map_tile_streamer.h"
 #include "mesh.h"
+#include "runway_database.h"
 #include "satellite/satellite_streamer.h"
 #include "satellite/world_tile_system.h"
 #include "sim.h"
@@ -1263,6 +1265,7 @@ struct MissileAutopilotState {
 struct AirportRoutePreset {
     const char* label = "";
     const char* ident = "";
+    const char* runwayAirportIdent = "";
     double latitudeDeg = 0.0;
     double longitudeDeg = 0.0;
     double elevationMeters = 0.0;
@@ -1282,6 +1285,10 @@ enum class AirplaneRoutePhase {
 struct AirplaneRouteAutopilotState {
     int originAirportIndex = 0;
     int destinationAirportIndex = 1;
+    std::array<char, 16> originAirportIdentText = {'K', 'S', 'F', 'O', '\0'};
+    std::array<char, 16> destinationAirportIdentText = {'K', 'L', 'A', 'X', '\0'};
+    int originRunwayEndIndex = -1;
+    int destinationRunwayEndIndex = -1;
     AirplaneRoutePhase phase = AirplaneRoutePhase::Ready;
     bool active = false;
     bool arrived = false;
@@ -1304,13 +1311,13 @@ constexpr int kRouteAirportWashingtonIad = 6;
 constexpr int kRouteAirportCount = 7;
 
 const std::array<AirportRoutePreset, kRouteAirportCount> kRouteAirports{{
-    {"San Francisco - SFO", "SFO", 37.618806, -122.375417, 4.0, 284.0},
-    {"Los Angeles - LAX", "LAX", 33.942496, -118.408049, 39.0, 251.0},
-    {"San Diego - SAN", "SAN", 32.733563, -117.189663, 5.0, 275.0},
-    {"New York - JFK", "JFK", 40.639928, -73.778692, 4.0, 121.0},
-    {"Chicago - ORD", "ORD", 41.976940, -87.908150, 207.0, 270.0},
-    {"Washington, D.C. - DCA", "DCA", 38.851440, -77.037721, 4.0, 175.0},
-    {"Washington, D.C. - IAD", "IAD", 38.947456, -77.459929, 95.0, 181.0},
+    {"San Francisco - SFO", "SFO", "KSFO", 37.618806, -122.375417, 4.0, 284.0},
+    {"Los Angeles - LAX", "LAX", "KLAX", 33.942496, -118.408049, 39.0, 251.0},
+    {"San Diego - SAN", "SAN", "KSAN", 32.733563, -117.189663, 5.0, 275.0},
+    {"New York - JFK", "JFK", "KJFK", 40.639928, -73.778692, 4.0, 121.0},
+    {"Chicago - ORD", "ORD", "KORD", 41.976940, -87.908150, 207.0, 270.0},
+    {"Washington, D.C. - DCA", "DCA", "KDCA", 38.851440, -77.037721, 4.0, 175.0},
+    {"Washington, D.C. - IAD", "IAD", "KIAD", 38.947456, -77.459929, 95.0, 181.0},
 }};
 
 const char* kRouteAirportComboItems =
@@ -1405,6 +1412,93 @@ void SetAirplaneRoutePhase(AirplaneRouteAutopilotState& route, AirplaneRoutePhas
     }
 }
 
+void SetRouteAirportIdentText(std::array<char, 16>& text, const char* ident) {
+    std::snprintf(text.data(), text.size(), "%s", ident != nullptr ? ident : "");
+}
+
+std::string RouteAirportIdentText(const std::array<char, 16>& text) {
+    return std::string(text.data());
+}
+
+bool RunwayEndSelectionIsValidForAirport(const RunwayDatabase& runwayDatabase, const std::string& airportIdent, int runwayEndIndex) {
+    const std::vector<int>& runwayEnds = runwayDatabase.RunwayEndIndicesForAirport(airportIdent);
+    return std::find(runwayEnds.begin(), runwayEnds.end(), runwayEndIndex) != runwayEnds.end();
+}
+
+void EnsureRouteRunwaySelection(const RunwayDatabase& runwayDatabase, const std::string& airportIdent, int& runwayEndIndex) {
+    if (!runwayDatabase.IsLoaded()) {
+        runwayEndIndex = -1;
+        return;
+    }
+    if (!RunwayEndSelectionIsValidForAirport(runwayDatabase, airportIdent, runwayEndIndex)) {
+        runwayEndIndex = runwayDatabase.DefaultRunwayEndIndexForAirport(airportIdent);
+    }
+}
+
+void ApplyRouteQuickPick(
+    const RunwayDatabase& runwayDatabase,
+    AirplaneRouteAutopilotState& route,
+    bool origin,
+    int airportIndex) {
+    const int clampedAirportIndex = std::clamp(airportIndex, 0, kRouteAirportCount - 1);
+    const AirportRoutePreset& airport = kRouteAirports[clampedAirportIndex];
+    if (origin) {
+        route.originAirportIndex = clampedAirportIndex;
+        SetRouteAirportIdentText(route.originAirportIdentText, airport.runwayAirportIdent);
+        route.originRunwayEndIndex = runwayDatabase.DefaultRunwayEndIndexForAirport(RouteAirportIdentText(route.originAirportIdentText));
+    } else {
+        route.destinationAirportIndex = clampedAirportIndex;
+        SetRouteAirportIdentText(route.destinationAirportIdentText, airport.runwayAirportIdent);
+        route.destinationRunwayEndIndex = runwayDatabase.DefaultRunwayEndIndexForAirport(RouteAirportIdentText(route.destinationAirportIdentText));
+    }
+    route.arrived = false;
+}
+
+struct RouteEndpoint {
+    std::string airportIdent;
+    std::string runwayIdent;
+    std::string oppositeRunwayIdent;
+    double latitudeDeg = 0.0;
+    double longitudeDeg = 0.0;
+    double elevationMeters = 0.0;
+    double headingDeg = 0.0;
+    bool runwayBacked = false;
+};
+
+RouteEndpoint ResolveRouteEndpoint(
+    const RunwayDatabase& runwayDatabase,
+    const std::string& airportIdentText,
+    int runwayEndIndex,
+    const AirportRoutePreset& fallbackAirport) {
+    RouteEndpoint endpoint;
+    endpoint.airportIdent = fallbackAirport.runwayAirportIdent;
+    endpoint.latitudeDeg = fallbackAirport.latitudeDeg;
+    endpoint.longitudeDeg = fallbackAirport.longitudeDeg;
+    endpoint.elevationMeters = fallbackAirport.elevationMeters;
+    endpoint.headingDeg = fallbackAirport.runwayHeadingDeg;
+
+    const RunwayEndRecord* runwayEnd = runwayDatabase.GetRunwayEnd(runwayEndIndex);
+    if (runwayEnd != nullptr && RunwayEndSelectionIsValidForAirport(runwayDatabase, airportIdentText, runwayEndIndex)) {
+        endpoint.airportIdent = runwayEnd->airportIdent;
+        endpoint.runwayIdent = runwayEnd->runwayIdent;
+        endpoint.oppositeRunwayIdent = runwayEnd->oppositeRunwayIdent;
+        endpoint.latitudeDeg = runwayEnd->latitudeDeg;
+        endpoint.longitudeDeg = runwayEnd->longitudeDeg;
+        endpoint.elevationMeters = runwayEnd->elevationMeters;
+        endpoint.headingDeg = runwayEnd->headingDeg;
+        endpoint.runwayBacked = true;
+        return endpoint;
+    }
+
+    const std::string resolvedIdent = runwayDatabase.ResolveAirportIdent(airportIdentText);
+    if (!resolvedIdent.empty()) {
+        endpoint.airportIdent = resolvedIdent;
+    } else if (!airportIdentText.empty()) {
+        endpoint.airportIdent = airportIdentText;
+    }
+    return endpoint;
+}
+
 double AirportGroundMeters(const AirportRoutePreset& airport, TerrainSystem& terrainSystem, bool terrainSystemReady) {
     if (!terrainSystemReady) {
         return airport.elevationMeters;
@@ -1415,6 +1509,83 @@ double AirportGroundMeters(const AirportRoutePreset& airport, TerrainSystem& ter
         return airport.elevationMeters;
     }
     return std::max(airport.elevationMeters, terrainHeight);
+}
+
+double RouteEndpointGroundMeters(const RouteEndpoint& endpoint, TerrainSystem& terrainSystem, bool terrainSystemReady) {
+    if (!terrainSystemReady) {
+        return endpoint.elevationMeters;
+    }
+    bool tileLoaded = false;
+    const double terrainHeight = terrainSystem.SampleHeightMetersCached(endpoint.latitudeDeg, endpoint.longitudeDeg, &tileLoaded);
+    if (!tileLoaded) {
+        return endpoint.elevationMeters;
+    }
+    return std::max(endpoint.elevationMeters, terrainHeight);
+}
+
+std::string FormatRunwayEndLabel(const RunwayEndRecord& runwayEnd, bool useImperialUnits) {
+    std::ostringstream ss;
+    ss << runwayEnd.runwayIdent << " -> " << runwayEnd.oppositeRunwayIdent << "  ";
+    if (useImperialUnits) {
+        ss << std::fixed << std::setprecision(0) << (runwayEnd.lengthMeters * kMetersToFeet) << " ft";
+    } else {
+        ss << std::fixed << std::setprecision(0) << runwayEnd.lengthMeters << " m";
+    }
+    ss << "  hdg " << std::fixed << std::setprecision(0) << runwayEnd.headingDeg;
+    return ss.str();
+}
+
+bool DrawRunwayEndCombo(
+    const char* label,
+    const RunwayDatabase& runwayDatabase,
+    const std::string& airportIdent,
+    int& runwayEndIndex,
+    bool useImperialUnits) {
+    const std::vector<int>& runwayEnds = runwayDatabase.RunwayEndIndicesForAirport(airportIdent);
+    if (runwayEnds.empty()) {
+        ImGui::BeginDisabled();
+        int empty = 0;
+        ImGui::Combo(label, &empty, "No runway data\0");
+        ImGui::EndDisabled();
+        runwayEndIndex = -1;
+        return false;
+    }
+
+    EnsureRouteRunwaySelection(runwayDatabase, airportIdent, runwayEndIndex);
+    const RunwayEndRecord* selectedRunwayEnd = runwayDatabase.GetRunwayEnd(runwayEndIndex);
+    const std::string preview = selectedRunwayEnd != nullptr ? FormatRunwayEndLabel(*selectedRunwayEnd, useImperialUnits) : "Select runway";
+    bool changed = false;
+
+    ImGui::SetNextItemWidth(260.0f);
+    if (ImGui::BeginCombo(label, preview.c_str())) {
+        for (int index : runwayEnds) {
+            const RunwayEndRecord* runwayEnd = runwayDatabase.GetRunwayEnd(index);
+            if (runwayEnd == nullptr) {
+                continue;
+            }
+            const std::string itemLabel = FormatRunwayEndLabel(*runwayEnd, useImperialUnits);
+            const bool selected = index == runwayEndIndex;
+            if (ImGui::Selectable(itemLabel.c_str(), selected)) {
+                runwayEndIndex = index;
+                changed = true;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    return changed;
+}
+
+std::string EndpointDisplayName(const RouteEndpoint& endpoint, const AirportRoutePreset& fallbackAirport) {
+    std::string name = endpoint.airportIdent.empty() ? fallbackAirport.ident : endpoint.airportIdent;
+    if (!endpoint.runwayIdent.empty()) {
+        name += " ";
+        name += endpoint.runwayIdent;
+    }
+    return name;
 }
 
 void MoveSimAlongHeading(
@@ -1443,16 +1614,23 @@ void MoveSimAlongHeading(
 void TeleportAirplaneRouteToOrigin(
     FlightSim& sim,
     AirplaneRouteAutopilotState& route,
+    const RunwayDatabase& runwayDatabase,
     TerrainSystem& terrainSystem,
     bool terrainSystemReady) {
     route.originAirportIndex = std::clamp(route.originAirportIndex, 0, kRouteAirportCount - 1);
     route.destinationAirportIndex = std::clamp(route.destinationAirportIndex, 0, kRouteAirportCount - 1);
     const AirportRoutePreset& origin = kRouteAirports[route.originAirportIndex];
     const AirportRoutePreset& destination = kRouteAirports[route.destinationAirportIndex];
-    route.originGroundMeters = AirportGroundMeters(origin, terrainSystem, terrainSystemReady);
-    route.destinationGroundMeters = AirportGroundMeters(destination, terrainSystem, terrainSystemReady);
+    const std::string originIdent = RouteAirportIdentText(route.originAirportIdentText);
+    const std::string destinationIdent = RouteAirportIdentText(route.destinationAirportIdentText);
+    EnsureRouteRunwaySelection(runwayDatabase, originIdent, route.originRunwayEndIndex);
+    EnsureRouteRunwaySelection(runwayDatabase, destinationIdent, route.destinationRunwayEndIndex);
+    const RouteEndpoint originEndpoint = ResolveRouteEndpoint(runwayDatabase, originIdent, route.originRunwayEndIndex, origin);
+    const RouteEndpoint destinationEndpoint = ResolveRouteEndpoint(runwayDatabase, destinationIdent, route.destinationRunwayEndIndex, destination);
+    route.originGroundMeters = RouteEndpointGroundMeters(originEndpoint, terrainSystem, terrainSystemReady);
+    route.destinationGroundMeters = RouteEndpointGroundMeters(destinationEndpoint, terrainSystem, terrainSystemReady);
     route.initialDistanceMeters =
-        GreatCircleDistanceMeters(origin.latitudeDeg, origin.longitudeDeg, destination.latitudeDeg, destination.longitudeDeg);
+        GreatCircleDistanceMeters(originEndpoint.latitudeDeg, originEndpoint.longitudeDeg, destinationEndpoint.latitudeDeg, destinationEndpoint.longitudeDeg);
     route.distanceToDestinationMeters = route.initialDistanceMeters;
     route.cruiseAltitudeMeters = std::max(
         std::max(route.originGroundMeters, route.destinationGroundMeters) + 1800.0,
@@ -1463,11 +1641,11 @@ void TeleportAirplaneRouteToOrigin(
     route.active = false;
     route.arrived = false;
     sim.SetKinematicStateRadians(
-        flight::DegToRad(origin.latitudeDeg),
-        flight::DegToRad(origin.longitudeDeg),
+        flight::DegToRad(originEndpoint.latitudeDeg),
+        flight::DegToRad(originEndpoint.longitudeDeg),
         route.originGroundMeters + 8.0,
         0.0,
-        flight::DegToRad(origin.runwayHeadingDeg),
+        flight::DegToRad(originEndpoint.headingDeg),
         0.0,
         0.0);
 }
@@ -1475,10 +1653,11 @@ void TeleportAirplaneRouteToOrigin(
 void StartAirplaneRouteAutopilot(
     FlightSim& sim,
     AirplaneRouteAutopilotState& route,
+    const RunwayDatabase& runwayDatabase,
     TerrainSystem& terrainSystem,
     bool terrainSystemReady) {
-    TeleportAirplaneRouteToOrigin(sim, route, terrainSystem, terrainSystemReady);
-    if (route.originAirportIndex == route.destinationAirportIndex || route.initialDistanceMeters < 1000.0) {
+    TeleportAirplaneRouteToOrigin(sim, route, runwayDatabase, terrainSystem, terrainSystemReady);
+    if (route.initialDistanceMeters < 1000.0) {
         route.arrived = true;
         route.phase = AirplaneRoutePhase::Arrived;
         return;
@@ -1497,6 +1676,7 @@ void CancelAirplaneRouteAutopilot(AirplaneRouteAutopilotState& route) {
 
 void UpdateAirplaneRouteAutopilot(
     FlightSim& sim,
+    const RunwayDatabase& runwayDatabase,
     AirplaneRouteAutopilotState& route,
     double dtSeconds,
     double timeScale) {
@@ -1506,16 +1686,23 @@ void UpdateAirplaneRouteAutopilot(
 
     const double dt = dtSeconds * std::clamp(timeScale, 0.01, 100.0);
     route.phaseElapsedSeconds += dt;
+    route.originAirportIndex = std::clamp(route.originAirportIndex, 0, kRouteAirportCount - 1);
+    route.destinationAirportIndex = std::clamp(route.destinationAirportIndex, 0, kRouteAirportCount - 1);
+    const AirportRoutePreset& origin = kRouteAirports[route.originAirportIndex];
     const AirportRoutePreset& destination = kRouteAirports[route.destinationAirportIndex];
+    const std::string originIdent = RouteAirportIdentText(route.originAirportIdentText);
+    const std::string destinationIdent = RouteAirportIdentText(route.destinationAirportIdentText);
+    const RouteEndpoint originEndpoint = ResolveRouteEndpoint(runwayDatabase, originIdent, route.originRunwayEndIndex, origin);
+    const RouteEndpoint destinationEndpoint = ResolveRouteEndpoint(runwayDatabase, destinationIdent, route.destinationRunwayEndIndex, destination);
     const double latDeg = sim.LatitudeDeg();
     const double lonDeg = sim.LongitudeDeg();
     const double distanceToDestination =
-        GreatCircleDistanceMeters(latDeg, lonDeg, destination.latitudeDeg, destination.longitudeDeg);
+        GreatCircleDistanceMeters(latDeg, lonDeg, destinationEndpoint.latitudeDeg, destinationEndpoint.longitudeDeg);
     route.distanceToDestinationMeters = distanceToDestination;
 
     const double destinationHeadingRad =
-        BearingRadiansBetween(latDeg, lonDeg, destination.latitudeDeg, destination.longitudeDeg);
-    const double runwayHeadingRad = flight::DegToRad(destination.runwayHeadingDeg);
+        BearingRadiansBetween(latDeg, lonDeg, destinationEndpoint.latitudeDeg, destinationEndpoint.longitudeDeg);
+    const double runwayHeadingRad = flight::DegToRad(destinationEndpoint.headingDeg);
     double desiredHeadingRad = destinationHeadingRad;
     double desiredAltitudeMeters = sim.AltitudeMeters();
     double desiredSpeedMps = sim.SpeedMps();
@@ -1523,8 +1710,7 @@ void UpdateAirplaneRouteAutopilot(
     double desiredRollRad = 0.0;
 
     if (route.phase == AirplaneRoutePhase::TakeoffRoll) {
-        const AirportRoutePreset& origin = kRouteAirports[route.originAirportIndex];
-        desiredHeadingRad = flight::DegToRad(origin.runwayHeadingDeg);
+        desiredHeadingRad = flight::DegToRad(originEndpoint.headingDeg);
         desiredSpeedMps = std::min(105.0, sim.SpeedMps() + 9.5 * dt);
         const double liftFactor = std::clamp((desiredSpeedMps - 62.0) / 42.0, 0.0, 1.0);
         desiredAltitudeMeters = route.originGroundMeters + 8.0 + liftFactor * route.phaseElapsedSeconds * 2.2;
@@ -1554,11 +1740,11 @@ void UpdateAirplaneRouteAutopilot(
         }
     } else if (route.phase == AirplaneRoutePhase::Descent) {
         const double approachOffsetMeters = 9500.0;
-        double approachLatDeg = destination.latitudeDeg;
-        double approachLonDeg = destination.longitudeDeg;
+        double approachLatDeg = destinationEndpoint.latitudeDeg;
+        double approachLonDeg = destinationEndpoint.longitudeDeg;
         OffsetLatLonMeters(
-            destination.latitudeDeg,
-            destination.longitudeDeg,
+            destinationEndpoint.latitudeDeg,
+            destinationEndpoint.longitudeDeg,
             -std::cos(runwayHeadingRad) * approachOffsetMeters,
             -std::sin(runwayHeadingRad) * approachOffsetMeters,
             approachLatDeg,
@@ -1574,17 +1760,28 @@ void UpdateAirplaneRouteAutopilot(
             SetAirplaneRoutePhase(route, AirplaneRoutePhase::Final);
         }
     } else if (route.phase == AirplaneRoutePhase::Final) {
-        desiredHeadingRad = destinationHeadingRad;
+        double runwayAimLatDeg = destinationEndpoint.latitudeDeg;
+        double runwayAimLonDeg = destinationEndpoint.longitudeDeg;
+        const double aimBeyondThresholdMeters = std::clamp(distanceToDestination * 0.25, 450.0, 1600.0);
+        OffsetLatLonMeters(
+            destinationEndpoint.latitudeDeg,
+            destinationEndpoint.longitudeDeg,
+            std::cos(runwayHeadingRad) * aimBeyondThresholdMeters,
+            std::sin(runwayHeadingRad) * aimBeyondThresholdMeters,
+            runwayAimLatDeg,
+            runwayAimLonDeg);
+        desiredHeadingRad = BearingRadiansBetween(latDeg, lonDeg, runwayAimLatDeg, runwayAimLonDeg);
         desiredSpeedMps = MoveToward(sim.SpeedMps(), 82.0, 10.0 * dt);
-        const double finalAltitude = route.destinationGroundMeters + std::max(8.0, distanceToDestination * std::tan(flight::DegToRad(2.8)));
+        const double flareFloorMeters = distanceToDestination < 850.0 ? 5.5 : 8.0;
+        const double finalAltitude = route.destinationGroundMeters + std::max(flareFloorMeters, distanceToDestination * std::tan(flight::DegToRad(3.0)));
         desiredAltitudeMeters = MoveToward(sim.AltitudeMeters(), finalAltitude, 12.0 * dt);
         desiredPitchRad = flight::DegToRad(std::clamp((desiredAltitudeMeters - sim.AltitudeMeters()) * 0.018, -5.0, 1.0));
         desiredRollRad = std::clamp(WrapRadiansPi(desiredHeadingRad - sim.HeadingRad()) * 0.6, flight::DegToRad(-18.0), flight::DegToRad(18.0));
         if ((distanceToDestination < 1000.0 && sim.AltitudeMeters() <= route.destinationGroundMeters + 45.0) ||
             distanceToDestination < 260.0) {
             sim.SetKinematicStateRadians(
-                flight::DegToRad(destination.latitudeDeg),
-                flight::DegToRad(destination.longitudeDeg),
+                flight::DegToRad(destinationEndpoint.latitudeDeg),
+                flight::DegToRad(destinationEndpoint.longitudeDeg),
                 route.destinationGroundMeters + 6.0,
                 0.0,
                 runwayHeadingRad,
@@ -2383,6 +2580,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         terrainSystemReady = true;
     }
 
+    RunwayDatabase runwayDatabase;
+    std::string runwayDatabaseStatus;
+    {
+        std::string runwayDatabaseError;
+        const std::filesystem::path runwayDatabasePath = std::filesystem::path("assets") / "data" / "runways.csv";
+        if (runwayDatabase.Load(runwayDatabasePath, runwayDatabaseError)) {
+            runwayDatabaseStatus = "Runways loaded: " + std::to_string(runwayDatabase.AirportCount()) + " airports, " +
+                std::to_string(runwayDatabase.RunwayEndCount()) + " runway ends";
+        } else {
+            runwayDatabaseStatus = runwayDatabaseError;
+        }
+    }
+    ApplyRouteQuickPick(runwayDatabase, airplaneRouteState, true, airplaneRouteState.originAirportIndex);
+    ApplyRouteQuickPick(runwayDatabase, airplaneRouteState, false, airplaneRouteState.destinationAirportIndex);
+
     SatelliteStreamer satelliteStreamer;
     bool satelliteStreamerReady = false;
     std::string satelliteInitStatus;
@@ -2412,8 +2624,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         WorldTileSystem::Config worldCfg{};
         worldCfg.minZoom = 9;
         worldCfg.maxZoom = 16;
-        worldCfg.atlasPagesX = 24;
-        worldCfg.atlasPagesY = 24;
+        worldCfg.atlasPagesX = 36;
+        worldCfg.atlasPagesY = 36;
         worldCfg.pageTableWidth = 1024;
         worldCfg.pageTableHeight = 1024;
         worldCfg.maxVisibleTilesPerFrame = 768;
@@ -2815,7 +3027,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 sim.Update(dt, input, static_cast<double>(simTimeScale));
                 vehicleModeStatus = "Airport hop autopilot cancelled";
             } else if (airplaneRouteState.active) {
-                UpdateAirplaneRouteAutopilot(sim, airplaneRouteState, dt, static_cast<double>(simTimeScale));
+                UpdateAirplaneRouteAutopilot(sim, runwayDatabase, airplaneRouteState, dt, static_cast<double>(simTimeScale));
             } else {
                 sim.Update(dt, input, static_cast<double>(simTimeScale));
             }
@@ -3593,17 +3805,36 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             std::clamp(airplaneRouteState.destinationAirportIndex, 0, kRouteAirportCount - 1);
         const AirportRoutePreset& routeOrigin = kRouteAirports[airplaneRouteState.originAirportIndex];
         const AirportRoutePreset& routeDestination = kRouteAirports[airplaneRouteState.destinationAirportIndex];
+        if (!airplaneRouteState.active) {
+            EnsureRouteRunwaySelection(runwayDatabase, RouteAirportIdentText(airplaneRouteState.originAirportIdentText), airplaneRouteState.originRunwayEndIndex);
+            EnsureRouteRunwaySelection(
+                runwayDatabase,
+                RouteAirportIdentText(airplaneRouteState.destinationAirportIdentText),
+                airplaneRouteState.destinationRunwayEndIndex);
+        }
+        const RouteEndpoint routeOriginEndpoint = ResolveRouteEndpoint(
+            runwayDatabase,
+            RouteAirportIdentText(airplaneRouteState.originAirportIdentText),
+            airplaneRouteState.originRunwayEndIndex,
+            routeOrigin);
+        const RouteEndpoint routeDestinationEndpoint = ResolveRouteEndpoint(
+            runwayDatabase,
+            RouteAirportIdentText(airplaneRouteState.destinationAirportIdentText),
+            airplaneRouteState.destinationRunwayEndIndex,
+            routeDestination);
         const double routePreviewDistanceMeters = GreatCircleDistanceMeters(
-            routeOrigin.latitudeDeg,
-            routeOrigin.longitudeDeg,
-            routeDestination.latitudeDeg,
-            routeDestination.longitudeDeg);
+            routeOriginEndpoint.latitudeDeg,
+            routeOriginEndpoint.longitudeDeg,
+            routeDestinationEndpoint.latitudeDeg,
+            routeDestinationEndpoint.longitudeDeg);
         const double routeDisplayDistanceMeters = (airplaneRouteState.active || airplaneRouteState.arrived)
             ? airplaneRouteState.distanceToDestinationMeters
             : routePreviewDistanceMeters;
+        const bool routeAirportsValid = routePreviewDistanceMeters >= 1000.0;
 
         ImGui::Text("State: %s", airplaneRouteState.active ? "Flying" : (airplaneRouteState.arrived ? "Arrived" : "Ready"));
         ImGui::Text("Phase: %s", AirplaneRoutePhaseName(airplaneRouteState.phase));
+        ImGui::TextUnformatted(runwayDatabaseStatus.c_str());
         if (useImperialUnits) {
             ImGui::Text("Distance: %.1f mi", routeDisplayDistanceMeters * 0.000621371);
             ImGui::Text("Target altitude: %.0f ft", ToDisplayAltitude(airplaneRouteState.targetAltitudeMeters, true));
@@ -3615,27 +3846,76 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         ImGui::Separator();
+        const bool routeSelectionDisabled = !airplaneRouteModeAvailable || airplaneRouteState.active;
+        if (routeSelectionDisabled) {
+            ImGui::BeginDisabled();
+        }
         ImGui::SetNextItemWidth(220.0f);
         if (ImGui::Combo("Origin Airport", &airplaneRouteState.originAirportIndex, kRouteAirportComboItems)) {
-            airplaneRouteState.arrived = false;
+            ApplyRouteQuickPick(runwayDatabase, airplaneRouteState, true, airplaneRouteState.originAirportIndex);
         }
         ImGui::SetNextItemWidth(220.0f);
         if (ImGui::Combo("Destination Airport", &airplaneRouteState.destinationAirportIndex, kRouteAirportComboItems)) {
+            ApplyRouteQuickPick(runwayDatabase, airplaneRouteState, false, airplaneRouteState.destinationAirportIndex);
+        }
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::InputText("Origin Ident", airplaneRouteState.originAirportIdentText.data(), airplaneRouteState.originAirportIdentText.size(), ImGuiInputTextFlags_CharsUppercase)) {
+            airplaneRouteState.originRunwayEndIndex =
+                runwayDatabase.DefaultRunwayEndIndexForAirport(RouteAirportIdentText(airplaneRouteState.originAirportIdentText));
             airplaneRouteState.arrived = false;
         }
-        ImGui::Text("Origin: %s %.6f, %.6f", routeOrigin.ident, routeOrigin.latitudeDeg, routeOrigin.longitudeDeg);
-        ImGui::Text("Destination: %s %.6f, %.6f", routeDestination.ident, routeDestination.latitudeDeg, routeDestination.longitudeDeg);
-        ImGui::Text("Runway heading: %.0f deg", routeDestination.runwayHeadingDeg);
+        if (DrawRunwayEndCombo(
+                "Origin Runway",
+                runwayDatabase,
+                RouteAirportIdentText(airplaneRouteState.originAirportIdentText),
+                airplaneRouteState.originRunwayEndIndex,
+                useImperialUnits)) {
+            airplaneRouteState.arrived = false;
+        }
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::InputText(
+                "Destination Ident",
+                airplaneRouteState.destinationAirportIdentText.data(),
+                airplaneRouteState.destinationAirportIdentText.size(),
+                ImGuiInputTextFlags_CharsUppercase)) {
+            airplaneRouteState.destinationRunwayEndIndex =
+                runwayDatabase.DefaultRunwayEndIndexForAirport(RouteAirportIdentText(airplaneRouteState.destinationAirportIdentText));
+            airplaneRouteState.arrived = false;
+        }
+        if (DrawRunwayEndCombo(
+                "Destination Runway",
+                runwayDatabase,
+                RouteAirportIdentText(airplaneRouteState.destinationAirportIdentText),
+                airplaneRouteState.destinationRunwayEndIndex,
+                useImperialUnits)) {
+            airplaneRouteState.arrived = false;
+        }
+        if (routeSelectionDisabled) {
+            ImGui::EndDisabled();
+        }
+        const std::string originName = EndpointDisplayName(routeOriginEndpoint, routeOrigin);
+        const std::string destinationName = EndpointDisplayName(routeDestinationEndpoint, routeDestination);
+        ImGui::Text(
+            "Origin: %s %.6f, %.6f",
+            originName.c_str(),
+            routeOriginEndpoint.latitudeDeg,
+            routeOriginEndpoint.longitudeDeg);
+        ImGui::Text(
+            "Destination: %s %.6f, %.6f",
+            destinationName.c_str(),
+            routeDestinationEndpoint.latitudeDeg,
+            routeDestinationEndpoint.longitudeDeg);
+        ImGui::Text("Departure heading: %.0f deg", routeOriginEndpoint.headingDeg);
+        ImGui::Text("Arrival heading: %.0f deg", routeDestinationEndpoint.headingDeg);
 
-        const bool routeAirportsValid = airplaneRouteState.originAirportIndex != airplaneRouteState.destinationAirportIndex;
         if (!airplaneRouteModeAvailable || airplaneRouteState.active) {
             ImGui::BeginDisabled();
         }
         if (ImGui::Button("Teleport To Origin")) {
-            TeleportAirplaneRouteToOrigin(sim, airplaneRouteState, terrainSystem, terrainSystemReady);
+            TeleportAirplaneRouteToOrigin(sim, airplaneRouteState, runwayDatabase, terrainSystem, terrainSystemReady);
             regenerateTerrainRequested = true;
             havePatchCenter = false;
-            vehicleModeStatus = std::string("Teleported to ") + routeOrigin.ident;
+            vehicleModeStatus = std::string("Teleported to ") + originName;
         }
         if (!airplaneRouteModeAvailable || airplaneRouteState.active) {
             ImGui::EndDisabled();
@@ -3646,10 +3926,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::BeginDisabled();
         }
         if (ImGui::Button("Start Autopilot")) {
-            StartAirplaneRouteAutopilot(sim, airplaneRouteState, terrainSystem, terrainSystemReady);
+            StartAirplaneRouteAutopilot(sim, airplaneRouteState, runwayDatabase, terrainSystem, terrainSystemReady);
             regenerateTerrainRequested = true;
             havePatchCenter = false;
-            vehicleModeStatus = std::string("Airport hop autopilot started: ") + routeOrigin.ident + " to " + routeDestination.ident;
+            vehicleModeStatus = std::string("Airport hop autopilot started: ") + originName + " to " + destinationName;
         }
         if (!airplaneRouteModeAvailable || !routeAirportsValid || airplaneRouteState.active) {
             ImGui::EndDisabled();
@@ -3670,7 +3950,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (!airplaneRouteModeAvailable) {
             ImGui::TextUnformatted("Switch out of Missile mode to fly an airport hop.");
         } else if (!routeAirportsValid) {
-            ImGui::TextUnformatted("Choose different origin and destination airports.");
+            ImGui::TextUnformatted("Choose origin and destination runway ends at least 1 km apart.");
         }
         ImGui::End();
 

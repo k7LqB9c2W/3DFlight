@@ -224,8 +224,8 @@ private:
     static constexpr uint32_t kWorldSatelliteTileSize = 256;
     static constexpr uint32_t kWorldSatelliteGutterTexels = 8;
     static constexpr uint32_t kWorldSatellitePhysicalTileSize = kWorldSatelliteTileSize + kWorldSatelliteGutterTexels * 2u;
-    static constexpr uint32_t kWorldSatelliteAtlasPagesX = 24;
-    static constexpr uint32_t kWorldSatelliteAtlasPagesY = 24;
+    static constexpr uint32_t kWorldSatelliteAtlasPagesX = 36;
+    static constexpr uint32_t kWorldSatelliteAtlasPagesY = 36;
     static constexpr uint32_t kWorldSatelliteAtlasMipCount = 5;
     static constexpr uint32_t kWorldSatellitePageTableWidth = 1024;
     static constexpr uint32_t kWorldSatellitePageTableHeight = 1024;

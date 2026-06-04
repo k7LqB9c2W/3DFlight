@@ -16,6 +16,8 @@ add_executable(3DFlight WIN32
     src/d3d12_renderer.h
     src/mesh.cpp
     src/mesh.h
+    src/runway_database.cpp
+    src/runway_database.h
     src/gltf_loader.cpp
     src/gltf_loader.h
     src/hud_map_tile_streamer.cpp
