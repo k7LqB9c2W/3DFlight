@@ -836,7 +836,9 @@ void D3D12Renderer::Shutdown() {
     m_rootSignature.Reset();
     m_computeRootSignature.Reset();
     m_planePso.Reset();
+    m_planeCulledPso.Reset();
     m_planeTransparentPso.Reset();
+    m_planeTransparentCulledPso.Reset();
     m_earthPso.Reset();
     m_skyboxPso.Reset();
     m_terrainPso.Reset();
@@ -1034,6 +1036,7 @@ bool D3D12Renderer::SetPlaneMeshParts(const std::vector<PlaneMeshPart>& parts, s
         dst.sphericalBillboard = src.sphericalBillboard;
         dst.transparent = src.transparent;
         dst.emissive = src.emissive;
+        dst.doubleSided = src.doubleSided;
         dst.alphaCutoff = src.alphaCutoff;
 
         const bool hasTexture =
@@ -1912,12 +1915,18 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
                 cameraUpModelLocal = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
             }
             auto drawPartPass = [&](bool transparentPass) {
-                m_commandList->SetPipelineState(transparentPass ? m_planeTransparentPso.Get() : m_planePso.Get());
                 for (size_t partIndex = 0; partIndex < m_planeParts.size(); ++partIndex) {
                     const auto& part = m_planeParts[partIndex];
                     if (!part.visible || part.transparent != transparentPass) {
                         continue;
                     }
+                    ID3D12PipelineState* partPso = nullptr;
+                    if (transparentPass) {
+                        partPso = part.doubleSided ? m_planeTransparentPso.Get() : m_planeTransparentCulledPso.Get();
+                    } else {
+                        partPso = part.doubleSided ? m_planePso.Get() : m_planeCulledPso.Get();
+                    }
+                    m_commandList->SetPipelineState(partPso);
                     ObjectConstants partObj = obj;
                     partObj.tuning0 = {
                         part.alphaCutoff,
@@ -2599,6 +2608,14 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
         return false;
     }
 
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC planeCulledPso = pso;
+    planeCulledPso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    hr = m_device->CreateGraphicsPipelineState(&planeCulledPso, IID_PPV_ARGS(m_planeCulledPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(plane culled) failed", hr);
+        return false;
+    }
+
     D3D12_GRAPHICS_PIPELINE_STATE_DESC planeTransparentPso = pso;
     planeTransparentPso.BlendState.RenderTarget[0].BlendEnable = TRUE;
     planeTransparentPso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
@@ -2612,6 +2629,14 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     hr = m_device->CreateGraphicsPipelineState(&planeTransparentPso, IID_PPV_ARGS(m_planeTransparentPso.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
         error = HrMessage("CreateGraphicsPipelineState(plane transparent) failed", hr);
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC planeTransparentCulledPso = planeTransparentPso;
+    planeTransparentCulledPso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    hr = m_device->CreateGraphicsPipelineState(&planeTransparentCulledPso, IID_PPV_ARGS(m_planeTransparentCulledPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(plane transparent culled) failed", hr);
         return false;
     }
 

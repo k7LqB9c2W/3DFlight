@@ -1312,9 +1312,10 @@ enum class VehicleMode {
     FlightGear737 = 4,
     Missile = 5,
     Cockpit737 = 6,
+    FlightGear737Cockpit = 7,
 };
 
-constexpr size_t kVehicleModeCount = 7;
+constexpr size_t kVehicleModeCount = 8;
 const char* kVehicleModeComboItems =
     "Airplane\0"
     "A320-200\0"
@@ -1322,7 +1323,8 @@ const char* kVehicleModeComboItems =
     "B-2 Spirit\0"
     "FlightGear 737-800YV\0"
     "AIM-120D Missile\0"
-    "737 Cockpit\0";
+    "737 Cockpit\0"
+    "FlightGear 737 Cockpit\0";
 
 const char* VehicleModeDisplayName(VehicleMode mode) {
     switch (mode) {
@@ -1340,6 +1342,8 @@ const char* VehicleModeDisplayName(VehicleMode mode) {
             return "Missile";
         case VehicleMode::Cockpit737:
             return "737 Cockpit";
+        case VehicleMode::FlightGear737Cockpit:
+            return "FlightGear 737 Cockpit";
         default:
             return "Airplane";
     }
@@ -1364,6 +1368,8 @@ VehicleMode VehicleModeFromIndex(int index) {
             return VehicleMode::Missile;
         case 6:
             return VehicleMode::Cockpit737;
+        case 7:
+            return VehicleMode::FlightGear737Cockpit;
         case 0:
         default:
             return VehicleMode::Airplane;
@@ -1375,7 +1381,11 @@ bool VehicleModeIsMissile(VehicleMode mode) {
 }
 
 bool VehicleModeIsCockpit(VehicleMode mode) {
-    return mode == VehicleMode::Cockpit737;
+    return mode == VehicleMode::Cockpit737 || mode == VehicleMode::FlightGear737Cockpit;
+}
+
+bool VehicleModeIsFlightGear737(VehicleMode mode) {
+    return mode == VehicleMode::FlightGear737 || mode == VehicleMode::FlightGear737Cockpit;
 }
 
 enum class VehicleRenderKind {
@@ -2773,6 +2783,19 @@ CockpitViewConfig MakeDefaultCockpitViewConfig() {
     return cfg;
 }
 
+CockpitViewConfig MakeDefaultFlightGear737CockpitViewConfig() {
+    CockpitViewConfig cfg;
+    cfg.seatRightMeters = -0.51f;
+    cfg.seatUpMeters = 1.28f;
+    cfg.seatForwardMeters = 1.34f;
+    cfg.basePitchDeg = -16.0f;
+    cfg.fovDeg = 75.0f;
+    cfg.worldNearClipMeters = 0.25f;
+    cfg.cockpitNearClipMeters = 0.02f;
+    cfg.cockpitFarClipMeters = 150.0f;
+    return cfg;
+}
+
 void SanitizeCockpitViewConfig(CockpitViewConfig& cfg) {
     cfg.modelScale = std::clamp(cfg.modelScale, 0.05f, 20.0f);
     cfg.modelRightMeters = std::clamp(cfg.modelRightMeters, -25.0f, 25.0f);
@@ -3061,6 +3084,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             cockpitLoadOptions,
             false,
             false},
+        VehicleAssetLoadSpec{
+            VehicleMode::FlightGear737Cockpit,
+            ResolveExistingPathFromWorkingTree(std::filesystem::path("737-800YV-master") / "737-800YV-master" / "Models" / "cockpit.xml"),
+            1.0f,
+            5.0f,
+            kCockpitAxisTransform,
+            VehicleRenderKind::InteriorCockpit,
+            {},
+            false,
+            true},
     }};
     const std::array<VehicleMode, kVehicleModeCount> vehicleLoadOrder{
         VehicleMode::Airplane,
@@ -3068,6 +3101,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         VehicleMode::F35,
         VehicleMode::B2,
         VehicleMode::FlightGear737,
+        VehicleMode::FlightGear737Cockpit,
         VehicleMode::Cockpit737,
         VehicleMode::Missile,
     };
@@ -3140,6 +3174,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     renderPart.objectName = part.objectName;
                     renderPart.transparent = part.transparent;
                     renderPart.emissive = part.emissive;
+                    renderPart.doubleSided = part.doubleSided;
                     renderPart.alphaCutoff = part.alphaCutoff;
                     const size_t partIndex = asset.meshParts.size();
                     if (!part.objectName.empty()) {
@@ -3239,8 +3274,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     bool autoTimeOfDay = false;
     float timeOfDayRateHoursPerSecond = 0.5f;
     CockpitViewConfig cockpitViewConfig = MakeDefaultCockpitViewConfig();
+    CockpitViewConfig flightGearCockpitViewConfig = MakeDefaultFlightGear737CockpitViewConfig();
+    CockpitViewConfig* activeCockpitViewConfig = &cockpitViewConfig;
     CockpitViewRuntimeState cockpitViewRuntime{};
     const std::filesystem::path cockpitConfigPath = std::filesystem::path("config") / "cockpit_view.json";
+    const std::filesystem::path flightGearCockpitConfigPath = std::filesystem::path("config") / "flightgear_737_cockpit_view.json";
+    const std::filesystem::path* activeCockpitConfigPath = &cockpitConfigPath;
     std::string cockpitConfigStatus;
 
     TerrainSystem terrainSystem;
@@ -3399,9 +3438,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 cockpitConfigStatus = "Cockpit config create failed: " + saveError;
             }
         }
+        const bool fgConfigExists = std::filesystem::exists(flightGearCockpitConfigPath, existsEc) && !existsEc;
+        if (fgConfigExists) {
+            std::string loadError;
+            if (!LoadCockpitViewConfig(flightGearCockpitConfigPath, flightGearCockpitViewConfig, loadError)) {
+                cockpitConfigStatus = "FlightGear cockpit config load failed: " + loadError;
+            }
+        } else {
+            std::string saveError;
+            SanitizeCockpitViewConfig(flightGearCockpitViewConfig);
+            if (!SaveCockpitViewConfig(flightGearCockpitConfigPath, flightGearCockpitViewConfig, saveError)) {
+                cockpitConfigStatus = "FlightGear cockpit config create failed: " + saveError;
+            }
+        }
     }
     g_cockpitViewSelected = nullptr;
-    g_cockpitViewConfig = &cockpitViewConfig;
+    g_cockpitViewConfig = activeCockpitViewConfig;
     g_cockpitViewRuntime = &cockpitViewRuntime;
     double graphicsHotReloadAccumulator = 0.0;
 
@@ -3571,6 +3623,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     std::array<char, 128> fgPropertyValueText = {'\0'};
     auto applyVehicleMesh = [&](VehicleMode mode) {
         cockpitViewSelected = VehicleModeIsCockpit(mode);
+        if (mode == VehicleMode::FlightGear737Cockpit) {
+            activeCockpitViewConfig = &flightGearCockpitViewConfig;
+            activeCockpitConfigPath = &flightGearCockpitConfigPath;
+        } else {
+            activeCockpitViewConfig = &cockpitViewConfig;
+            activeCockpitConfigPath = &cockpitConfigPath;
+        }
+        g_cockpitViewConfig = activeCockpitViewConfig;
         if (!cockpitViewSelected) {
             cockpitViewRuntime.freelookActive = false;
             cockpitViewRuntime.hasLastMousePos = false;
@@ -3766,7 +3826,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
         }
 
-        const bool flightGearExteriorControls = flightInputFocused && vehicleMode == VehicleMode::FlightGear737;
+        const bool flightGearExteriorControls = flightInputFocused && VehicleModeIsFlightGear737(vehicleMode);
         const bool gearKeyDown = flightGearExteriorControls && IsKeyDown('G');
         if (gearKeyDown && !previousGearKey) {
             fgGearTargetDown = !fgGearTargetDown;
@@ -3855,7 +3915,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         fgRuntime.SetPropertyDouble("/sim/sound/category/effects", fgEffectsSoundGain);
         fgRuntime.UpdateFromSim(
             activeSim,
-            vehicleMode == VehicleMode::FlightGear737,
+            VehicleModeIsFlightGear737(vehicleMode),
             VehicleModeIsCockpit(vehicleMode),
             dt * static_cast<double>(simTimeScale));
 
@@ -3865,7 +3925,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             fgFlapPositionNorm = MoveTowardFloat(fgFlapPositionNorm, fgFlapTargetNorm, visualDt / 4.0f);
             fgSpeedBrakePositionNorm = MoveTowardFloat(fgSpeedBrakePositionNorm, fgSpeedBrakeTargetNorm, visualDt / 1.8f);
         }
-        if (vehicleMode == VehicleMode::FlightGear737) {
+        if (VehicleModeIsFlightGear737(vehicleMode)) {
             std::unordered_map<std::string, float> fgVisualProperties;
             const float speedMps = static_cast<float>(std::max(0.0, activeSim.SpeedMps()));
             const float speedKnots = speedMps * 1.94384449f;
@@ -3958,17 +4018,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             SetFlightGearPropertyValue(fgVisualProperties, "engines/engine[1]/n1", n1Percent);
             SetFlightGearPropertyValue(fgVisualProperties, "engines/engine/n1", n1Percent);
 
-            VehicleRenderAsset& activeFgAsset = vehicleAssets[VehicleModeToIndex(VehicleMode::FlightGear737)];
-            fgAnimationDebugEntries = BuildFlightGearAnimationDebugEntries(activeFgAsset, fgVisualProperties, 32);
+            VehicleRenderAsset& activeFgAsset = vehicleAssets[VehicleModeToIndex(vehicleMode)];
+            VehicleRenderAsset& debugFgAsset = vehicleAssets[VehicleModeToIndex(VehicleMode::FlightGear737)];
+            fgAnimationDebugEntries = BuildFlightGearAnimationDebugEntries(debugFgAsset, fgVisualProperties, 32);
             UpdateFlightGearVisualAnimations(activeFgAsset, fgVisualProperties, visualDt);
-            if (appliedRenderMode == VehicleMode::FlightGear737 && appliedVehicleAssetReady) {
+            if (appliedRenderMode == vehicleMode && appliedVehicleAssetReady) {
                 renderer.SetPlanePartAnimationState(activeFgAsset.meshPartAnimationStates);
             }
         } else {
             fgAnimationDebugEntries.clear();
         }
         if (!cockpitViewRuntime.freelookActive) {
-            const double halflife = std::max(static_cast<double>(cockpitViewConfig.recenterHalflifeSec), 0.01);
+            const double halflife = std::max(static_cast<double>(activeCockpitViewConfig->recenterHalflifeSec), 0.01);
             const float decay = static_cast<float>(std::exp2(-dt / halflife));
             cockpitViewRuntime.lookYawDeg *= decay;
             cockpitViewRuntime.lookPitchDeg *= decay;
@@ -4715,7 +4776,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("Camera orbit Left/Right arrows");
             ImGui::Text("Hide/show GUI F5");
             ImGui::Text("Altitude R/F, Reset Backspace");
-            if (vehicleMode == VehicleMode::FlightGear737) {
+            if (VehicleModeIsFlightGear737(vehicleMode)) {
                 ImGui::Text("737 exterior: Gear G, Flaps Z/X, Speedbrakes B, Lights L");
                 ImGui::Text(
                     "737 visual state: gear %.0f%%, flaps %.0f%%, speedbrake %.0f%%, lights %s",
@@ -4795,12 +4856,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::End();
         }
 
-        const auto& fgDebugAsset = vehicleAssets[VehicleModeToIndex(vehicleMode)];
+        const auto& fgDebugAsset = vehicleAssets[VehicleModeToIndex(
+            vehicleMode == VehicleMode::FlightGear737Cockpit ? VehicleMode::FlightGear737 : vehicleMode)];
         const bool showFlightGearAnimationDebug =
-            vehicleMode == VehicleMode::FlightGear737 && !fgDebugAsset.flightGearAnimations.empty();
+            VehicleModeIsFlightGear737(vehicleMode) && !fgDebugAsset.flightGearAnimations.empty();
         if (showFlightGearAnimationDebug) {
             ImGui::Begin("Aircraft Animation Debug");
             ImGui::Text("%s", VehicleModeDisplayName(vehicleMode));
+            if (vehicleMode == VehicleMode::FlightGear737Cockpit) {
+                if (ImGui::Button("Exit Cockpit View")) {
+                    vehicleMode = VehicleMode::FlightGear737;
+                    applyVehicleMesh(vehicleMode);
+                    regenerateTerrainRequested = true;
+                    havePatchCenter = false;
+                }
+            } else {
+                if (ImGui::Button("Enter FlightGear Cockpit")) {
+                    vehicleMode = VehicleMode::FlightGear737Cockpit;
+                    applyVehicleMesh(vehicleMode);
+                    regenerateTerrainRequested = true;
+                    havePatchCenter = false;
+                }
+            }
             ImGui::Text(
                 "Animations: %zu, parts: %zu",
                 fgDebugAsset.flightGearAnimations.size(),
@@ -5257,6 +5334,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         if (VehicleModeIsCockpit(vehicleMode)) {
             ImGui::Begin("Cockpit View");
+            CockpitViewConfig& cockpitCfg = *activeCockpitViewConfig;
+            const std::filesystem::path& cockpitProfilePath = *activeCockpitConfigPath;
             bool cockpitConfigChanged = false;
             const auto editFloatWithInput =
                 [&](const char* label, float& value, float minValue, float maxValue, float dragSpeed, const char* format, float step, float stepFast) {
@@ -5274,34 +5353,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     }
                 };
 
-            editFloatWithInput("Model Scale", cockpitViewConfig.modelScale, 0.05f, 6.0f, 0.01f, "%.2f", 0.01f, 0.10f);
-            editFloatWithInput("Model Right (m)", cockpitViewConfig.modelRightMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
-            editFloatWithInput("Model Up (m)", cockpitViewConfig.modelUpMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
-            editFloatWithInput("Model Forward (m)", cockpitViewConfig.modelForwardMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
-            editFloatWithInput("Model Yaw (deg)", cockpitViewConfig.modelYawDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
-            editFloatWithInput("Model Pitch (deg)", cockpitViewConfig.modelPitchDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
-            editFloatWithInput("Model Roll (deg)", cockpitViewConfig.modelRollDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
-            editFloatWithInput("Seat Right (m)", cockpitViewConfig.seatRightMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
-            editFloatWithInput("Seat Up (m)", cockpitViewConfig.seatUpMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
-            editFloatWithInput("Seat Forward (m)", cockpitViewConfig.seatForwardMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
-            editFloatWithInput("Base Yaw (deg)", cockpitViewConfig.baseYawDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
-            editFloatWithInput("Base Pitch (deg)", cockpitViewConfig.basePitchDeg, -89.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
-            editFloatWithInput("FOV (deg)", cockpitViewConfig.fovDeg, 30.0f, 110.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Model Scale", cockpitCfg.modelScale, 0.05f, 6.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Right (m)", cockpitCfg.modelRightMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Up (m)", cockpitCfg.modelUpMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Forward (m)", cockpitCfg.modelForwardMeters, -15.0f, 15.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Model Yaw (deg)", cockpitCfg.modelYawDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Model Pitch (deg)", cockpitCfg.modelPitchDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Model Roll (deg)", cockpitCfg.modelRollDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Seat Right (m)", cockpitCfg.seatRightMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Seat Up (m)", cockpitCfg.seatUpMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Seat Forward (m)", cockpitCfg.seatForwardMeters, -10.0f, 10.0f, 0.01f, "%.2f", 0.01f, 0.10f);
+            editFloatWithInput("Base Yaw (deg)", cockpitCfg.baseYawDeg, -180.0f, 180.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Base Pitch (deg)", cockpitCfg.basePitchDeg, -89.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("FOV (deg)", cockpitCfg.fovDeg, 30.0f, 110.0f, 0.10f, "%.1f", 0.10f, 1.00f);
             editFloatWithInput(
                 "Mouse Sensitivity",
-                cockpitViewConfig.freelookSensitivityDegPerPixel,
+                cockpitCfg.freelookSensitivityDegPerPixel,
                 0.01f,
                 0.8f,
                 0.005f,
                 "%.3f",
                 0.01f,
                 0.05f);
-            editFloatWithInput("Max Look Yaw", cockpitViewConfig.maxLookYawDeg, 5.0f, 179.0f, 0.10f, "%.1f", 0.10f, 1.00f);
-            editFloatWithInput("Max Look Pitch Up", cockpitViewConfig.maxLookPitchUpDeg, 5.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
-            editFloatWithInput("Max Look Pitch Down", cockpitViewConfig.maxLookPitchDownDeg, 5.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Max Look Yaw", cockpitCfg.maxLookYawDeg, 5.0f, 179.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Max Look Pitch Up", cockpitCfg.maxLookPitchUpDeg, 5.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
+            editFloatWithInput("Max Look Pitch Down", cockpitCfg.maxLookPitchDownDeg, 5.0f, 89.0f, 0.10f, "%.1f", 0.10f, 1.00f);
 
             if (cockpitConfigChanged) {
-                SanitizeCockpitViewConfig(cockpitViewConfig);
+                SanitizeCockpitViewConfig(cockpitCfg);
             }
 
             if (ImGui::Button("Reset Runtime Look")) {
@@ -5313,7 +5392,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             }
             ImGui::SameLine();
             if (ImGui::Button("Reset Profile Defaults")) {
-                cockpitViewConfig = MakeDefaultCockpitViewConfig();
+                cockpitCfg = (vehicleMode == VehicleMode::FlightGear737Cockpit)
+                    ? MakeDefaultFlightGear737CockpitViewConfig()
+                    : MakeDefaultCockpitViewConfig();
                 cockpitViewRuntime.lookYawDeg = 0.0f;
                 cockpitViewRuntime.lookPitchDeg = 0.0f;
                 cockpitViewRuntime.freelookActive = false;
@@ -5321,21 +5402,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 cockpitConfigStatus = "Restored cockpit defaults";
             }
             if (ImGui::Button("Save Cockpit Profile")) {
-                SanitizeCockpitViewConfig(cockpitViewConfig);
+                SanitizeCockpitViewConfig(cockpitCfg);
                 std::string saveError;
-                if (SaveCockpitViewConfig(cockpitConfigPath, cockpitViewConfig, saveError)) {
-                    cockpitConfigStatus = "Saved " + cockpitConfigPath.string();
+                if (SaveCockpitViewConfig(cockpitProfilePath, cockpitCfg, saveError)) {
+                    cockpitConfigStatus = "Saved " + cockpitProfilePath.string();
                 } else {
                     cockpitConfigStatus = "Cockpit save failed: " + saveError;
                 }
             }
             ImGui::SameLine();
             if (ImGui::Button("Reload Cockpit Profile")) {
-                CockpitViewConfig loaded = cockpitViewConfig;
+                CockpitViewConfig loaded = cockpitCfg;
                 std::string loadError;
-                if (LoadCockpitViewConfig(cockpitConfigPath, loaded, loadError)) {
-                    cockpitViewConfig = loaded;
-                    cockpitConfigStatus = "Reloaded " + cockpitConfigPath.string();
+                if (LoadCockpitViewConfig(cockpitProfilePath, loaded, loadError)) {
+                    cockpitCfg = loaded;
+                    cockpitConfigStatus = "Reloaded " + cockpitProfilePath.string();
                 } else {
                     cockpitConfigStatus = "Cockpit reload failed: " + loadError;
                 }
@@ -5344,7 +5425,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Separator();
             ImGui::Text("Freelook: %s", cockpitViewRuntime.freelookActive ? "active" : "idle");
             ImGui::Text("Look yaw/pitch: %.1f / %.1f deg", cockpitViewRuntime.lookYawDeg, cockpitViewRuntime.lookPitchDeg);
-            ImGui::Text("Config: %s", cockpitConfigPath.string().c_str());
+            ImGui::Text("Config: %s", cockpitProfilePath.string().c_str());
             if (!cockpitConfigStatus.empty()) {
                 ImGui::TextWrapped("%s", cockpitConfigStatus.c_str());
             }
@@ -5655,27 +5736,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         D3D12Renderer::CameraSettings cameraSettings{};
+        CockpitViewConfig& currentCockpitCfg = *activeCockpitViewConfig;
         cameraSettings.mode = VehicleModeIsCockpit(vehicleMode) ? D3D12Renderer::CameraMode::Cockpit : D3D12Renderer::CameraMode::Chase;
         cameraSettings.chaseDistanceMeters = renderer.CameraFollowDistanceMeters();
         cameraSettings.chaseOrbitYawDeg = chaseOrbitYawDeg;
-        cameraSettings.cockpitSeatRightMeters = cockpitViewConfig.seatRightMeters;
-        cameraSettings.cockpitSeatUpMeters = cockpitViewConfig.seatUpMeters;
-        cameraSettings.cockpitSeatForwardMeters = cockpitViewConfig.seatForwardMeters;
-        cameraSettings.cockpitModelScale = cockpitViewConfig.modelScale;
-        cameraSettings.cockpitModelRightMeters = cockpitViewConfig.modelRightMeters;
-        cameraSettings.cockpitModelUpMeters = cockpitViewConfig.modelUpMeters;
-        cameraSettings.cockpitModelForwardMeters = cockpitViewConfig.modelForwardMeters;
-        cameraSettings.cockpitModelYawDeg = cockpitViewConfig.modelYawDeg;
-        cameraSettings.cockpitModelPitchDeg = cockpitViewConfig.modelPitchDeg;
-        cameraSettings.cockpitModelRollDeg = cockpitViewConfig.modelRollDeg;
-        cameraSettings.cockpitBaseYawDeg = cockpitViewConfig.baseYawDeg;
-        cameraSettings.cockpitBasePitchDeg = cockpitViewConfig.basePitchDeg;
+        cameraSettings.cockpitSeatRightMeters = currentCockpitCfg.seatRightMeters;
+        cameraSettings.cockpitSeatUpMeters = currentCockpitCfg.seatUpMeters;
+        cameraSettings.cockpitSeatForwardMeters = currentCockpitCfg.seatForwardMeters;
+        cameraSettings.cockpitModelScale = currentCockpitCfg.modelScale;
+        cameraSettings.cockpitModelRightMeters = currentCockpitCfg.modelRightMeters;
+        cameraSettings.cockpitModelUpMeters = currentCockpitCfg.modelUpMeters;
+        cameraSettings.cockpitModelForwardMeters = currentCockpitCfg.modelForwardMeters;
+        cameraSettings.cockpitModelYawDeg = currentCockpitCfg.modelYawDeg;
+        cameraSettings.cockpitModelPitchDeg = currentCockpitCfg.modelPitchDeg;
+        cameraSettings.cockpitModelRollDeg = currentCockpitCfg.modelRollDeg;
+        cameraSettings.cockpitBaseYawDeg = currentCockpitCfg.baseYawDeg;
+        cameraSettings.cockpitBasePitchDeg = currentCockpitCfg.basePitchDeg;
         cameraSettings.cockpitLookYawDeg = cockpitViewRuntime.lookYawDeg;
         cameraSettings.cockpitLookPitchDeg = cockpitViewRuntime.lookPitchDeg;
-        cameraSettings.cockpitFovDeg = cockpitViewConfig.fovDeg;
-        cameraSettings.worldNearClipMeters = cockpitViewConfig.worldNearClipMeters;
-        cameraSettings.cockpitNearClipMeters = cockpitViewConfig.cockpitNearClipMeters;
-        cameraSettings.cockpitFarClipMeters = cockpitViewConfig.cockpitFarClipMeters;
+        cameraSettings.cockpitFovDeg = currentCockpitCfg.fovDeg;
+        cameraSettings.worldNearClipMeters = currentCockpitCfg.worldNearClipMeters;
+        cameraSettings.cockpitNearClipMeters = currentCockpitCfg.cockpitNearClipMeters;
+        cameraSettings.cockpitFarClipMeters = currentCockpitCfg.cockpitFarClipMeters;
         cameraSettings.renderOnlyCockpitMesh = VehicleModeIsCockpit(vehicleMode);
         renderer.SetCameraSettings(cameraSettings);
 

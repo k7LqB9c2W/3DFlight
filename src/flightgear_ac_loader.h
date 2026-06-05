@@ -33,6 +33,7 @@ struct FlightGearMeshPart {
     std::vector<std::string> objectAliases;
     bool transparent = false;
     bool emissive = false;
+    bool doubleSided = false;
     float alphaCutoff = 0.0f;
 };
 

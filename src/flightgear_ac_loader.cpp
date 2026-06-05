@@ -57,6 +57,22 @@ struct TextureBinding {
     std::string name;
 };
 
+struct AcSurfaceRef {
+    uint32_t index = 0;
+    Float2 uv{};
+};
+
+struct AcTriangle {
+    std::array<AcSurfaceRef, 3> refs{};
+    std::array<Float3, 3> positions{};
+    Float3 weightedNormal{};
+    float weightedNormalLength = 0.0f;
+    DirectX::XMFLOAT4 color{1.0f, 1.0f, 1.0f, 1.0f};
+    bool smooth = false;
+    bool doubleSided = false;
+    bool emissive = false;
+};
+
 struct ParseContext {
     std::vector<AcMaterial> materials;
     std::unordered_map<std::wstring, TextureImage> textureCache;
@@ -211,6 +227,14 @@ bool StartsWith(const std::string& value, const std::string& prefix) {
 
 bool ContainsInsensitive(const std::string& value, const std::string& needle) {
     return Lower(value).find(Lower(needle)) != std::string::npos;
+}
+
+uint32_t ParseAcSurfaceFlags(const std::string& flagsText) {
+    try {
+        return static_cast<uint32_t>(std::stoul(flagsText, nullptr, 0));
+    } catch (...) {
+        return 0;
+    }
 }
 
 bool IsFlightGearLightObjectName(const std::string& objectName) {
@@ -532,23 +556,7 @@ void ApplyTextureToPart(FlightGearMeshPart& part, const TextureBinding& texture)
     }
 }
 
-FlightGearMeshPart& GetPartForTexture(ParseContext& context, const TextureBinding& texture) {
-    static constexpr wchar_t kUntexturedKey[] = L"__flightgear_untextured__";
-    const std::wstring key = texture.image != nullptr ? texture.key : std::wstring(kUntexturedKey);
-    const auto found = context.partByTextureKey.find(key);
-    if (found != context.partByTextureKey.end()) {
-        return (*context.parts)[found->second];
-    }
-
-    FlightGearMeshPart part{};
-    ApplyTextureToPart(part, texture);
-    context.parts->push_back(std::move(part));
-    const size_t index = context.parts->size() - 1u;
-    context.partByTextureKey.emplace(key, index);
-    return (*context.parts)[index];
-}
-
-FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::string& objectKey, const TextureBinding& texture) {
+FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::string& objectKey, const TextureBinding& texture, bool doubleSided) {
     std::string key = objectKey;
     for (const std::string& alias : context.modelAliasStack) {
         key += "|";
@@ -556,6 +564,7 @@ FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::st
     }
     key += "|";
     key += texture.image != nullptr ? std::filesystem::path(texture.key).generic_string() : std::string("__flightgear_untextured__");
+    key += doubleSided ? "|double" : "|single";
     const auto found = context.partByObjectTextureKey.find(key);
     if (found != context.partByObjectTextureKey.end()) {
         return (*context.parts)[found->second];
@@ -564,6 +573,7 @@ FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::st
     FlightGearMeshPart part{};
     part.objectName = objectKey;
     part.objectAliases = context.modelAliasStack;
+    part.doubleSided = doubleSided;
     ApplyTextureToPart(part, texture);
     context.parts->push_back(std::move(part));
     const size_t index = context.parts->size() - 1u;
@@ -571,34 +581,142 @@ FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::st
     return (*context.parts)[index];
 }
 
-FlightGearMeshPart& GetPartForObject(ParseContext& context, const std::string& objectName, const TextureBinding& texture) {
+FlightGearMeshPart& GetPartForTexture(ParseContext& context, const TextureBinding& texture, bool doubleSided) {
+    static constexpr wchar_t kUntexturedKey[] = L"__flightgear_untextured__";
+    std::wstring key = texture.image != nullptr ? texture.key : std::wstring(kUntexturedKey);
+    key += doubleSided ? L"|double" : L"|single";
+    const auto found = context.partByTextureKey.find(key);
+    if (found != context.partByTextureKey.end()) {
+        return (*context.parts)[found->second];
+    }
+
+    FlightGearMeshPart part{};
+    part.doubleSided = doubleSided;
+    ApplyTextureToPart(part, texture);
+    context.parts->push_back(std::move(part));
+    const size_t index = context.parts->size() - 1u;
+    context.partByTextureKey.emplace(std::move(key), index);
+    return (*context.parts)[index];
+}
+
+FlightGearMeshPart& GetPartForObject(ParseContext& context, const std::string& objectName, const TextureBinding& texture, bool doubleSided) {
     const std::string scopedObjectKey = ScopedObjectKey(context, objectName);
     if (!objectName.empty() && context.animatedObjectKeys.find(scopedObjectKey) != context.animatedObjectKeys.end()) {
-        return GetPartForObjectTexture(context, scopedObjectKey, texture);
+        return GetPartForObjectTexture(context, scopedObjectKey, texture, doubleSided);
     }
     for (const std::string& alias : context.modelAliasStack) {
         if (!alias.empty() && context.animatedObjectKeys.find(alias) != context.animatedObjectKeys.end()) {
-            return GetPartForObjectTexture(context, scopedObjectKey, texture);
+            return GetPartForObjectTexture(context, scopedObjectKey, texture, doubleSided);
         }
     }
-    return GetPartForTexture(context, texture);
+    return GetPartForTexture(context, texture, doubleSided);
 }
 
-void AppendTriangle(MeshData& mesh, const std::array<Float3, 3>& positions, const std::array<Float2, 3>& uvs, const DirectX::XMFLOAT4& color) {
-    const Float3 normal = Normalize(Cross(Sub(positions[1], positions[0]), Sub(positions[2], positions[0])));
+void AppendTriangle(
+    MeshData& mesh,
+    const std::array<Float3, 3>& positions,
+    const std::array<Float3, 3>& normals,
+    const std::array<Float2, 3>& uvs,
+    const DirectX::XMFLOAT4& color) {
     const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
     for (size_t i = 0; i < 3; ++i) {
         // FlightGear/AC3D aircraft use negative X forward, Y up, Z lateral. The renderer mesh convention is X right, Y up, Z forward.
         Vertex v{};
         v.position = RemapAcVector(positions[i]);
-        v.normal = RemapAcVector(normal);
+        v.normal = RemapAcVector(normals[i]);
         v.uv = {uvs[i].x, uvs[i].y};
         v.color = color;
         mesh.vertices.push_back(v);
     }
     mesh.indices.push_back(base + 0u);
-    mesh.indices.push_back(base + 1u);
     mesh.indices.push_back(base + 2u);
+    mesh.indices.push_back(base + 1u);
+}
+
+void EmitAcTriangles(
+    ParseContext& context,
+    const std::string& objectName,
+    const TextureBinding& objectTexture,
+    const std::vector<AcTriangle>& triangles,
+    float creaseAngleDeg,
+    MeshData& fallbackMesh) {
+    if (triangles.empty()) {
+        return;
+    }
+
+    std::vector<std::vector<std::pair<size_t, size_t>>> refsByVertex;
+    for (size_t triIndex = 0; triIndex < triangles.size(); ++triIndex) {
+        const AcTriangle& tri = triangles[triIndex];
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const uint32_t vertexIndex = tri.refs[corner].index;
+            if (vertexIndex >= refsByVertex.size()) {
+                refsByVertex.resize(static_cast<size_t>(vertexIndex) + 1u);
+            }
+            refsByVertex[vertexIndex].push_back({triIndex, corner});
+        }
+    }
+
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    const float creaseCos =
+        creaseAngleDeg <= 0.0f ? 1.0f : (creaseAngleDeg >= 180.0f ? -1.0f : std::cos(creaseAngleDeg * kDegToRad));
+    std::vector<std::array<Float3, 3>> finalNormals(triangles.size());
+    for (size_t triIndex = 0; triIndex < triangles.size(); ++triIndex) {
+        const AcTriangle& tri = triangles[triIndex];
+        for (size_t corner = 0; corner < 3; ++corner) {
+            Float3 normal = tri.weightedNormal;
+            if (tri.smooth && tri.weightedNormalLength > 1e-8f) {
+                normal = {};
+                const auto& candidates = refsByVertex[tri.refs[corner].index];
+                for (const auto& [otherTriIndex, otherCorner] : candidates) {
+                    (void)otherCorner;
+                    const AcTriangle& other = triangles[otherTriIndex];
+                    if (!other.smooth || other.weightedNormalLength <= 1e-8f) {
+                        continue;
+                    }
+                    const float dot =
+                        tri.weightedNormal.x * other.weightedNormal.x +
+                        tri.weightedNormal.y * other.weightedNormal.y +
+                        tri.weightedNormal.z * other.weightedNormal.z;
+                    const float threshold = creaseCos * tri.weightedNormalLength * other.weightedNormalLength;
+                    if (dot >= threshold) {
+                        normal = Add(normal, other.weightedNormal);
+                    }
+                }
+            }
+            finalNormals[triIndex][corner] = Normalize(normal);
+        }
+    }
+
+    for (size_t triIndex = 0; triIndex < triangles.size(); ++triIndex) {
+        const AcTriangle& tri = triangles[triIndex];
+        MeshData* targetMesh = &fallbackMesh;
+        FlightGearMeshPart* targetPart = nullptr;
+        DirectX::XMFLOAT4 color = tri.color;
+        if (context.parts != nullptr) {
+            targetPart = &GetPartForObject(context, objectName, objectTexture, tri.doubleSided);
+            targetMesh = &targetPart->mesh;
+            const bool lightObject = IsFlightGearLightObjectName(objectName);
+            targetPart->transparent = targetPart->transparent || color.w < 0.995f || lightObject;
+            targetPart->emissive = targetPart->emissive || tri.emissive || lightObject;
+            targetPart->doubleSided = targetPart->doubleSided || tri.doubleSided;
+            if (targetPart->transparent) {
+                targetPart->alphaCutoff = std::max(targetPart->alphaCutoff, 0.01f);
+            }
+        } else {
+            const DirectX::XMFLOAT4 sampled = SampleTexture(objectTexture.image, tri.refs[0].uv);
+            color.x *= sampled.x;
+            color.y *= sampled.y;
+            color.z *= sampled.z;
+            color.w *= sampled.w;
+        }
+
+        AppendTriangle(
+            *targetMesh,
+            tri.positions,
+            finalNormals[triIndex],
+            {tri.refs[0].uv, tri.refs[1].uv, tri.refs[2].uv},
+            color);
+    }
 }
 
 AcMaterial ParseMaterial(const std::string& line) {
@@ -641,6 +759,7 @@ bool ParseAcObject(
     Float2 textureRepeat{1.0f, 1.0f};
     Float2 textureOffset{0.0f, 0.0f};
     std::string objectName;
+    float creaseAngleDeg = 61.0f;
 
     while (stream.good()) {
         std::string token;
@@ -681,7 +800,9 @@ bool ParseAcObject(
         } else if (token == "loc") {
             stream >> local.m[0][3] >> local.m[1][3] >> local.m[2][3];
             currentTransform = Multiply(parentTransform, local);
-        } else if (token == "crease" || token == "url") {
+        } else if (token == "crease") {
+            stream >> creaseAngleDeg;
+        } else if (token == "url") {
             std::string ignored;
             std::getline(stream, ignored);
         } else if (token == "numvert") {
@@ -697,6 +818,7 @@ bool ParseAcObject(
         } else if (token == "numsurf") {
             uint32_t surfaceCount = 0;
             stream >> surfaceCount;
+            std::vector<AcTriangle> parsedTriangles;
             for (uint32_t surface = 0; surface < surfaceCount; ++surface) {
                 std::string surfToken;
                 stream >> surfToken;
@@ -706,6 +828,13 @@ bool ParseAcObject(
                 }
                 std::string flagsText;
                 stream >> flagsText;
+                const uint32_t flags = ParseAcSurfaceFlags(flagsText);
+                constexpr uint32_t kSurfaceTypeMask = 0xfu;
+                constexpr uint32_t kSurfaceShaded = 1u << 4u;
+                constexpr uint32_t kSurfaceTwoSided = 1u << 5u;
+                const bool isPolygon = (flags & kSurfaceTypeMask) == 0u;
+                const bool isSmooth = (flags & kSurfaceShaded) != 0u;
+                const bool isDoubleSided = (flags & kSurfaceTwoSided) != 0u;
                 std::string matToken;
                 uint32_t matIndex = 0;
                 stream >> matToken >> matIndex;
@@ -721,17 +850,13 @@ bool ParseAcObject(
                     return false;
                 }
 
-                struct Ref {
-                    uint32_t index = 0;
-                    Float2 uv{};
-                };
-                std::vector<Ref> refs(refCount);
+                std::vector<AcSurfaceRef> refs(refCount);
                 for (uint32_t i = 0; i < refCount; ++i) {
                     stream >> refs[i].index >> refs[i].uv.x >> refs[i].uv.y;
                     refs[i].uv.x = textureOffset.x + refs[i].uv.x * textureRepeat.x;
                     refs[i].uv.y = textureOffset.y + refs[i].uv.y * textureRepeat.y;
                 }
-                if (refCount < 3) {
+                if (!isPolygon || refCount < 3) {
                     continue;
                 }
                 DirectX::XMFLOAT4 baseColor{1.0f, 1.0f, 1.0f, 1.0f};
@@ -740,36 +865,27 @@ bool ParseAcObject(
                     baseColor = context.materials[matIndex].color;
                     materialEmissive = context.materials[matIndex].emissive;
                 }
-                MeshData* targetMesh = &mesh;
-                FlightGearMeshPart* targetPart = nullptr;
-                if (context.parts != nullptr) {
-                    targetPart = &GetPartForObject(context, objectName, objectTexture);
-                    targetMesh = &targetPart->mesh;
-                    const bool lightObject = IsFlightGearLightObjectName(objectName);
-                    targetPart->transparent = targetPart->transparent || baseColor.w < 0.995f || lightObject;
-                    targetPart->emissive = targetPart->emissive || materialEmissive || lightObject;
-                    if (targetPart->transparent) {
-                        targetPart->alphaCutoff = std::max(targetPart->alphaCutoff, 0.01f);
-                    }
-                } else {
-                    const DirectX::XMFLOAT4 sampled = SampleTexture(objectTexture.image, refs[0].uv);
-                    baseColor.x *= sampled.x;
-                    baseColor.y *= sampled.y;
-                    baseColor.z *= sampled.z;
-                    baseColor.w *= sampled.w;
-                }
 
                 for (uint32_t i = 1; i + 1 < refCount; ++i) {
                     if (refs[0].index >= vertices.size() || refs[i].index >= vertices.size() || refs[i + 1].index >= vertices.size()) {
                         continue;
                     }
-                    AppendTriangle(
-                        *targetMesh,
-                        {vertices[refs[0].index], vertices[refs[i].index], vertices[refs[i + 1].index]},
-                        {refs[0].uv, refs[i].uv, refs[i + 1].uv},
-                        baseColor);
+                    AcTriangle tri{};
+                    tri.refs = {refs[0], refs[i], refs[i + 1]};
+                    tri.positions = {vertices[refs[0].index], vertices[refs[i].index], vertices[refs[i + 1].index]};
+                    tri.weightedNormal = Cross(Sub(tri.positions[1], tri.positions[0]), Sub(tri.positions[2], tri.positions[0]));
+                    tri.weightedNormalLength = std::sqrt(
+                        tri.weightedNormal.x * tri.weightedNormal.x +
+                        tri.weightedNormal.y * tri.weightedNormal.y +
+                        tri.weightedNormal.z * tri.weightedNormal.z);
+                    tri.color = baseColor;
+                    tri.smooth = isSmooth;
+                    tri.doubleSided = isDoubleSided;
+                    tri.emissive = materialEmissive;
+                    parsedTriangles.push_back(tri);
                 }
             }
+            EmitAcTriangles(context, objectName, objectTexture, parsedTriangles, creaseAngleDeg, mesh);
         } else if (token == "kids") {
             uint32_t childCount = 0;
             stream >> childCount;
