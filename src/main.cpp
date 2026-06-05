@@ -3188,6 +3188,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     g_cockpitViewSelected = &cockpitViewSelected;
     bool fgAudioEnabled = true;
     bool showFgAudioDebug = true;
+    float fgMasterSoundGain = 1.0f;
+    float fgEngineSoundGain = 1.0f;
+    float fgAvionicsSoundGain = 1.0f;
+    float fgCalloutSoundGain = 1.0f;
+    float fgEnvironmentSoundGain = 1.0f;
+    float fgAnnouncementSoundGain = 1.0f;
+    float fgEffectsSoundGain = 1.0f;
     std::array<char, 128> fgPropertySearchText = {'\0'};
     std::array<char, 192> fgPropertyPathText = {'\0'};
     std::array<char, 128> fgPropertyValueText = {'\0'};
@@ -3396,6 +3403,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
 
         const FlightSim& activeSim = VehicleModeIsMissile(vehicleMode) ? missileViewSim : sim;
         fgRuntime.SetEnabled(fgAudioEnabled);
+        fgRuntime.SetPropertyDouble("/sim/sound/category/master", fgMasterSoundGain);
+        fgRuntime.SetPropertyDouble("/sim/sound/category/engine", fgEngineSoundGain);
+        fgRuntime.SetPropertyDouble("/sim/sound/category/avionics", fgAvionicsSoundGain);
+        fgRuntime.SetPropertyDouble("/sim/sound/category/callout", fgCalloutSoundGain);
+        fgRuntime.SetPropertyDouble("/sim/sound/category/environment", fgEnvironmentSoundGain);
+        fgRuntime.SetPropertyDouble("/sim/sound/category/announcement", fgAnnouncementSoundGain);
+        fgRuntime.SetPropertyDouble("/sim/sound/category/effects", fgEffectsSoundGain);
         fgRuntime.UpdateFromSim(
             activeSim,
             vehicleMode == VehicleMode::FlightGear737,
@@ -4154,6 +4168,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::TextWrapped("%s", fgRuntime.Status().c_str());
             ImGui::Checkbox("Enabled", &fgAudioEnabled);
             ImGui::Separator();
+            ImGui::TextUnformatted("Category Mixer");
+            ImGui::SliderFloat("Master", &fgMasterSoundGain, 0.0f, 1.5f, "%.2f");
+            ImGui::SliderFloat("Engine", &fgEngineSoundGain, 0.0f, 1.5f, "%.2f");
+            ImGui::SliderFloat("Avionics", &fgAvionicsSoundGain, 0.0f, 1.5f, "%.2f");
+            ImGui::SliderFloat("Callouts", &fgCalloutSoundGain, 0.0f, 1.5f, "%.2f");
+            ImGui::SliderFloat("Environment", &fgEnvironmentSoundGain, 0.0f, 1.5f, "%.2f");
+            ImGui::SliderFloat("Announcements", &fgAnnouncementSoundGain, 0.0f, 1.5f, "%.2f");
+            ImGui::SliderFloat("Effects", &fgEffectsSoundGain, 0.0f, 1.5f, "%.2f");
+            ImGui::Separator();
             ImGui::TextUnformatted("Sounds");
             const auto sounds = fgRuntime.SoundDebugSnapshot();
             int playingCount = 0;
@@ -4165,14 +4188,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("%d / %d playing", playingCount, static_cast<int>(sounds.size()));
             ImGui::BeginChild("fg_sound_list", ImVec2(0.0f, 220.0f), true);
             for (const auto& sound : sounds) {
-                ImGui::Text("%c %c vol %.2f pitch %.2f  %s",
+                ImGui::Text("%c %c %c %-12s %-8s vol %.2f pitch %.2f  %s",
+                    sound.loaded ? ' ' : '!',
                     sound.playing ? '>' : ' ',
                     sound.condition ? '*' : ' ',
+                    sound.category.c_str(),
+                    sound.type.c_str(),
                     sound.volume,
                     sound.pitch,
                     sound.name.c_str());
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("%s", sound.path.c_str());
+                    if (sound.unsupported.empty()) {
+                        ImGui::SetTooltip("%s", sound.path.c_str());
+                    } else {
+                        ImGui::SetTooltip("%s\n%s", sound.path.c_str(), sound.unsupported.c_str());
+                    }
                 }
             }
             ImGui::EndChild();

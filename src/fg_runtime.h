@@ -13,6 +13,10 @@ namespace flight {
 struct FgSoundDebugInfo {
     std::string name;
     std::string path;
+    std::string category;
+    std::string type;
+    std::string unsupported;
+    bool loaded = false;
     bool playing = false;
     bool condition = false;
     float volume = 0.0f;
@@ -46,6 +50,7 @@ public:
     [[nodiscard]] std::vector<FgSoundDebugInfo> SoundDebugSnapshot() const;
     [[nodiscard]] std::vector<FgPropertyDebugInfo> FindProperties(const std::string& query, size_t limit) const;
     bool SetPropertyFromUi(const std::string& path, const std::string& valueText);
+    bool SetPropertyDouble(const std::string& path, double value);
 
 private:
     struct Impl;

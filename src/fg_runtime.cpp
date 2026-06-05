@@ -1,12 +1,15 @@
 #include "fg_runtime.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <map>
 #include <optional>
+#include <random>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -670,6 +673,119 @@ struct SystemFilter {
     }
 };
 
+struct SoundAxisValue {
+    double constant = 0.0;
+    std::string property;
+
+    [[nodiscard]] double Eval(const FgPropertyTree& tree) const {
+        return property.empty() ? constant : tree.GetDouble(property, constant);
+    }
+};
+
+SoundAxisValue ParseSoundAxisValue(const tinyxml2::XMLElement* parent, const char* shortName, const char* meterName) {
+    SoundAxisValue value{};
+    const tinyxml2::XMLElement* child = parent ? parent->FirstChildElement(shortName) : nullptr;
+    if (!child && meterName) {
+        child = parent ? parent->FirstChildElement(meterName) : nullptr;
+    }
+    if (!child) {
+        return value;
+    }
+    if (const tinyxml2::XMLElement* property = child->FirstChildElement("property")) {
+        value.property = Trim(property->GetText() ? property->GetText() : "");
+    }
+    const char* text = child->GetText();
+    if (text) {
+        const std::string trimmed = Trim(text);
+        if (!trimmed.empty()) {
+            char* end = nullptr;
+            const double parsed = std::strtod(trimmed.c_str(), &end);
+            if (end != trimmed.c_str()) {
+                value.constant = parsed;
+            }
+        }
+    }
+    return value;
+}
+
+struct SoundPosition {
+    SoundAxisValue x;
+    SoundAxisValue y;
+    SoundAxisValue z;
+
+    [[nodiscard]] bool Dynamic() const {
+        return !x.property.empty() || !y.property.empty() || !z.property.empty();
+    }
+
+    void Apply(ALuint source, const FgPropertyTree& tree) const {
+        alSource3f(
+            source,
+            AL_POSITION,
+            static_cast<ALfloat>(x.Eval(tree)),
+            static_cast<ALfloat>(y.Eval(tree)),
+            static_cast<ALfloat>(z.Eval(tree)));
+    }
+};
+
+struct SoundOrientation {
+    SoundAxisValue x;
+    SoundAxisValue y;
+    SoundAxisValue z;
+    float innerAngle = 360.0f;
+    float outerAngle = 360.0f;
+    float outerGain = 1.0f;
+    bool enabled = false;
+
+    void Apply(ALuint source, const FgPropertyTree& tree) const {
+        if (!enabled) {
+            return;
+        }
+        alSource3f(
+            source,
+            AL_DIRECTION,
+            static_cast<ALfloat>(x.Eval(tree)),
+            static_cast<ALfloat>(y.Eval(tree)),
+            static_cast<ALfloat>(z.Eval(tree)));
+        alSourcef(source, AL_CONE_INNER_ANGLE, innerAngle);
+        alSourcef(source, AL_CONE_OUTER_ANGLE, outerAngle);
+        alSourcef(source, AL_CONE_OUTER_GAIN, outerGain);
+    }
+};
+
+SoundPosition ParseSoundPosition(const tinyxml2::XMLElement* position) {
+    SoundPosition out{};
+    out.x = ParseSoundAxisValue(position, "x", "x-m");
+    out.y = ParseSoundAxisValue(position, "y", "y-m");
+    out.z = ParseSoundAxisValue(position, "z", "z-m");
+    return out;
+}
+
+SoundOrientation ParseSoundOrientation(const tinyxml2::XMLElement* orientation) {
+    SoundOrientation out{};
+    if (!orientation) {
+        return out;
+    }
+    out.enabled = true;
+    out.x = ParseSoundAxisValue(orientation, "x", "x-m");
+    out.y = ParseSoundAxisValue(orientation, "y", "y-m");
+    out.z = ParseSoundAxisValue(orientation, "z", "z-m");
+    out.innerAngle = static_cast<float>(ElementDouble(orientation, "inner-angle", ElementDouble(orientation, "inner-angle-deg", 360.0)));
+    out.outerAngle = static_cast<float>(ElementDouble(orientation, "outer-angle", ElementDouble(orientation, "outer-angle-deg", out.innerAngle)));
+    out.outerGain = static_cast<float>(std::clamp(ElementDouble(orientation, "outer-gain", 1.0), 0.0, 1.0));
+    return out;
+}
+
+std::string JoinStrings(const std::vector<std::string>& values, const char* separator) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            oss << separator;
+        }
+        oss << values[i];
+    }
+    return oss.str();
+}
+
 class AudioEngine {
 public:
     ~AudioEngine() { Shutdown(); }
@@ -777,11 +893,16 @@ struct SoundEvent {
 
     std::string name;
     std::string pathText;
+    std::string category;
+    std::string type;
     Mode mode = Mode::Once;
     std::string triggerProperty;
     ConditionPtr condition;
     std::vector<SoundParam> volumes;
     std::vector<SoundParam> pitches;
+    SoundPosition position;
+    SoundOrientation orientation;
+    std::vector<std::string> unsupportedNodes;
     ALuint source = 0;
     bool active = false;
     bool loaded = false;
@@ -860,10 +981,35 @@ struct SoundEvent {
         return out;
     }
 
+    double CategoryGain(const FgPropertyTree& tree) const {
+        const double master = tree.GetDouble("/sim/sound/category/master", 1.0);
+        if (type == "avionics") {
+            return master * tree.GetDouble("/sim/sound/category/avionics", 1.0);
+        }
+        if (category == "engine" || category == "reverse" || category == "engineReverse") {
+            return master * tree.GetDouble("/sim/sound/category/engine", 1.0);
+        }
+        if (category == "announcement" || category == "boarding" || category == "safety") {
+            return master * tree.GetDouble("/sim/sound/category/announcement", 1.0);
+        }
+        if (category == "rain" || category == "wind" || category == "rumble") {
+            return master * tree.GetDouble("/sim/sound/category/environment", 1.0);
+        }
+        if (category == "callout" || category == "gpws" || category == "wow" || category == "warning" || category == "altAlert") {
+            return master * tree.GetDouble("/sim/sound/category/callout", 1.0);
+        }
+        return master * tree.GetDouble("/sim/sound/category/effects", 1.0);
+    }
+
     void Update(FgPropertyTree& tree, double dt) {
         if (!loaded || source == 0) {
             return;
         }
+        if (position.Dynamic()) {
+            position.Apply(source, tree);
+        }
+        orientation.Apply(source, tree);
+
         bool nowCondition = false;
         if (condition) {
             nowCondition = condition->Test(tree);
@@ -916,7 +1062,8 @@ struct SoundEvent {
             alSourcePlay(source);
         }
         if (IsPlaying()) {
-            lastVolume = static_cast<float>(ComputeParams(volumes, tree, false));
+            lastVolume = static_cast<float>(ComputeParams(volumes, tree, false) * CategoryGain(tree));
+            lastVolume = std::clamp(lastVolume, 0.0f, 1.0f);
             lastPitch = static_cast<float>(ComputeParams(pitches, tree, true));
             alSourcef(source, AL_GAIN, lastVolume);
             alSourcef(source, AL_PITCH, lastPitch);
@@ -924,7 +1071,7 @@ struct SoundEvent {
     }
 };
 
-SoundParam ParseSoundParam(const tinyxml2::XMLElement* element, bool pitch) {
+SoundParam ParseSoundParam(const tinyxml2::XMLElement* element, bool pitch, std::mt19937& rng) {
     SoundParam param{};
     param.offset = pitch ? 1.0 : 0.0;
     param.min = 0.0;
@@ -946,6 +1093,13 @@ SoundParam ParseSoundParam(const tinyxml2::XMLElement* element, bool pitch) {
         param.subtract = true;
     }
     param.offset = ElementDouble(element, "offset", param.offset);
+    if (pitch) {
+        const double randomRange = ElementDouble(element, "random", 0.0);
+        if (randomRange > 0.0) {
+            std::uniform_real_distribution<double> dist(0.0, randomRange);
+            param.offset += dist(rng);
+        }
+    }
     param.min = ElementDouble(element, "min", 0.0);
     param.max = ElementDouble(element, "max", 0.0);
     const std::string type = ElementText(element, "type");
@@ -971,7 +1125,10 @@ struct FgRuntime::Impl {
     std::vector<SystemFilter> filters;
     std::vector<SoundEvent> sounds;
     AudioEngine audio;
+    std::mt19937 rng{0x737800u};
     std::string loadStatus;
+    int unsupportedSoundNodeCount = 0;
+    int missingSampleCount = 0;
     double elapsed = 0.0;
 
     bool Initialize(const std::filesystem::path& root, std::string& error) {
@@ -998,6 +1155,12 @@ struct FgRuntime::Impl {
 
         loadStatus = "FlightGear audio: " + std::to_string(sounds.size()) + " sounds, " +
             std::to_string(filters.size()) + " filters";
+        if (unsupportedSoundNodeCount > 0) {
+            loadStatus += ", " + std::to_string(unsupportedSoundNodeCount) + " unsupported sound XML nodes";
+        }
+        if (missingSampleCount > 0) {
+            loadStatus += ", " + std::to_string(missingSampleCount) + " missing samples";
+        }
         return true;
     }
 
@@ -1007,6 +1170,13 @@ struct FgRuntime::Impl {
         tree.SetDouble("/sim/sound/volume", 1.0);
         tree.SetDouble("/sim/sound/effects/volume", 1.0);
         tree.SetDouble("/sim/sound/Ovolume", 0.45);
+        tree.SetDouble("/sim/sound/category/master", 1.0);
+        tree.SetDouble("/sim/sound/category/engine", 1.0);
+        tree.SetDouble("/sim/sound/category/avionics", 1.0);
+        tree.SetDouble("/sim/sound/category/callout", 1.0);
+        tree.SetDouble("/sim/sound/category/environment", 1.0);
+        tree.SetDouble("/sim/sound/category/announcement", 1.0);
+        tree.SetDouble("/sim/sound/category/effects", 1.0);
         tree.SetBool("/sim/current-view/internal", false);
         tree.SetDouble("/sim/current-view/z-offset-m", 12.0);
         tree.SetDouble("/systems/electrical/outputs/efis", 1.0);
@@ -1053,10 +1223,38 @@ struct FgRuntime::Impl {
             error = "FlightGear sound XML has no <fx>: " + path.string();
             return false;
         }
+        unsupportedSoundNodeCount = 0;
+        missingSampleCount = 0;
+        const std::set<std::string> supportedChildNames{
+            "name",
+            "mode",
+            "path",
+            "condition",
+            "property",
+            "delay-sec",
+            "volume",
+            "pitch",
+            "position",
+            "orientation",
+            "reference-dist",
+            "max-dist",
+            "type",
+        };
         for (const tinyxml2::XMLElement* node = fx->FirstChildElement(); node; node = node->NextSiblingElement()) {
             SoundEvent event{};
+            event.category = node->Name();
             event.name = ElementText(node, "name", node->Name());
             event.pathText = ElementText(node, "path");
+            event.type = ElementText(node, "type", "fx");
+            std::set<std::string> unsupportedNames;
+            for (const tinyxml2::XMLElement* child = node->FirstChildElement(); child; child = child->NextSiblingElement()) {
+                const std::string childName = child->Name();
+                if (supportedChildNames.find(childName) == supportedChildNames.end()) {
+                    unsupportedNames.insert(childName);
+                }
+            }
+            event.unsupportedNodes.assign(unsupportedNames.begin(), unsupportedNames.end());
+            unsupportedSoundNodeCount += static_cast<int>(event.unsupportedNodes.size());
             const std::string mode = ElementText(node, "mode", "once");
             if (mode == "looped") {
                 event.mode = SoundEvent::Mode::Looped;
@@ -1069,18 +1267,16 @@ struct FgRuntime::Impl {
             }
             event.delay = ElementDouble(node, "delay-sec", 0.0);
             for (const tinyxml2::XMLElement* volume = node->FirstChildElement("volume"); volume; volume = volume->NextSiblingElement("volume")) {
-                event.volumes.push_back(ParseSoundParam(volume, false));
+                event.volumes.push_back(ParseSoundParam(volume, false, rng));
             }
             for (const tinyxml2::XMLElement* pitch = node->FirstChildElement("pitch"); pitch; pitch = pitch->NextSiblingElement("pitch")) {
-                event.pitches.push_back(ParseSoundParam(pitch, true));
+                event.pitches.push_back(ParseSoundParam(pitch, true, rng));
             }
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
             if (const tinyxml2::XMLElement* pos = node->FirstChildElement("position")) {
-                x = static_cast<float>(ElementDouble(pos, "x", ElementDouble(pos, "x-m", 0.0)));
-                y = static_cast<float>(ElementDouble(pos, "y", ElementDouble(pos, "y-m", 0.0)));
-                z = static_cast<float>(ElementDouble(pos, "z", ElementDouble(pos, "z-m", 0.0)));
+                event.position = ParseSoundPosition(pos);
+            }
+            if (const tinyxml2::XMLElement* orientation = node->FirstChildElement("orientation")) {
+                event.orientation = ParseSoundOrientation(orientation);
             }
 
             const std::filesystem::path soundPath = loader.ResolvePath(event.pathText, path.parent_path());
@@ -1090,13 +1286,23 @@ struct FgRuntime::Impl {
                 const auto looped = event.mode != SoundEvent::Mode::Once;
                 const float ref = static_cast<float>(ElementDouble(node, "reference-dist", 60.0));
                 const float max = static_cast<float>(ElementDouble(node, "max-dist", 6000.0));
-                event.source = audio.CreateSource(*buffer, looped, ref, max, x, y, z);
+                event.source = audio.CreateSource(
+                    *buffer,
+                    looped,
+                    ref,
+                    max,
+                    static_cast<float>(event.position.x.Eval(tree)),
+                    static_cast<float>(event.position.y.Eval(tree)),
+                    static_cast<float>(event.position.z.Eval(tree)));
+                event.orientation.Apply(event.source, tree);
                 event.loaded = true;
                 if (!event.triggerProperty.empty()) {
                     event.previousPropertyValue = tree.GetDouble(event.triggerProperty);
                 }
             } else {
                 event.loaded = false;
+                event.unsupportedNodes.push_back("missing sample: " + event.pathText);
+                ++missingSampleCount;
             }
             sounds.push_back(std::move(event));
         }
@@ -1201,6 +1407,10 @@ std::vector<FgSoundDebugInfo> FgRuntime::SoundDebugSnapshot() const {
         out.push_back({
             sound.name,
             sound.pathText,
+            sound.category,
+            sound.type,
+            JoinStrings(sound.unsupportedNodes, ", "),
+            sound.loaded,
             sound.IsPlaying(),
             sound.lastCondition,
             sound.lastVolume,
@@ -1219,6 +1429,14 @@ bool FgRuntime::SetPropertyFromUi(const std::string& path, const std::string& va
         return false;
     }
     m_impl->tree.SetFromText(path, valueText, "");
+    return true;
+}
+
+bool FgRuntime::SetPropertyDouble(const std::string& path, double value) {
+    if (!m_impl) {
+        return false;
+    }
+    m_impl->tree.SetDouble(path, value);
     return true;
 }
 
