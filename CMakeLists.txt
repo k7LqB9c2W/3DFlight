@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(imgui CONFIG REQUIRED)
+find_package(tinyxml2 CONFIG REQUIRED)
+find_package(OpenAL CONFIG REQUIRED)
+find_path(DRLIBS_INCLUDE_DIRS "dr_wav.h" REQUIRED)
 find_package(unofficial-gdal CONFIG QUIET)
 find_package(GDAL CONFIG QUIET)
 
@@ -22,6 +25,8 @@ add_executable(3DFlight WIN32
     src/gltf_loader.h
     src/flightgear_ac_loader.cpp
     src/flightgear_ac_loader.h
+    src/fg_runtime.cpp
+    src/fg_runtime.h
     src/hud_map_tile_streamer.cpp
     src/hud_map_tile_streamer.h
     src/earth.cpp
@@ -46,6 +51,7 @@ set_source_files_properties(third_party/cgltf/cgltf.c PROPERTIES LANGUAGE C)
 target_include_directories(3DFlight PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cgltf
+    ${DRLIBS_INCLUDE_DIRS}
 )
 
 target_compile_definitions(3DFlight PRIVATE
@@ -61,6 +67,8 @@ endif()
 
 target_link_libraries(3DFlight PRIVATE
     imgui::imgui
+    tinyxml2::tinyxml2
+    OpenAL::OpenAL
     d3d12
     dxgi
     dxguid

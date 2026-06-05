@@ -10,6 +10,9 @@
         "win32-binding"
       ]
     },
-    "gdal"
+    "gdal",
+    "tinyxml2",
+    "openal-soft",
+    "drlibs"
   ]
 }

@@ -28,6 +28,7 @@
 #include <windowsx.h>
 
 #include "d3d12_renderer.h"
+#include "fg_runtime.h"
 #include "flightgear_ac_loader.h"
 #include "gltf_loader.h"
 #include "hud_map_tile_streamer.h"
@@ -2641,6 +2642,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         return 1;
     }
 
+    flight::FgRuntime fgRuntime;
+    std::string fgAudioError;
+    const std::filesystem::path flightGearAircraftRoot =
+        ResolveExistingPathFromWorkingTree(std::filesystem::path("737-800YV-master") / "737-800YV-master");
+    if (!fgRuntime.Initialize(flightGearAircraftRoot, fgAudioError)) {
+        OutputDebugStringA((std::string("FlightGear audio init failed: ") + fgAudioError + "\n").c_str());
+    }
+
     std::array<VehicleRenderAsset, kVehicleModeCount> vehicleAssets{};
     const auto transformVertexAxis = [](const DirectX::XMFLOAT3& value, const VehicleAxisTransform& axisTransform, float scale) {
         return DirectX::XMFLOAT3{
@@ -3177,6 +3186,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     bool previousBackspace = false;
     bool cockpitViewSelected = VehicleModeIsCockpit(vehicleMode);
     g_cockpitViewSelected = &cockpitViewSelected;
+    bool fgAudioEnabled = true;
+    bool showFgAudioDebug = true;
+    std::array<char, 128> fgPropertySearchText = {'\0'};
+    std::array<char, 192> fgPropertyPathText = {'\0'};
+    std::array<char, 128> fgPropertyValueText = {'\0'};
     auto applyVehicleMesh = [&](VehicleMode mode) {
         cockpitViewSelected = VehicleModeIsCockpit(mode);
         if (!cockpitViewSelected) {
@@ -3381,6 +3395,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
 
         const FlightSim& activeSim = VehicleModeIsMissile(vehicleMode) ? missileViewSim : sim;
+        fgRuntime.SetEnabled(fgAudioEnabled);
+        fgRuntime.UpdateFromSim(
+            activeSim,
+            vehicleMode == VehicleMode::FlightGear737,
+            VehicleModeIsCockpit(vehicleMode),
+            dt * static_cast<double>(simTimeScale));
         if (!cockpitViewRuntime.freelookActive) {
             const double halflife = std::max(static_cast<double>(cockpitViewConfig.recenterHalflifeSec), 0.01);
             const float decay = static_cast<float>(std::exp2(-dt / halflife));
@@ -3955,6 +3975,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (!vehicleModeStatus.empty()) {
             ImGui::TextWrapped("%s", vehicleModeStatus.c_str());
         }
+        ImGui::TextWrapped("%s", fgRuntime.Status().c_str());
+        ImGui::Checkbox("FlightGear audio", &fgAudioEnabled);
+        ImGui::SameLine();
+        ImGui::Checkbox("FG audio debug", &showFgAudioDebug);
 
         if (VehicleModeIsMissile(vehicleMode)) {
             ImGui::Separator();
@@ -4124,6 +4148,50 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         }
         ImGui::Text("Landmask: %s", renderer.HasLandmask() ? "loaded" : "fallback");
         ImGui::End();
+
+        if (showFgAudioDebug) {
+            ImGui::Begin("FlightGear Audio");
+            ImGui::TextWrapped("%s", fgRuntime.Status().c_str());
+            ImGui::Checkbox("Enabled", &fgAudioEnabled);
+            ImGui::Separator();
+            ImGui::TextUnformatted("Sounds");
+            const auto sounds = fgRuntime.SoundDebugSnapshot();
+            int playingCount = 0;
+            for (const auto& sound : sounds) {
+                if (sound.playing) {
+                    ++playingCount;
+                }
+            }
+            ImGui::Text("%d / %d playing", playingCount, static_cast<int>(sounds.size()));
+            ImGui::BeginChild("fg_sound_list", ImVec2(0.0f, 220.0f), true);
+            for (const auto& sound : sounds) {
+                ImGui::Text("%c %c vol %.2f pitch %.2f  %s",
+                    sound.playing ? '>' : ' ',
+                    sound.condition ? '*' : ' ',
+                    sound.volume,
+                    sound.pitch,
+                    sound.name.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", sound.path.c_str());
+                }
+            }
+            ImGui::EndChild();
+            ImGui::Separator();
+            ImGui::TextUnformatted("Properties");
+            ImGui::InputText("Search", fgPropertySearchText.data(), fgPropertySearchText.size());
+            const auto props = fgRuntime.FindProperties(fgPropertySearchText.data(), 24);
+            ImGui::BeginChild("fg_property_list", ImVec2(0.0f, 180.0f), true);
+            for (const auto& prop : props) {
+                ImGui::TextWrapped("%s = %s", prop.path.c_str(), prop.value.c_str());
+            }
+            ImGui::EndChild();
+            ImGui::InputText("Path", fgPropertyPathText.data(), fgPropertyPathText.size());
+            ImGui::InputText("Value", fgPropertyValueText.data(), fgPropertyValueText.size());
+            if (ImGui::Button("Set Property")) {
+                fgRuntime.SetPropertyFromUi(fgPropertyPathText.data(), fgPropertyValueText.data());
+            }
+            ImGui::End();
+        }
 
         ImGui::Begin("Autopilot Route");
         const bool airplaneRouteModeAvailable = !VehicleModeIsMissile(vehicleMode);
