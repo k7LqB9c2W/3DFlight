@@ -60,8 +60,9 @@ struct ParseContext {
     std::unordered_map<std::wstring, TextureImage> textureCache;
     std::unordered_map<std::wstring, size_t> partByTextureKey;
     std::unordered_map<std::string, size_t> partByObjectTextureKey;
-    std::unordered_set<std::string> animatedObjectNames;
+    std::unordered_set<std::string> animatedObjectKeys;
     std::vector<std::string> modelAliasStack;
+    std::vector<std::string> modelScopeStack;
     std::vector<FlightGearMeshPart>* parts = nullptr;
     std::vector<FlightGearAnimation>* animations = nullptr;
     std::filesystem::path aircraftRoot;
@@ -251,6 +252,14 @@ std::vector<std::string> ExtractTagTexts(const std::string& xml, const std::stri
 
 DirectX::XMFLOAT3 RemapFgVector(const Float3& v) {
     return {v.z, v.y, -v.x};
+}
+
+std::string CurrentModelScopeKey(const ParseContext& context) {
+    return context.modelScopeStack.empty() ? std::string("__flightgear_root__") : context.modelScopeStack.back();
+}
+
+std::string ScopedObjectKey(const ParseContext& context, const std::string& objectName) {
+    return CurrentModelScopeKey(context) + "::" + objectName;
 }
 
 Float3 ReadFgVec3(const std::string& xml, const std::string& tag, const Float3& fallback = {}) {
@@ -506,8 +515,8 @@ FlightGearMeshPart& GetPartForTexture(ParseContext& context, const TextureBindin
     return (*context.parts)[index];
 }
 
-FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::string& objectName, const TextureBinding& texture) {
-    std::string key = objectName;
+FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::string& objectKey, const TextureBinding& texture) {
+    std::string key = objectKey;
     for (const std::string& alias : context.modelAliasStack) {
         key += "|";
         key += alias;
@@ -520,7 +529,7 @@ FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::st
     }
 
     FlightGearMeshPart part{};
-    part.objectName = objectName;
+    part.objectName = objectKey;
     part.objectAliases = context.modelAliasStack;
     ApplyTextureToPart(part, texture);
     context.parts->push_back(std::move(part));
@@ -530,12 +539,13 @@ FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::st
 }
 
 FlightGearMeshPart& GetPartForObject(ParseContext& context, const std::string& objectName, const TextureBinding& texture) {
-    if (!objectName.empty() && context.animatedObjectNames.find(objectName) != context.animatedObjectNames.end()) {
-        return GetPartForObjectTexture(context, objectName, texture);
+    const std::string scopedObjectKey = ScopedObjectKey(context, objectName);
+    if (!objectName.empty() && context.animatedObjectKeys.find(scopedObjectKey) != context.animatedObjectKeys.end()) {
+        return GetPartForObjectTexture(context, scopedObjectKey, texture);
     }
     for (const std::string& alias : context.modelAliasStack) {
-        if (!alias.empty() && context.animatedObjectNames.find(alias) != context.animatedObjectNames.end()) {
-            return GetPartForObjectTexture(context, objectName, texture);
+        if (!alias.empty() && context.animatedObjectKeys.find(alias) != context.animatedObjectKeys.end()) {
+            return GetPartForObjectTexture(context, scopedObjectKey, texture);
         }
     }
     return GetPartForTexture(context, texture);
@@ -867,6 +877,13 @@ void ParseAnimationsForXml(const std::filesystem::path& xmlPath, const std::stri
     if (context.animations == nullptr || !ShouldAnimateXmlPath(xmlPath)) {
         return;
     }
+    std::unordered_set<std::string> localModelAliases;
+    for (const std::string& modelBlock : ExtractBlocks(xml, "model")) {
+        const std::string name = GetFirstTagText(modelBlock, "name");
+        if (!name.empty()) {
+            localModelAliases.insert(name);
+        }
+    }
     for (const std::string& block : ExtractBlocks(xml, "animation")) {
         const auto type = ParseAnimationType(GetFirstTagText(block, "type"));
         if (!type) {
@@ -874,7 +891,19 @@ void ParseAnimationsForXml(const std::filesystem::path& xmlPath, const std::stri
         }
         FlightGearAnimation animation{};
         animation.type = *type;
-        animation.objectNames = ExtractTagTexts(block, "object-name");
+        const std::vector<std::string> objectNames = ExtractTagTexts(block, "object-name");
+        if (objectNames.empty()) {
+            continue;
+        }
+        animation.objectNames.reserve(objectNames.size());
+        std::unordered_set<std::string> seenTargets;
+        for (const std::string& objectName : objectNames) {
+            const bool targetsChildModelAlias = localModelAliases.find(objectName) != localModelAliases.end();
+            const std::string targetKey = targetsChildModelAlias ? objectName : ScopedObjectKey(context, objectName);
+            if (seenTargets.insert(targetKey).second) {
+                animation.objectNames.push_back(targetKey);
+            }
+        }
         if (animation.objectNames.empty()) {
             continue;
         }
@@ -894,7 +923,7 @@ void ParseAnimationsForXml(const std::filesystem::path& xmlPath, const std::stri
         ParseInterpolation(block, animation.interpolation);
         ParseAnimationCondition(block, animation);
         for (const std::string& objectName : animation.objectNames) {
-            context.animatedObjectNames.insert(objectName);
+            context.animatedObjectKeys.insert(objectName);
         }
         context.animations->push_back(std::move(animation));
     }
@@ -945,9 +974,13 @@ bool LoadModelXmlRecursive(
     if (!context.loadedXml.insert(key).second) {
         return true;
     }
+    const std::string scopeKey =
+        (ec ? xmlPath.string() : canonical.string()) + "#" + std::to_string(std::hash<std::wstring>{}(key));
+    context.modelScopeStack.push_back(scopeKey);
 
     std::ifstream file(xmlPath);
     if (!file) {
+        context.modelScopeStack.pop_back();
         error = "Model XML not found: " + xmlPath.string();
         return false;
     }
@@ -961,6 +994,7 @@ bool LoadModelXmlRecursive(
         const std::filesystem::path resolved = ResolveFlightGearPath(xmlPath, context.aircraftRoot, ownPath);
         if (Lower(resolved.extension().string()) == ".ac") {
             if (!LoadAcFile(resolved, transform, context, mesh, error)) {
+                context.modelScopeStack.pop_back();
                 return false;
             }
         }
@@ -983,6 +1017,7 @@ bool LoadModelXmlRecursive(
                 if (hasModelAlias) {
                     context.modelAliasStack.pop_back();
                 }
+                context.modelScopeStack.pop_back();
                 return false;
             }
         } else if (ext == ".ac") {
@@ -990,6 +1025,7 @@ bool LoadModelXmlRecursive(
                 if (hasModelAlias) {
                     context.modelAliasStack.pop_back();
                 }
+                context.modelScopeStack.pop_back();
                 return false;
             }
         }
@@ -998,6 +1034,7 @@ bool LoadModelXmlRecursive(
         }
     }
 
+    context.modelScopeStack.pop_back();
     return true;
 }
 

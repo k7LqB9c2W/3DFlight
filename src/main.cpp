@@ -1699,6 +1699,10 @@ void UpdateFlightGearVisualAnimations(
             DirectX::XMStoreFloat3(&axis, axisVec);
             transform = DirectX::XMMatrixTranslation(axis.x * distance, axis.y * distance, axis.z * distance);
         } else if (animation.type == flight::FlightGearAnimation::Type::Spin) {
+            const std::string property = NormalizeFlightGearPropertyPath(animation.property);
+            if (property.find("gear/gear[") != std::string::npos && property.find("/rollspeed-ms") != std::string::npos) {
+                continue;
+            }
             const float rateRpm = EvaluateFlightGearAnimationValue(animation, properties);
             float& spinAngle = asset.flightGearSpinAnglesDeg[animationIndex];
             spinAngle = std::fmod(spinAngle + rateRpm * 6.0f * static_cast<float>(dtSeconds), 360.0f);
@@ -2971,6 +2975,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             loaded = flight::LoadFlightGearAircraftParts(spec.path, flightGearParts, flightGearAnimations, fgStats, fgOptions, loadError);
             if (loaded) {
                 asset.flightGearAnimations = std::move(flightGearAnimations);
+                for (auto& animation : asset.flightGearAnimations) {
+                    if (NormalizeFlightGearPropertyPath(animation.property) == "sim/multiplay/generic/float[9]") {
+                        const bool targetsRightAileronTab = std::any_of(
+                            animation.objectNames.begin(),
+                            animation.objectNames.end(),
+                            [](const std::string& objectName) {
+                                return LowerAscii(objectName).find("ailerontabrh") != std::string::npos;
+                            });
+                        if (targetsRightAileronTab) {
+                            animation.property = "__controls/aileron-tab-rh";
+                        }
+                    }
+                }
                 asset.flightGearSpinAnglesDeg.assign(asset.flightGearAnimations.size(), 0.0f);
                 asset.meshParts.reserve(flightGearParts.size());
                 for (auto& part : flightGearParts) {
@@ -3694,6 +3711,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[9]", pitchControl);
             SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[10]", pitchControl);
             SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[11]", yawControl);
+            SetFlightGearPropertyValue(fgVisualProperties, "__controls/aileron-tab-rh", rollControl);
             SetFlightGearPropertyValue(fgVisualProperties, "engines/engine[0]/n1", n1Percent);
             SetFlightGearPropertyValue(fgVisualProperties, "engines/engine[1]/n1", n1Percent);
             SetFlightGearPropertyValue(fgVisualProperties, "engines/engine/n1", n1Percent);
