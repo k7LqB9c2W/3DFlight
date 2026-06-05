@@ -19,6 +19,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <imgui.h>
@@ -1386,6 +1387,7 @@ using VehicleAxisTransform = std::array<std::array<float, 3>, 3>;
 struct VehicleRenderAsset {
     MeshData mesh;
     GlbMaterialTexture texture;
+    std::vector<D3D12Renderer::PlaneMeshPart> meshParts;
     std::string modelStatus;
     std::string textureStatus;
     float minZoomMeters = 45.0f;
@@ -2780,7 +2782,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         bool loaded = false;
         if (spec.flightGearAircraft) {
             flight::FlightGearLoadOptions fgOptions{};
-            loaded = flight::LoadFlightGearAircraftMesh(spec.path, asset.mesh, asset.texture, fgStats, fgOptions, loadError);
+            std::vector<flight::FlightGearMeshPart> flightGearParts;
+            loaded = flight::LoadFlightGearAircraftParts(spec.path, flightGearParts, fgStats, fgOptions, loadError);
+            if (loaded) {
+                asset.meshParts.reserve(flightGearParts.size());
+                for (auto& part : flightGearParts) {
+                    if (!part.mesh.IsValid()) {
+                        continue;
+                    }
+                    for (auto& v : part.mesh.vertices) {
+                        v.position = transformVertexAxis(v.position, spec.axisTransform, spec.scale);
+                        v.normal = transformVertexAxis(v.normal, spec.axisTransform, 1.0f);
+                    }
+
+                    D3D12Renderer::PlaneMeshPart renderPart{};
+                    renderPart.mesh = std::move(part.mesh);
+                    renderPart.rgbaPixels = std::move(part.texture.rgbaPixels);
+                    renderPart.textureWidth = part.texture.width;
+                    renderPart.textureHeight = part.texture.height;
+                    asset.meshParts.push_back(std::move(renderPart));
+                }
+            }
         } else {
             loaded = flight::LoadGlbMesh(spec.path, asset.mesh, asset.texture, spec.loadOptions, loadError);
         }
@@ -2791,7 +2813,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             asset.texture = {};
         }
 
-        if (spec.missileAsset) {
+        if (spec.flightGearAircraft && loaded) {
+            // FlightGear AC3D parts are transformed as they are converted above.
+        } else if (spec.missileAsset) {
             // Missile GLB already points the correct way for the chase camera; keep orientation and only scale it down.
             for (auto& v : asset.mesh.vertices) {
                 v.position.x *= spec.scale;
@@ -2813,7 +2837,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             asset.modelStatus = std::string(VehicleModeDisplayName(spec.mode)) + " model loaded: " + spec.path.string();
             if (spec.flightGearAircraft) {
                 asset.textureStatus =
-                    "Baked FlightGear textures: " + std::to_string(fgStats.texturesLoaded) + " loaded, " +
+                    "FlightGear multi-texture: " + std::to_string(fgStats.texturesLoaded) + " textures, " +
+                    std::to_string(asset.meshParts.size()) + " draw parts, " +
                     std::to_string(fgStats.texturesMissing) + " missing, " + std::to_string(fgStats.acFilesLoaded) +
                     " AC files, " + std::to_string(fgStats.xmlFilesLoaded) + " XML files";
             } else if (asset.texture.IsValid()) {
@@ -3171,21 +3196,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             applyVehicleZoomRange(mode);
             return;
         }
-        std::string meshUploadError;
-        const bool ok = renderer.SetPlaneMesh(asset.mesh, meshUploadError);
-        if (!ok) {
-            vehicleModeStatus = "Vehicle mesh switch failed: " + meshUploadError;
-            return;
-        }
-        std::string textureError;
-        const bool textureOk = renderer.SetPlaneTexture(
-            asset.texture.IsValid() ? asset.texture.rgbaPixels.data() : nullptr,
-            asset.texture.width,
-            asset.texture.height,
-            textureError);
-        if (!textureOk) {
-            vehicleModeStatus = "Vehicle texture switch failed: " + textureError;
-            return;
+        if (!asset.meshParts.empty()) {
+            std::string meshUploadError;
+            const bool ok = renderer.SetPlaneMeshParts(asset.meshParts, meshUploadError);
+            if (!ok) {
+                vehicleModeStatus = "Vehicle mesh switch failed: " + meshUploadError;
+                return;
+            }
+        } else {
+            std::string meshUploadError;
+            const bool ok = renderer.SetPlaneMesh(asset.mesh, meshUploadError);
+            if (!ok) {
+                vehicleModeStatus = "Vehicle mesh switch failed: " + meshUploadError;
+                return;
+            }
+            std::string textureError;
+            const bool textureOk = renderer.SetPlaneTexture(
+                asset.texture.IsValid() ? asset.texture.rgbaPixels.data() : nullptr,
+                asset.texture.width,
+                asset.texture.height,
+                textureError);
+            if (!textureOk) {
+                vehicleModeStatus = "Vehicle texture switch failed: " + textureError;
+                return;
+            }
         }
         appliedRenderMode = mode;
         appliedVehicleAssetReady = true;

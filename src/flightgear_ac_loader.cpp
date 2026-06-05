@@ -49,9 +49,17 @@ struct TextureImage {
     }
 };
 
+struct TextureBinding {
+    const TextureImage* image = nullptr;
+    std::wstring key;
+    std::string name;
+};
+
 struct ParseContext {
     std::vector<AcMaterial> materials;
     std::unordered_map<std::wstring, TextureImage> textureCache;
+    std::unordered_map<std::wstring, size_t> partByTextureKey;
+    std::vector<FlightGearMeshPart>* parts = nullptr;
     std::filesystem::path aircraftRoot;
     std::unordered_set<std::wstring> loadedXml;
     FlightGearLoadStats stats{};
@@ -396,17 +404,17 @@ bool DecodeSgiRgb(const std::filesystem::path& path, TextureImage& out) {
     return out.IsValid();
 }
 
-const TextureImage* LoadTexture(ParseContext& context, const std::filesystem::path& acPath, const std::string& textureName) {
+TextureBinding LoadTexture(ParseContext& context, const std::filesystem::path& acPath, const std::string& textureName) {
     const auto texturePath = FindTextureFile(acPath, textureName);
     if (!texturePath) {
         context.stats.texturesMissing += 1;
-        return nullptr;
+        return {};
     }
 
     const std::wstring key = std::filesystem::weakly_canonical(*texturePath).wstring();
     const auto found = context.textureCache.find(key);
     if (found != context.textureCache.end()) {
-        return found->second.IsValid() ? &found->second : nullptr;
+        return found->second.IsValid() ? TextureBinding{&found->second, key, textureName} : TextureBinding{};
     }
 
     TextureImage image;
@@ -418,7 +426,7 @@ const TextureImage* LoadTexture(ParseContext& context, const std::filesystem::pa
         context.stats.texturesMissing += 1;
     }
     auto [it, _] = context.textureCache.emplace(key, std::move(image));
-    return it->second.IsValid() ? &it->second : nullptr;
+    return it->second.IsValid() ? TextureBinding{&it->second, key, textureName} : TextureBinding{};
 }
 
 DirectX::XMFLOAT4 SampleTexture(const TextureImage* texture, const Float2& uv) {
@@ -436,6 +444,32 @@ DirectX::XMFLOAT4 SampleTexture(const TextureImage* texture, const Float2& uv) {
         static_cast<float>(texture->pixels[idx + 2]) / 255.0f,
         static_cast<float>(texture->pixels[idx + 3]) / 255.0f,
     };
+}
+
+FlightGearMeshPart& GetPartForTexture(ParseContext& context, const TextureBinding& texture) {
+    static constexpr wchar_t kUntexturedKey[] = L"__flightgear_untextured__";
+    const std::wstring key = texture.image != nullptr ? texture.key : std::wstring(kUntexturedKey);
+    const auto found = context.partByTextureKey.find(key);
+    if (found != context.partByTextureKey.end()) {
+        return (*context.parts)[found->second];
+    }
+
+    FlightGearMeshPart part{};
+    part.textureName = texture.name;
+    if (texture.image != nullptr && texture.image->IsValid()) {
+        part.texture.rgbaPixels = texture.image->pixels;
+        part.texture.width = texture.image->width;
+        part.texture.height = texture.image->height;
+    } else {
+        part.texture.rgbaPixels = {255, 255, 255, 255};
+        part.texture.width = 1;
+        part.texture.height = 1;
+        part.textureName = "untextured";
+    }
+    context.parts->push_back(std::move(part));
+    const size_t index = context.parts->size() - 1u;
+    context.partByTextureKey.emplace(key, index);
+    return (*context.parts)[index];
 }
 
 void AppendTriangle(MeshData& mesh, const std::array<Float3, 3>& positions, const std::array<Float2, 3>& uvs, const DirectX::XMFLOAT4& color) {
@@ -476,7 +510,7 @@ bool ParseAcObject(
     ParseContext& context,
     const std::filesystem::path& acPath,
     const Matrix4& parentTransform,
-    const TextureImage* inheritedTexture,
+    const TextureBinding& inheritedTexture,
     MeshData& mesh,
     std::string& error) {
     std::string objectType;
@@ -485,7 +519,7 @@ bool ParseAcObject(
     Matrix4 local = Identity();
     Matrix4 currentTransform = parentTransform;
     std::vector<Float3> vertices;
-    const TextureImage* objectTexture = inheritedTexture;
+    TextureBinding objectTexture = inheritedTexture;
     Float2 textureRepeat{1.0f, 1.0f};
     Float2 textureOffset{0.0f, 0.0f};
 
@@ -585,18 +619,23 @@ bool ParseAcObject(
                 if (matIndex < context.materials.size()) {
                     baseColor = context.materials[matIndex].color;
                 }
-                const DirectX::XMFLOAT4 sampled = SampleTexture(objectTexture, refs[0].uv);
-                baseColor.x *= sampled.x;
-                baseColor.y *= sampled.y;
-                baseColor.z *= sampled.z;
-                baseColor.w *= sampled.w;
+                MeshData* targetMesh = &mesh;
+                if (context.parts != nullptr) {
+                    targetMesh = &GetPartForTexture(context, objectTexture).mesh;
+                } else {
+                    const DirectX::XMFLOAT4 sampled = SampleTexture(objectTexture.image, refs[0].uv);
+                    baseColor.x *= sampled.x;
+                    baseColor.y *= sampled.y;
+                    baseColor.z *= sampled.z;
+                    baseColor.w *= sampled.w;
+                }
 
                 for (uint32_t i = 1; i + 1 < refCount; ++i) {
                     if (refs[0].index >= vertices.size() || refs[i].index >= vertices.size() || refs[i + 1].index >= vertices.size()) {
                         continue;
                     }
                     AppendTriangle(
-                        mesh,
+                        *targetMesh,
                         {vertices[refs[0].index], vertices[refs[i].index], vertices[refs[i + 1].index]},
                         {refs[0].uv, refs[i].uv, refs[i + 1].uv},
                         baseColor);
@@ -653,7 +692,7 @@ bool LoadAcFile(
         if (token == "MATERIAL") {
             context.materials.push_back(ParseMaterial(ReadLineString(stream)));
         } else if (token == "OBJECT") {
-            if (!ParseAcObject(stream, context, acPath, transform, nullptr, mesh, error)) {
+            if (!ParseAcObject(stream, context, acPath, transform, TextureBinding{}, mesh, error)) {
                 return false;
             }
         } else {
@@ -797,6 +836,46 @@ bool LoadFlightGearAircraftMesh(
     outTexture.rgbaPixels = {255, 255, 255, 255};
     outTexture.width = 1;
     outTexture.height = 1;
+    outStats = context.stats;
+    return true;
+}
+
+bool LoadFlightGearAircraftParts(
+    const std::filesystem::path& modelXmlPath,
+    std::vector<FlightGearMeshPart>& outParts,
+    FlightGearLoadStats& outStats,
+    const FlightGearLoadOptions& options,
+    std::string& error) {
+    outParts = {};
+    outStats = {};
+
+    if (!std::filesystem::exists(modelXmlPath)) {
+        error = "FlightGear model XML not found: " + modelXmlPath.string();
+        return false;
+    }
+
+    MeshData ignoredCombinedMesh;
+    ParseContext context{};
+    context.parts = &outParts;
+    context.aircraftRoot = modelXmlPath.parent_path().parent_path();
+    if (!LoadModelXmlRecursive(modelXmlPath, Identity(), context, options, ignoredCombinedMesh, error)) {
+        outStats = context.stats;
+        return false;
+    }
+
+    outParts.erase(
+        std::remove_if(
+            outParts.begin(),
+            outParts.end(),
+            [](const FlightGearMeshPart& part) { return !part.mesh.IsValid() || !part.texture.IsValid(); }),
+        outParts.end());
+
+    if (outParts.empty()) {
+        outStats = context.stats;
+        error = "FlightGear aircraft import produced no textured mesh parts";
+        return false;
+    }
+
     outStats = context.stats;
     return true;
 }

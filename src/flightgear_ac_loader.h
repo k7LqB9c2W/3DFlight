@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "gltf_loader.h"
 #include "mesh.h"
@@ -22,10 +23,23 @@ struct FlightGearLoadStats {
     uint32_t skippedModels = 0;
 };
 
+struct FlightGearMeshPart {
+    MeshData mesh;
+    GlbMaterialTexture texture;
+    std::string textureName;
+};
+
 bool LoadFlightGearAircraftMesh(
     const std::filesystem::path& modelXmlPath,
     MeshData& outMesh,
     GlbMaterialTexture& outTexture,
+    FlightGearLoadStats& outStats,
+    const FlightGearLoadOptions& options,
+    std::string& error);
+
+bool LoadFlightGearAircraftParts(
+    const std::filesystem::path& modelXmlPath,
+    std::vector<FlightGearMeshPart>& outParts,
     FlightGearLoadStats& outStats,
     const FlightGearLoadOptions& options,
     std::string& error);

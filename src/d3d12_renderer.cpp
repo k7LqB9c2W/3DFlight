@@ -742,6 +742,10 @@ bool D3D12Renderer::Initialize(
 
     m_earthMesh.ReleaseUploadBuffers();
     m_planeMesh.ReleaseUploadBuffers();
+    for (auto& part : m_planeParts) {
+        part.mesh.ReleaseUploadBuffers();
+        part.upload.Reset();
+    }
     m_skyboxMesh.ReleaseUploadBuffers();
     m_landmaskUpload.Reset();
     m_skyboxUpload.Reset();
@@ -843,6 +847,7 @@ void D3D12Renderer::Shutdown() {
 
     m_sceneCb = {};
     m_objectCb = {};
+    m_planeParts.clear();
     m_landmaskTexture.Reset();
     m_landmaskUpload.Reset();
     m_skyboxTexture.Reset();
@@ -980,6 +985,91 @@ bool D3D12Renderer::SetPlaneMesh(const MeshData& mesh, std::string& error) {
 
     updated.ReleaseUploadBuffers();
     m_planeMesh = std::move(updated);
+    m_planeParts.clear();
+    return true;
+}
+
+bool D3D12Renderer::SetPlaneMeshParts(const std::vector<PlaneMeshPart>& parts, std::string& error) {
+    if (parts.empty()) {
+        error = "SetPlaneMeshParts called with no parts";
+        return false;
+    }
+    if (parts.size() > kMaxVehiclePartTextures) {
+        error = "SetPlaneMeshParts received " + std::to_string(parts.size()) +
+            " parts, but the renderer supports " + std::to_string(kMaxVehiclePartTextures);
+        return false;
+    }
+
+    WaitForGpu();
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    FrameContext& frame = m_frames[m_frameIndex];
+    if (FAILED(frame.allocator->Reset())) {
+        error = "SetPlaneMeshParts allocator reset failed";
+        return false;
+    }
+    if (FAILED(m_commandList->Reset(frame.allocator.Get(), nullptr))) {
+        error = "SetPlaneMeshParts command list reset failed";
+        return false;
+    }
+
+    std::vector<GpuPlanePart> updated;
+    updated.reserve(parts.size());
+    constexpr uint8_t kDefaultWhite[4] = {255, 255, 255, 255};
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const PlaneMeshPart& src = parts[i];
+        if (!src.mesh.IsValid()) {
+            continue;
+        }
+
+        GpuPlanePart dst{};
+        if (!dst.mesh.Upload(m_device.Get(), m_commandList.Get(), src.mesh, error)) {
+            return false;
+        }
+
+        const bool hasTexture =
+            src.textureWidth > 0 &&
+            src.textureHeight > 0 &&
+            src.rgbaPixels.size() == static_cast<size_t>(src.textureWidth) * static_cast<size_t>(src.textureHeight) * 4ull;
+        const uint8_t* pixels = hasTexture ? src.rgbaPixels.data() : kDefaultWhite;
+        const uint32_t width = hasTexture ? src.textureWidth : 1u;
+        const uint32_t height = hasTexture ? src.textureHeight : 1u;
+        dst.srvIndex = kVehiclePartSrvStartIndex + static_cast<UINT>(updated.size());
+        if (!CreateSatelliteTextureFromPixels(
+                m_commandList.Get(),
+                dst.srvIndex,
+                dst.texture,
+                dst.upload,
+                pixels,
+                width,
+                height,
+                error)) {
+            return false;
+        }
+        updated.push_back(std::move(dst));
+    }
+
+    if (updated.empty()) {
+        error = "SetPlaneMeshParts did not receive any valid mesh parts";
+        return false;
+    }
+
+    if (FAILED(m_commandList->Close())) {
+        error = "SetPlaneMeshParts command list close failed";
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+
+    for (auto& part : updated) {
+        part.mesh.ReleaseUploadBuffers();
+        part.upload.Reset();
+    }
+    m_planeParts = std::move(updated);
+    m_planeMesh = {};
+    m_hasModelAlbedoTexture = false;
     return true;
 }
 
@@ -1581,6 +1671,7 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->SetGraphicsRootConstantBufferView(0, worldSceneCbGpu);
     m_commandList->SetGraphicsRootDescriptorTable(2, GpuSrv(kSrvTableStartIndex));
+    m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(kModelAlbedoSrvIndex));
 
     // Draw skybox first with depth disabled.
     {
@@ -1779,10 +1870,22 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning6 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning7 = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
-        m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
         m_commandList->SetPipelineState(m_planePso.Get());
-        m_planeMesh.Draw(m_commandList.Get());
+        if (!m_planeParts.empty()) {
+            obj.colorAndFlags = {1.0f, 1.0f, 1.0f, 1.0f};
+            std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
+            m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
+            for (const auto& part : m_planeParts) {
+                m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(part.srvIndex));
+                part.mesh.Draw(m_commandList.Get());
+            }
+            m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(kModelAlbedoSrvIndex));
+        } else {
+            std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
+            m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
+            m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(kModelAlbedoSrvIndex));
+            m_planeMesh.Draw(m_commandList.Get());
+        }
     };
 
     if (!cockpitMode || !m_cameraSettings.renderOnlyCockpitMesh) {
@@ -1864,7 +1967,7 @@ bool D3D12Renderer::CreateDeviceResources(std::string& error) {
 
     D3D12_DESCRIPTOR_HEAP_DESC srvDesc{};
     srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvDesc.NumDescriptors = 32;
+    srvDesc.NumDescriptors = kSrvHeapDescriptorCount;
     srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = m_device->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(m_srvHeap.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
@@ -2143,7 +2246,14 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     graphicsSrvRanges[1].RegisterSpace = 0;
     graphicsSrvRanges[1].OffsetInDescriptorsFromTableStart = kWorldSatelliteAtlasSrvIndex - kSrvTableStartIndex;
 
-    D3D12_ROOT_PARAMETER graphicsParams[3]{};
+    D3D12_DESCRIPTOR_RANGE modelTextureRange{};
+    modelTextureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    modelTextureRange.NumDescriptors = 1; // t30, rebound per model part.
+    modelTextureRange.BaseShaderRegister = 30;
+    modelTextureRange.RegisterSpace = 0;
+    modelTextureRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER graphicsParams[4]{};
 
     graphicsParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     graphicsParams[0].Descriptor.ShaderRegister = 0;
@@ -2159,6 +2269,11 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     graphicsParams[2].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(std::size(graphicsSrvRanges));
     graphicsParams[2].DescriptorTable.pDescriptorRanges = graphicsSrvRanges;
     graphicsParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    graphicsParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    graphicsParams[3].DescriptorTable.NumDescriptorRanges = 1;
+    graphicsParams[3].DescriptorTable.pDescriptorRanges = &modelTextureRange;
+    graphicsParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     std::array<D3D12_STATIC_SAMPLER_DESC, 2> staticSamplers{};
     staticSamplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;

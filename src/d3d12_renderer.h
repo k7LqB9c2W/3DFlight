@@ -62,6 +62,13 @@ public:
         bool valid = false;
     };
 
+    struct PlaneMeshPart {
+        MeshData mesh;
+        std::vector<uint8_t> rgbaPixels;
+        uint32_t textureWidth = 0;
+        uint32_t textureHeight = 0;
+    };
+
     struct WorldAtlasPageUpload {
         enum NeighborIndex : size_t {
             Left = 0,
@@ -134,6 +141,7 @@ public:
     void Render(const FlightSim& sim, ImDrawData* imguiDrawData);
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
+    bool SetPlaneMeshParts(const std::vector<PlaneMeshPart>& parts, std::string& error);
     bool SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
     bool SetHudMapTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
     bool SetSatelliteLodTextures(const std::array<SatelliteLodTexture, 3>& lods, std::string& error);
@@ -216,6 +224,9 @@ private:
     static constexpr UINT kWorldSatellitePageTableSrvIndex = 21;
     static constexpr UINT kWorldSatellitePageKeySrvIndex = 22;
     static constexpr UINT kHudMapSrvIndex = 23;
+    static constexpr UINT kVehiclePartSrvStartIndex = 32;
+    static constexpr UINT kMaxVehiclePartTextures = 128;
+    static constexpr UINT kSrvHeapDescriptorCount = kVehiclePartSrvStartIndex + kMaxVehiclePartTextures;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
     static constexpr UINT kSkyViewUavIndex = kUavTableStartIndex + 1;
@@ -300,6 +311,13 @@ private:
         DirectX::XMFLOAT4 tuning13{};
         DirectX::XMFLOAT4 tuning14{};
         DirectX::XMFLOAT4 tuning15{};
+    };
+
+    struct GpuPlanePart {
+        GpuMesh mesh;
+        Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+        Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+        UINT srvIndex = 0;
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -420,6 +438,7 @@ private:
 
     GpuMesh m_earthMesh;
     GpuMesh m_planeMesh;
+    std::vector<GpuPlanePart> m_planeParts;
     GpuMesh m_skyboxMesh;
     GpuMesh m_terrainMesh;
     GpuMesh m_prevTerrainMesh;
