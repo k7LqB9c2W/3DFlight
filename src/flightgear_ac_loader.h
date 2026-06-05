@@ -31,6 +31,9 @@ struct FlightGearMeshPart {
     std::string textureName;
     std::string objectName;
     std::vector<std::string> objectAliases;
+    bool transparent = false;
+    bool emissive = false;
+    float alphaCutoff = 0.0f;
 };
 
 struct FlightGearAnimationEntry {
@@ -44,6 +47,9 @@ struct FlightGearAnimation {
         Rotate,
         Translate,
         Spin,
+        Scale,
+        DistScale,
+        Billboard,
     };
 
     Type type = Type::Rotate;
@@ -57,6 +63,11 @@ struct FlightGearAnimation {
     float maxValue = 3.402823466e+38f;
     DirectX::XMFLOAT3 center{0.0f, 0.0f, 0.0f};
     DirectX::XMFLOAT3 axis{0.0f, 1.0f, 0.0f};
+    DirectX::XMFLOAT3 scaleFactor{1.0f, 1.0f, 1.0f};
+    DirectX::XMFLOAT3 scaleOffset{0.0f, 0.0f, 0.0f};
+    DirectX::XMFLOAT3 scaleMin{-3.402823466e+38f, -3.402823466e+38f, -3.402823466e+38f};
+    DirectX::XMFLOAT3 scaleMax{3.402823466e+38f, 3.402823466e+38f, 3.402823466e+38f};
+    bool sphericalBillboard = true;
     std::vector<FlightGearAnimationEntry> interpolation;
 };
 

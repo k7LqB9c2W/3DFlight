@@ -16,6 +16,7 @@ cbuffer ObjectCB : register(b1)
 {
     float4x4 gModel;
     float4 gColorAndFlags;
+    float4 gTuning0; // x alphaCutoff, y emissive, z transparent, w unused
 };
 
 struct VSInput
@@ -63,15 +64,28 @@ float4 PSMain(VSOutput input) : SV_Target
     float ambient = lerp(0.08, 0.25, hemi);
     float diffuse = 0.85 * ndl;
 
+    float alpha = input.color.a;
     float3 baseColor = gColorAndFlags.rgb * input.color.rgb;
     if (gColorAndFlags.w > 0.5)
     {
-        float3 albedo = gModelAlbedo.Sample(gWrapSampler, input.uv).rgb;
-        baseColor *= albedo;
+        float4 albedo = gModelAlbedo.Sample(gWrapSampler, input.uv);
+        baseColor *= albedo.rgb;
+        float sampledAlpha = albedo.a;
+        if (gTuning0.y > 0.5 && sampledAlpha > 0.999)
+        {
+            sampledAlpha = saturate(dot(albedo.rgb, float3(0.299, 0.587, 0.114)));
+        }
+        alpha *= sampledAlpha;
     }
+    clip(alpha - max(gTuning0.x, 0.0));
+
     float3 lit = baseColor * (ambient + diffuse) + spec.xxx + rim * float3(0.52, 0.62, 0.75);
+    if (gTuning0.y > 0.5)
+    {
+        lit = max(lit, baseColor * 2.5);
+    }
 
     lit = ApplyAerialPerspectiveToColor(gAerialPerspectiveLut, gClampSampler, input.position.xy, length(input.worldPos), lit);
     lit = 1.0 - exp(-lit * max(gAtmosphereFlags.z, 0.01));
-    return float4(saturate(lit), 1.0);
+    return float4(saturate(lit), saturate(alpha));
 }

@@ -37,12 +37,14 @@ struct Matrix4 {
 
 struct AcMaterial {
     DirectX::XMFLOAT4 color{1.0f, 1.0f, 1.0f, 1.0f};
+    bool emissive = false;
 };
 
 struct TextureImage {
     std::vector<uint8_t> pixels;
     uint32_t width = 0;
     uint32_t height = 0;
+    bool hasTransparency = false;
 
     [[nodiscard]] bool IsValid() const {
         return width > 0 && height > 0 && pixels.size() == static_cast<size_t>(width) * static_cast<size_t>(height) * 4ull;
@@ -166,12 +168,12 @@ Matrix4 RotationAxis(Float3 axis, float radians) {
 
 Matrix4 OffsetMatrix(const SubmodelOffset& offset) {
     constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-    Matrix4 out = Translation(offset.x, offset.y, offset.z);
+    Matrix4 out = Translation(offset.x, offset.z, -offset.y);
     if (std::abs(offset.headingDeg) > 1e-6f) {
-        out = Multiply(out, RotationAxis({0.0f, 0.0f, 1.0f}, offset.headingDeg * kDegToRad));
+        out = Multiply(out, RotationAxis({0.0f, 1.0f, 0.0f}, offset.headingDeg * kDegToRad));
     }
     if (std::abs(offset.pitchDeg) > 1e-6f) {
-        out = Multiply(out, RotationAxis({0.0f, 1.0f, 0.0f}, offset.pitchDeg * kDegToRad));
+        out = Multiply(out, RotationAxis({0.0f, 0.0f, -1.0f}, offset.pitchDeg * kDegToRad));
     }
     if (std::abs(offset.rollDeg) > 1e-6f) {
         out = Multiply(out, RotationAxis({1.0f, 0.0f, 0.0f}, offset.rollDeg * kDegToRad));
@@ -209,6 +211,27 @@ bool StartsWith(const std::string& value, const std::string& prefix) {
 
 bool ContainsInsensitive(const std::string& value, const std::string& needle) {
     return Lower(value).find(Lower(needle)) != std::string::npos;
+}
+
+bool IsFlightGearLightObjectName(const std::string& objectName) {
+    const std::string lower = Lower(objectName);
+    return lower.find("light") != std::string::npos ||
+        lower.find("strobe") != std::string::npos ||
+        lower.find("beacon") != std::string::npos ||
+        lower.find("taxi") != std::string::npos ||
+        lower.find("landing") != std::string::npos ||
+        lower.find("rednav") != std::string::npos ||
+        lower.find("greennav") != std::string::npos ||
+        lower.find("navlight") != std::string::npos;
+}
+
+bool PixelsHaveTransparency(const std::vector<uint8_t>& pixels) {
+    for (size_t i = 3; i < pixels.size(); i += 4) {
+        if (pixels[i] < 250) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string GetFirstTagText(const std::string& xml, const std::string& tag) {
@@ -250,8 +273,12 @@ std::vector<std::string> ExtractTagTexts(const std::string& xml, const std::stri
     return out;
 }
 
-DirectX::XMFLOAT3 RemapFgVector(const Float3& v) {
-    return {v.z, v.y, -v.x};
+DirectX::XMFLOAT3 RemapFlightGearXmlVector(const Float3& v) {
+    return {v.y, v.z, -v.x};
+}
+
+DirectX::XMFLOAT3 RemapAcVector(const Float3& v) {
+    return {-v.z, v.y, -v.x};
 }
 
 std::string CurrentModelScopeKey(const ParseContext& context) {
@@ -343,6 +370,7 @@ bool DecodeImageFileWic(const std::filesystem::path& path, TextureImage& out) {
     out.pixels = std::move(pixels);
     out.width = width;
     out.height = height;
+    out.hasTransparency = PixelsHaveTransparency(out.pixels);
     return out.IsValid();
 }
 
@@ -440,6 +468,7 @@ bool DecodeSgiRgb(const std::filesystem::path& path, TextureImage& out) {
     out.pixels = std::move(rgba);
     out.width = width;
     out.height = height;
+    out.hasTransparency = PixelsHaveTransparency(out.pixels);
     return out.IsValid();
 }
 
@@ -491,6 +520,10 @@ void ApplyTextureToPart(FlightGearMeshPart& part, const TextureBinding& texture)
         part.texture.rgbaPixels = texture.image->pixels;
         part.texture.width = texture.image->width;
         part.texture.height = texture.image->height;
+        part.transparent = part.transparent || texture.image->hasTransparency;
+        if (texture.image->hasTransparency) {
+            part.alphaCutoff = std::max(part.alphaCutoff, 0.01f);
+        }
     } else {
         part.texture.rgbaPixels = {255, 255, 255, 255};
         part.texture.width = 1;
@@ -557,8 +590,8 @@ void AppendTriangle(MeshData& mesh, const std::array<Float3, 3>& positions, cons
     for (size_t i = 0; i < 3; ++i) {
         // FlightGear/AC3D aircraft use negative X forward, Y up, Z lateral. The renderer mesh convention is X right, Y up, Z forward.
         Vertex v{};
-        v.position = {positions[i].z, positions[i].y, -positions[i].x};
-        v.normal = {normal.z, normal.y, -normal.x};
+        v.position = RemapAcVector(positions[i]);
+        v.normal = RemapAcVector(normal);
         v.uv = {uvs[i].x, uvs[i].y};
         v.color = color;
         mesh.vertices.push_back(v);
@@ -573,14 +606,20 @@ AcMaterial ParseMaterial(const std::string& line) {
     std::istringstream stream(line);
     std::string token;
     float trans = 0.0f;
+    float emisR = 0.0f;
+    float emisG = 0.0f;
+    float emisB = 0.0f;
     while (stream >> token) {
         if (token == "rgb") {
             stream >> material.color.x >> material.color.y >> material.color.z;
+        } else if (token == "emis") {
+            stream >> emisR >> emisG >> emisB;
         } else if (token == "trans") {
             stream >> trans;
         }
     }
     material.color.w = std::clamp(1.0f - trans, 0.0f, 1.0f);
+    material.emissive = std::max({emisR, emisG, emisB}) > 0.05f;
     return material;
 }
 
@@ -696,12 +735,22 @@ bool ParseAcObject(
                     continue;
                 }
                 DirectX::XMFLOAT4 baseColor{1.0f, 1.0f, 1.0f, 1.0f};
+                bool materialEmissive = false;
                 if (matIndex < context.materials.size()) {
                     baseColor = context.materials[matIndex].color;
+                    materialEmissive = context.materials[matIndex].emissive;
                 }
                 MeshData* targetMesh = &mesh;
+                FlightGearMeshPart* targetPart = nullptr;
                 if (context.parts != nullptr) {
-                    targetMesh = &GetPartForObject(context, objectName, objectTexture).mesh;
+                    targetPart = &GetPartForObject(context, objectName, objectTexture);
+                    targetMesh = &targetPart->mesh;
+                    const bool lightObject = IsFlightGearLightObjectName(objectName);
+                    targetPart->transparent = targetPart->transparent || baseColor.w < 0.995f || lightObject;
+                    targetPart->emissive = targetPart->emissive || materialEmissive || lightObject;
+                    if (targetPart->transparent) {
+                        targetPart->alphaCutoff = std::max(targetPart->alphaCutoff, 0.01f);
+                    }
                 } else {
                     const DirectX::XMFLOAT4 sampled = SampleTexture(objectTexture.image, refs[0].uv);
                     baseColor.x *= sampled.x;
@@ -792,7 +841,14 @@ bool ShouldIncludeModelPath(const std::string& path, const FlightGearLoadOptions
         return false;
     }
     if (lower.find("/lights/") != std::string::npos || lower.find("light-cone") != std::string::npos) {
-        return false;
+        if (!options.includeLights || lower.find("light-cone") != std::string::npos) {
+            return false;
+        }
+        // FlightGear ALS light models are shader/effect proxies. Importing their raw AC quads as aircraft mesh
+        // produces opaque square panels; keep legacy textured light meshes until we have an ALS effect renderer.
+        if (lower.find("/lights/als/") != std::string::npos) {
+            return false;
+        }
     }
     if (lower.find("pushback") != std::string::npos || lower.find("tyre-smoke") != std::string::npos || lower.find("tyrespray") != std::string::npos ||
         lower.find("contrail") != std::string::npos || lower.find("fire") != std::string::npos) {
@@ -843,7 +899,24 @@ std::optional<FlightGearAnimation::Type> ParseAnimationType(const std::string& r
     if (type == "spin") {
         return FlightGearAnimation::Type::Spin;
     }
+    if (type == "scale") {
+        return FlightGearAnimation::Type::Scale;
+    }
+    if (type == "dist-scale") {
+        return FlightGearAnimation::Type::DistScale;
+    }
+    if (type == "billboard") {
+        return FlightGearAnimation::Type::Billboard;
+    }
     return std::nullopt;
+}
+
+bool GetFirstTagBool(const std::string& xml, const std::string& tag, bool fallback = false) {
+    const std::string value = Lower(Trim(GetFirstTagText(xml, tag)));
+    if (value.empty()) {
+        return fallback;
+    }
+    return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
 void ParseInterpolation(const std::string& block, std::vector<FlightGearAnimationEntry>& outEntries) {
@@ -892,9 +965,6 @@ void ParseAnimationsForXml(const std::filesystem::path& xmlPath, const std::stri
         FlightGearAnimation animation{};
         animation.type = *type;
         const std::vector<std::string> objectNames = ExtractTagTexts(block, "object-name");
-        if (objectNames.empty()) {
-            continue;
-        }
         animation.objectNames.reserve(objectNames.size());
         std::unordered_set<std::string> seenTargets;
         for (const std::string& objectName : objectNames) {
@@ -903,6 +973,12 @@ void ParseAnimationsForXml(const std::filesystem::path& xmlPath, const std::stri
             if (seenTargets.insert(targetKey).second) {
                 animation.objectNames.push_back(targetKey);
             }
+        }
+        if (animation.objectNames.empty() &&
+            (animation.type == FlightGearAnimation::Type::Scale ||
+             animation.type == FlightGearAnimation::Type::DistScale ||
+             animation.type == FlightGearAnimation::Type::Billboard)) {
+            animation.objectNames.push_back(CurrentModelScopeKey(context));
         }
         if (animation.objectNames.empty()) {
             continue;
@@ -918,8 +994,32 @@ void ParseAnimationsForXml(const std::filesystem::path& xmlPath, const std::stri
             animation.minValue = GetFirstTagFloat(block, "min-m", animation.minValue);
             animation.maxValue = GetFirstTagFloat(block, "max-m", animation.maxValue);
         }
-        animation.center = RemapFgVector(ReadFgVec3(block, "center"));
-        animation.axis = RemapFgVector(ReadFgVec3(block, "axis", {0.0f, 1.0f, 0.0f}));
+        if (animation.type == FlightGearAnimation::Type::Scale) {
+            const float defaultScaleFactor = animation.property.empty() ? 0.0f : animation.factor;
+            const float defaultScaleOffset = animation.property.empty() ? 1.0f : 0.0f;
+            animation.scaleFactor = {
+                GetFirstTagFloat(block, "x-factor", defaultScaleFactor),
+                GetFirstTagFloat(block, "y-factor", defaultScaleFactor),
+                GetFirstTagFloat(block, "z-factor", defaultScaleFactor)};
+            animation.scaleOffset = {
+                GetFirstTagFloat(block, "x-offset", defaultScaleOffset),
+                GetFirstTagFloat(block, "y-offset", defaultScaleOffset),
+                GetFirstTagFloat(block, "z-offset", defaultScaleOffset)};
+            animation.scaleMin = {
+                GetFirstTagFloat(block, "x-min", animation.minValue),
+                GetFirstTagFloat(block, "y-min", animation.minValue),
+                GetFirstTagFloat(block, "z-min", animation.minValue)};
+            animation.scaleMax = {
+                GetFirstTagFloat(block, "x-max", animation.maxValue),
+                GetFirstTagFloat(block, "y-max", animation.maxValue),
+                GetFirstTagFloat(block, "z-max", animation.maxValue)};
+        } else if (animation.type == FlightGearAnimation::Type::DistScale) {
+            animation.property = "__viewer/distance-m";
+        } else if (animation.type == FlightGearAnimation::Type::Billboard) {
+            animation.sphericalBillboard = GetFirstTagBool(block, "spherical", true);
+        }
+        animation.center = RemapFlightGearXmlVector(ReadFgVec3(block, "center"));
+        animation.axis = RemapFlightGearXmlVector(ReadFgVec3(block, "axis", {0.0f, 1.0f, 0.0f}));
         ParseInterpolation(block, animation.interpolation);
         ParseAnimationCondition(block, animation);
         for (const std::string& objectName : animation.objectNames) {

@@ -836,6 +836,7 @@ void D3D12Renderer::Shutdown() {
     m_rootSignature.Reset();
     m_computeRootSignature.Reset();
     m_planePso.Reset();
+    m_planeTransparentPso.Reset();
     m_earthPso.Reset();
     m_skyboxPso.Reset();
     m_terrainPso.Reset();
@@ -1027,7 +1028,13 @@ bool D3D12Renderer::SetPlaneMeshParts(const std::vector<PlaneMeshPart>& parts, s
             return false;
         }
         dst.localTransform = src.localTransform;
+        dst.billboardCenter = src.billboardCenter;
         dst.visible = src.visible;
+        dst.faceCamera = src.faceCamera;
+        dst.sphericalBillboard = src.sphericalBillboard;
+        dst.transparent = src.transparent;
+        dst.emissive = src.emissive;
+        dst.alphaCutoff = src.alphaCutoff;
 
         const bool hasTexture =
             src.textureWidth > 0 &&
@@ -1080,6 +1087,9 @@ void D3D12Renderer::SetPlanePartAnimationState(const std::vector<PlanePartAnimat
     for (size_t i = 0; i < count; ++i) {
         m_planeParts[i].localTransform = states[i].localTransform;
         m_planeParts[i].visible = states[i].visible;
+        m_planeParts[i].billboardCenter = states[i].billboardCenter;
+        m_planeParts[i].faceCamera = states[i].faceCamera;
+        m_planeParts[i].sphericalBillboard = states[i].sphericalBillboard;
     }
 }
 
@@ -1540,8 +1550,14 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
     } else {
         const double cameraFollowDistance = static_cast<double>(std::clamp(m_cameraSettings.chaseDistanceMeters, 1.0f, 100000.0f));
         const double cameraHeight = std::clamp(cameraFollowDistance * 0.32, 18.0, 420.0);
-        cameraEcef = planeEcef - forwardEcef * cameraFollowDistance + upEcef * cameraHeight;
-        cameraForward = Normalize((planeEcef + forwardEcef * std::clamp(cameraFollowDistance * 0.35, 28.0, 540.0)) - cameraEcef);
+        const double orbitYawRad = DirectX::XMConvertToRadians(m_cameraSettings.chaseOrbitYawDeg);
+        Double3 cameraBack = forwardEcef * -1.0;
+        if (std::abs(orbitYawRad) > 1e-8) {
+            cameraBack = Normalize(rotateAroundAxis(cameraBack, upEcef, orbitYawRad));
+        }
+        const Double3 chaseTarget = planeEcef + forwardEcef * std::clamp(cameraFollowDistance * 0.35, 28.0, 540.0);
+        cameraEcef = planeEcef + cameraBack * cameraFollowDistance + upEcef * cameraHeight;
+        cameraForward = Normalize(chaseTarget - cameraEcef);
         cameraViewUp = upEcef;
     }
 
@@ -1880,25 +1896,72 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         obj.tuning6 = {0.0f, 0.0f, 0.0f, 0.0f};
         obj.tuning7 = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        m_commandList->SetPipelineState(m_planePso.Get());
         if (!m_planeParts.empty()) {
             obj.colorAndFlags = {1.0f, 1.0f, 1.0f, 1.0f};
-            for (size_t partIndex = 0; partIndex < m_planeParts.size(); ++partIndex) {
-                const auto& part = m_planeParts[partIndex];
-                if (!part.visible) {
-                    continue;
-                }
-                ObjectConstants partObj = obj;
-                const DirectX::XMMATRIX local = DirectX::XMLoadFloat4x4(&part.localTransform);
-                DirectX::XMStoreFloat4x4(&partObj.model, DirectX::XMMatrixTranspose(local * model));
-                const UINT64 objectSlot = 3u + static_cast<UINT64>(partIndex);
-                std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * objectSlot), &partObj, sizeof(partObj));
-                m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * objectSlot);
-                m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(part.srvIndex));
-                part.mesh.Draw(m_commandList.Get());
+            const DirectX::XMMATRIX invModel = DirectX::XMMatrixInverse(nullptr, model);
+            const DirectX::XMVECTOR cameraModelLocal =
+                DirectX::XMVector3TransformCoord(DirectX::XMVectorZero(), invModel);
+            DirectX::XMVECTOR cameraUpModelLocal = DirectX::XMVector3Normalize(DirectX::XMVector3TransformNormal(
+                DirectX::XMVectorSet(
+                    static_cast<float>(cameraViewUp.x),
+                    static_cast<float>(cameraViewUp.y),
+                    static_cast<float>(cameraViewUp.z),
+                    0.0f),
+                invModel));
+            if (DirectX::XMVector3Equal(cameraUpModelLocal, DirectX::XMVectorZero())) {
+                cameraUpModelLocal = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
             }
+            auto drawPartPass = [&](bool transparentPass) {
+                m_commandList->SetPipelineState(transparentPass ? m_planeTransparentPso.Get() : m_planePso.Get());
+                for (size_t partIndex = 0; partIndex < m_planeParts.size(); ++partIndex) {
+                    const auto& part = m_planeParts[partIndex];
+                    if (!part.visible || part.transparent != transparentPass) {
+                        continue;
+                    }
+                    ObjectConstants partObj = obj;
+                    partObj.tuning0 = {
+                        part.alphaCutoff,
+                        part.emissive ? 1.0f : 0.0f,
+                        part.transparent ? 1.0f : 0.0f,
+                        0.0f};
+                    DirectX::XMMATRIX local = DirectX::XMLoadFloat4x4(&part.localTransform);
+                    if (part.faceCamera) {
+                        const auto& c = part.billboardCenter;
+                        const DirectX::XMVECTOR center = DirectX::XMVectorSet(c.x, c.y, c.z, 1.0f);
+                        DirectX::XMVECTOR forward = DirectX::XMVector3Normalize(DirectX::XMVectorSubtract(cameraModelLocal, center));
+                        if (DirectX::XMVector3Equal(forward, DirectX::XMVectorZero())) {
+                            forward = DirectX::XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+                        }
+                        DirectX::XMVECTOR up = part.sphericalBillboard ? cameraUpModelLocal : DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+                        DirectX::XMVECTOR right = DirectX::XMVector3Normalize(DirectX::XMVector3Cross(up, forward));
+                        if (DirectX::XMVector3Equal(right, DirectX::XMVectorZero())) {
+                            right = DirectX::XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+                        }
+                        up = DirectX::XMVector3Normalize(DirectX::XMVector3Cross(forward, right));
+                        const DirectX::XMMATRIX orient(
+                            DirectX::XMVectorGetX(right), DirectX::XMVectorGetY(right), DirectX::XMVectorGetZ(right), 0.0f,
+                            DirectX::XMVectorGetX(up), DirectX::XMVectorGetY(up), DirectX::XMVectorGetZ(up), 0.0f,
+                            DirectX::XMVectorGetX(forward), DirectX::XMVectorGetY(forward), DirectX::XMVectorGetZ(forward), 0.0f,
+                            0.0f, 0.0f, 0.0f, 1.0f);
+                        const DirectX::XMMATRIX billboard =
+                            DirectX::XMMatrixTranslation(-c.x, -c.y, -c.z) *
+                            orient *
+                            DirectX::XMMatrixTranslation(c.x, c.y, c.z);
+                        local = billboard * local;
+                    }
+                    DirectX::XMStoreFloat4x4(&partObj.model, DirectX::XMMatrixTranspose(local * model));
+                    const UINT64 objectSlot = 3u + static_cast<UINT64>(partIndex);
+                    std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * objectSlot), &partObj, sizeof(partObj));
+                    m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * objectSlot);
+                    m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(part.srvIndex));
+                    part.mesh.Draw(m_commandList.Get());
+                }
+            };
+            drawPartPass(false);
+            drawPartPass(true);
             m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(kModelAlbedoSrvIndex));
         } else {
+            m_commandList->SetPipelineState(m_planePso.Get());
             std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
             m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
             m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(kModelAlbedoSrvIndex));
@@ -2533,6 +2596,22 @@ bool D3D12Renderer::CreatePipeline(std::string& error) {
     hr = m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(m_planePso.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) {
         error = HrMessage("CreateGraphicsPipelineState(plane) failed", hr);
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC planeTransparentPso = pso;
+    planeTransparentPso.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    planeTransparentPso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    planeTransparentPso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    planeTransparentPso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    planeTransparentPso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    planeTransparentPso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    planeTransparentPso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    planeTransparentPso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    planeTransparentPso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    hr = m_device->CreateGraphicsPipelineState(&planeTransparentPso, IID_PPV_ARGS(m_planeTransparentPso.ReleaseAndGetAddressOf()));
+    if (FAILED(hr)) {
+        error = HrMessage("CreateGraphicsPipelineState(plane transparent) failed", hr);
         return false;
     }
 

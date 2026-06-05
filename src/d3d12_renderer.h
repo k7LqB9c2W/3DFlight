@@ -32,6 +32,7 @@ public:
     struct CameraSettings {
         CameraMode mode = CameraMode::Chase;
         float chaseDistanceMeters = 250.0f;
+        float chaseOrbitYawDeg = 0.0f;
         float cockpitSeatRightMeters = 0.0f;
         float cockpitSeatUpMeters = 0.0f;
         float cockpitSeatForwardMeters = 0.0f;
@@ -73,7 +74,13 @@ public:
             0.0f, 1.0f, 0.0f, 0.0f,
             0.0f, 0.0f, 1.0f, 0.0f,
             0.0f, 0.0f, 0.0f, 1.0f};
+        DirectX::XMFLOAT3 billboardCenter{0.0f, 0.0f, 0.0f};
         bool visible = true;
+        bool faceCamera = false;
+        bool sphericalBillboard = true;
+        bool transparent = false;
+        bool emissive = false;
+        float alphaCutoff = 0.0f;
     };
 
     struct PlanePartAnimationState {
@@ -82,7 +89,10 @@ public:
             0.0f, 1.0f, 0.0f, 0.0f,
             0.0f, 0.0f, 1.0f, 0.0f,
             0.0f, 0.0f, 0.0f, 1.0f};
+        DirectX::XMFLOAT3 billboardCenter{0.0f, 0.0f, 0.0f};
         bool visible = true;
+        bool faceCamera = false;
+        bool sphericalBillboard = true;
     };
 
     struct WorldAtlasPageUpload {
@@ -335,8 +345,14 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> texture;
         Microsoft::WRL::ComPtr<ID3D12Resource> upload;
         DirectX::XMFLOAT4X4 localTransform{};
+        DirectX::XMFLOAT3 billboardCenter{0.0f, 0.0f, 0.0f};
         UINT srvIndex = 0;
         bool visible = true;
+        bool faceCamera = false;
+        bool sphericalBillboard = true;
+        bool transparent = false;
+        bool emissive = false;
+        float alphaCutoff = 0.0f;
     };
 
     bool CreateDeviceResources(std::string& error);
@@ -446,6 +462,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_computeRootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_planePso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_planeTransparentPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_earthPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_skyboxPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_terrainPso;
