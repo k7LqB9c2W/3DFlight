@@ -67,6 +67,22 @@ public:
         std::vector<uint8_t> rgbaPixels;
         uint32_t textureWidth = 0;
         uint32_t textureHeight = 0;
+        std::string objectName;
+        DirectX::XMFLOAT4X4 localTransform{
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+        bool visible = true;
+    };
+
+    struct PlanePartAnimationState {
+        DirectX::XMFLOAT4X4 localTransform{
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+        bool visible = true;
     };
 
     struct WorldAtlasPageUpload {
@@ -142,6 +158,7 @@ public:
 
     bool SetPlaneMesh(const MeshData& mesh, std::string& error);
     bool SetPlaneMeshParts(const std::vector<PlaneMeshPart>& parts, std::string& error);
+    void SetPlanePartAnimationState(const std::vector<PlanePartAnimationState>& states);
     bool SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
     bool SetHudMapTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error);
     bool SetSatelliteLodTextures(const std::array<SatelliteLodTexture, 3>& lods, std::string& error);
@@ -225,7 +242,7 @@ private:
     static constexpr UINT kWorldSatellitePageKeySrvIndex = 22;
     static constexpr UINT kHudMapSrvIndex = 23;
     static constexpr UINT kVehiclePartSrvStartIndex = 32;
-    static constexpr UINT kMaxVehiclePartTextures = 128;
+    static constexpr UINT kMaxVehiclePartTextures = 512;
     static constexpr UINT kSrvHeapDescriptorCount = kVehiclePartSrvStartIndex + kMaxVehiclePartTextures;
     static constexpr UINT kUavTableStartIndex = 16;
     static constexpr UINT kTransmittanceUavIndex = kUavTableStartIndex + 0;
@@ -317,7 +334,9 @@ private:
         GpuMesh mesh;
         Microsoft::WRL::ComPtr<ID3D12Resource> texture;
         Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+        DirectX::XMFLOAT4X4 localTransform{};
         UINT srvIndex = 0;
+        bool visible = true;
     };
 
     bool CreateDeviceResources(std::string& error);

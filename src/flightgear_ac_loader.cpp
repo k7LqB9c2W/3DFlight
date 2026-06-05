@@ -59,7 +59,11 @@ struct ParseContext {
     std::vector<AcMaterial> materials;
     std::unordered_map<std::wstring, TextureImage> textureCache;
     std::unordered_map<std::wstring, size_t> partByTextureKey;
+    std::unordered_map<std::string, size_t> partByObjectTextureKey;
+    std::unordered_set<std::string> animatedObjectNames;
+    std::vector<std::string> modelAliasStack;
     std::vector<FlightGearMeshPart>* parts = nullptr;
+    std::vector<FlightGearAnimation>* animations = nullptr;
     std::filesystem::path aircraftRoot;
     std::unordered_set<std::wstring> loadedXml;
     FlightGearLoadStats stats{};
@@ -75,6 +79,7 @@ struct SubmodelOffset {
 };
 
 struct XmlModelRef {
+    std::string name;
     std::string path;
     SubmodelOffset offset;
 };
@@ -233,6 +238,31 @@ std::vector<std::string> ExtractBlocks(const std::string& xml, const std::string
         out.push_back((*it)[1].str());
     }
     return out;
+}
+
+std::vector<std::string> ExtractTagTexts(const std::string& xml, const std::string& tag) {
+    std::vector<std::string> out;
+    const std::regex pattern("<\\s*" + tag + "(?:\\s+[^>]*)?\\s*>([\\s\\S]*?)<\\s*/\\s*" + tag + "\\s*>", std::regex::icase);
+    for (std::sregex_iterator it(xml.begin(), xml.end(), pattern), end; it != end; ++it) {
+        out.push_back(Trim((*it)[1].str()));
+    }
+    return out;
+}
+
+DirectX::XMFLOAT3 RemapFgVector(const Float3& v) {
+    return {v.z, v.y, -v.x};
+}
+
+Float3 ReadFgVec3(const std::string& xml, const std::string& tag, const Float3& fallback = {}) {
+    const std::string block = GetFirstTagText(xml, tag);
+    if (block.empty()) {
+        return fallback;
+    }
+    return {
+        GetFirstTagFloat(block, "x", GetFirstTagFloat(block, "x-m", fallback.x)),
+        GetFirstTagFloat(block, "y", GetFirstTagFloat(block, "y-m", fallback.y)),
+        GetFirstTagFloat(block, "z", GetFirstTagFloat(block, "z-m", fallback.z)),
+    };
 }
 
 std::filesystem::path ResolveFlightGearPath(
@@ -446,15 +476,7 @@ DirectX::XMFLOAT4 SampleTexture(const TextureImage* texture, const Float2& uv) {
     };
 }
 
-FlightGearMeshPart& GetPartForTexture(ParseContext& context, const TextureBinding& texture) {
-    static constexpr wchar_t kUntexturedKey[] = L"__flightgear_untextured__";
-    const std::wstring key = texture.image != nullptr ? texture.key : std::wstring(kUntexturedKey);
-    const auto found = context.partByTextureKey.find(key);
-    if (found != context.partByTextureKey.end()) {
-        return (*context.parts)[found->second];
-    }
-
-    FlightGearMeshPart part{};
+void ApplyTextureToPart(FlightGearMeshPart& part, const TextureBinding& texture) {
     part.textureName = texture.name;
     if (texture.image != nullptr && texture.image->IsValid()) {
         part.texture.rgbaPixels = texture.image->pixels;
@@ -466,10 +488,57 @@ FlightGearMeshPart& GetPartForTexture(ParseContext& context, const TextureBindin
         part.texture.height = 1;
         part.textureName = "untextured";
     }
+}
+
+FlightGearMeshPart& GetPartForTexture(ParseContext& context, const TextureBinding& texture) {
+    static constexpr wchar_t kUntexturedKey[] = L"__flightgear_untextured__";
+    const std::wstring key = texture.image != nullptr ? texture.key : std::wstring(kUntexturedKey);
+    const auto found = context.partByTextureKey.find(key);
+    if (found != context.partByTextureKey.end()) {
+        return (*context.parts)[found->second];
+    }
+
+    FlightGearMeshPart part{};
+    ApplyTextureToPart(part, texture);
     context.parts->push_back(std::move(part));
     const size_t index = context.parts->size() - 1u;
     context.partByTextureKey.emplace(key, index);
     return (*context.parts)[index];
+}
+
+FlightGearMeshPart& GetPartForObjectTexture(ParseContext& context, const std::string& objectName, const TextureBinding& texture) {
+    std::string key = objectName;
+    for (const std::string& alias : context.modelAliasStack) {
+        key += "|";
+        key += alias;
+    }
+    key += "|";
+    key += texture.image != nullptr ? std::filesystem::path(texture.key).generic_string() : std::string("__flightgear_untextured__");
+    const auto found = context.partByObjectTextureKey.find(key);
+    if (found != context.partByObjectTextureKey.end()) {
+        return (*context.parts)[found->second];
+    }
+
+    FlightGearMeshPart part{};
+    part.objectName = objectName;
+    part.objectAliases = context.modelAliasStack;
+    ApplyTextureToPart(part, texture);
+    context.parts->push_back(std::move(part));
+    const size_t index = context.parts->size() - 1u;
+    context.partByObjectTextureKey.emplace(std::move(key), index);
+    return (*context.parts)[index];
+}
+
+FlightGearMeshPart& GetPartForObject(ParseContext& context, const std::string& objectName, const TextureBinding& texture) {
+    if (!objectName.empty() && context.animatedObjectNames.find(objectName) != context.animatedObjectNames.end()) {
+        return GetPartForObjectTexture(context, objectName, texture);
+    }
+    for (const std::string& alias : context.modelAliasStack) {
+        if (!alias.empty() && context.animatedObjectNames.find(alias) != context.animatedObjectNames.end()) {
+            return GetPartForObjectTexture(context, objectName, texture);
+        }
+    }
+    return GetPartForTexture(context, texture);
 }
 
 void AppendTriangle(MeshData& mesh, const std::array<Float3, 3>& positions, const std::array<Float2, 3>& uvs, const DirectX::XMFLOAT4& color) {
@@ -522,6 +591,7 @@ bool ParseAcObject(
     TextureBinding objectTexture = inheritedTexture;
     Float2 textureRepeat{1.0f, 1.0f};
     Float2 textureOffset{0.0f, 0.0f};
+    std::string objectName;
 
     while (stream.good()) {
         std::string token;
@@ -538,7 +608,7 @@ bool ParseAcObject(
             const std::string rest = ReadLineString(stream);
             context.materials.push_back(ParseMaterial(rest));
         } else if (token == "name") {
-            (void)ReadLineString(stream);
+            objectName = ReadLineString(stream);
         } else if (token == "data") {
             int len = 0;
             stream >> len;
@@ -621,7 +691,7 @@ bool ParseAcObject(
                 }
                 MeshData* targetMesh = &mesh;
                 if (context.parts != nullptr) {
-                    targetMesh = &GetPartForTexture(context, objectTexture).mesh;
+                    targetMesh = &GetPartForObject(context, objectName, objectTexture).mesh;
                 } else {
                     const DirectX::XMFLOAT4 sampled = SampleTexture(objectTexture.image, refs[0].uv);
                     baseColor.x *= sampled.x;
@@ -727,10 +797,114 @@ bool ShouldIncludeModelPath(const std::string& path, const FlightGearLoadOptions
     return true;
 }
 
+bool ShouldAnimateXmlPath(const std::filesystem::path& xmlPath) {
+    std::string lower = Lower(xmlPath.string());
+    std::replace(lower.begin(), lower.end(), '\\', '/');
+    const std::array<const char*, 9> skipped{
+        "/cockpit",
+        "/instruments/",
+        "/oh-panel/",
+        "/overhead/",
+        "/pedestal",
+        "/seats/",
+        "/yoke/",
+        "/services/",
+        "/effects/",
+    };
+    for (const char* needle : skipped) {
+        if (lower.find(needle) != std::string::npos) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<FlightGearAnimation::Type> ParseAnimationType(const std::string& rawType) {
+    const std::string type = Lower(Trim(rawType));
+    if (type == "select") {
+        return FlightGearAnimation::Type::Select;
+    }
+    if (type == "rotate") {
+        return FlightGearAnimation::Type::Rotate;
+    }
+    if (type == "translate") {
+        return FlightGearAnimation::Type::Translate;
+    }
+    if (type == "spin") {
+        return FlightGearAnimation::Type::Spin;
+    }
+    return std::nullopt;
+}
+
+void ParseInterpolation(const std::string& block, std::vector<FlightGearAnimationEntry>& outEntries) {
+    const std::string interpolation = GetFirstTagText(block, "interpolation");
+    if (interpolation.empty()) {
+        return;
+    }
+    for (const std::string& entryBlock : ExtractBlocks(interpolation, "entry")) {
+        FlightGearAnimationEntry entry{};
+        entry.input = GetFirstTagFloat(entryBlock, "ind", 0.0f);
+        entry.output = GetFirstTagFloat(entryBlock, "dep", 0.0f);
+        outEntries.push_back(entry);
+    }
+    std::sort(outEntries.begin(), outEntries.end(), [](const auto& a, const auto& b) { return a.input < b.input; });
+}
+
+void ParseAnimationCondition(const std::string& block, FlightGearAnimation& animation) {
+    const std::string condition = GetFirstTagText(block, "condition");
+    if (condition.empty()) {
+        return;
+    }
+    const bool inverted = Lower(condition).find("<not>") != std::string::npos;
+    const std::string prop = GetFirstTagText(condition, "property");
+    if (!prop.empty()) {
+        animation.conditionProperty = prop;
+        animation.conditionInvert = inverted;
+    }
+}
+
+void ParseAnimationsForXml(const std::filesystem::path& xmlPath, const std::string& xml, ParseContext& context) {
+    if (context.animations == nullptr || !ShouldAnimateXmlPath(xmlPath)) {
+        return;
+    }
+    for (const std::string& block : ExtractBlocks(xml, "animation")) {
+        const auto type = ParseAnimationType(GetFirstTagText(block, "type"));
+        if (!type) {
+            continue;
+        }
+        FlightGearAnimation animation{};
+        animation.type = *type;
+        animation.objectNames = ExtractTagTexts(block, "object-name");
+        if (animation.objectNames.empty()) {
+            continue;
+        }
+        animation.property = GetFirstTagText(block, "property");
+        animation.factor = GetFirstTagFloat(block, "factor", 1.0f);
+        if (animation.type == FlightGearAnimation::Type::Rotate || animation.type == FlightGearAnimation::Type::Spin) {
+            animation.offset = GetFirstTagFloat(block, "offset-deg", 0.0f);
+            animation.minValue = GetFirstTagFloat(block, "min-deg", animation.minValue);
+            animation.maxValue = GetFirstTagFloat(block, "max-deg", animation.maxValue);
+        } else {
+            animation.offset = GetFirstTagFloat(block, "offset-m", 0.0f);
+            animation.minValue = GetFirstTagFloat(block, "min-m", animation.minValue);
+            animation.maxValue = GetFirstTagFloat(block, "max-m", animation.maxValue);
+        }
+        animation.center = RemapFgVector(ReadFgVec3(block, "center"));
+        animation.axis = RemapFgVector(ReadFgVec3(block, "axis", {0.0f, 1.0f, 0.0f}));
+        ParseInterpolation(block, animation.interpolation);
+        ParseAnimationCondition(block, animation);
+        for (const std::string& objectName : animation.objectNames) {
+            context.animatedObjectNames.insert(objectName);
+        }
+        context.animations->push_back(std::move(animation));
+    }
+}
+
 std::vector<XmlModelRef> ParseModelRefs(const std::string& xml) {
     std::vector<XmlModelRef> out;
     for (const std::string& block : ExtractBlocks(xml, "model")) {
         XmlModelRef ref{};
+        ref.name = GetFirstTagText(block, "name");
         ref.path = GetFirstTagText(block, "path");
         const std::string offsets = GetFirstTagText(block, "offsets");
         if (!offsets.empty()) {
@@ -757,7 +931,17 @@ bool LoadModelXmlRecursive(
     std::string& error) {
     std::error_code ec;
     const std::filesystem::path canonical = std::filesystem::weakly_canonical(xmlPath, ec);
-    const std::wstring key = ec ? xmlPath.wstring() : canonical.wstring();
+    std::wostringstream keyBuilder;
+    keyBuilder << (ec ? xmlPath.wstring() : canonical.wstring());
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            keyBuilder << L'|' << transform.m[r][c];
+        }
+    }
+    for (const std::string& alias : context.modelAliasStack) {
+        keyBuilder << L'|' << std::wstring(alias.begin(), alias.end());
+    }
+    const std::wstring key = keyBuilder.str();
     if (!context.loadedXml.insert(key).second) {
         return true;
     }
@@ -769,6 +953,8 @@ bool LoadModelXmlRecursive(
     }
     const std::string xml((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     context.stats.xmlFilesLoaded += 1;
+
+    ParseAnimationsForXml(xmlPath, xml, context);
 
     const std::string ownPath = GetFirstTagText(xml, "path");
     if (!ownPath.empty()) {
@@ -788,14 +974,27 @@ bool LoadModelXmlRecursive(
         const std::filesystem::path resolved = ResolveFlightGearPath(xmlPath, context.aircraftRoot, ref.path);
         const Matrix4 childTransform = Multiply(transform, OffsetMatrix(ref.offset));
         const std::string ext = Lower(resolved.extension().string());
+        const bool hasModelAlias = !ref.name.empty();
+        if (hasModelAlias) {
+            context.modelAliasStack.push_back(ref.name);
+        }
         if (ext == ".xml") {
             if (!LoadModelXmlRecursive(resolved, childTransform, context, options, mesh, error)) {
+                if (hasModelAlias) {
+                    context.modelAliasStack.pop_back();
+                }
                 return false;
             }
         } else if (ext == ".ac") {
             if (!LoadAcFile(resolved, childTransform, context, mesh, error)) {
+                if (hasModelAlias) {
+                    context.modelAliasStack.pop_back();
+                }
                 return false;
             }
+        }
+        if (hasModelAlias) {
+            context.modelAliasStack.pop_back();
         }
     }
 
@@ -843,10 +1042,12 @@ bool LoadFlightGearAircraftMesh(
 bool LoadFlightGearAircraftParts(
     const std::filesystem::path& modelXmlPath,
     std::vector<FlightGearMeshPart>& outParts,
+    std::vector<FlightGearAnimation>& outAnimations,
     FlightGearLoadStats& outStats,
     const FlightGearLoadOptions& options,
     std::string& error) {
     outParts = {};
+    outAnimations = {};
     outStats = {};
 
     if (!std::filesystem::exists(modelXmlPath)) {
@@ -857,6 +1058,7 @@ bool LoadFlightGearAircraftParts(
     MeshData ignoredCombinedMesh;
     ParseContext context{};
     context.parts = &outParts;
+    context.animations = &outAnimations;
     context.aircraftRoot = modelXmlPath.parent_path().parent_path();
     if (!LoadModelXmlRecursive(modelXmlPath, Identity(), context, options, ignoredCombinedMesh, error)) {
         outStats = context.stats;

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -1389,6 +1390,10 @@ struct VehicleRenderAsset {
     MeshData mesh;
     GlbMaterialTexture texture;
     std::vector<D3D12Renderer::PlaneMeshPart> meshParts;
+    std::vector<D3D12Renderer::PlanePartAnimationState> meshPartAnimationStates;
+    std::vector<flight::FlightGearAnimation> flightGearAnimations;
+    std::vector<float> flightGearSpinAnglesDeg;
+    std::unordered_map<std::string, std::vector<size_t>> meshPartIndicesByObjectName;
     std::string modelStatus;
     std::string textureStatus;
     float minZoomMeters = 45.0f;
@@ -1549,6 +1554,176 @@ double MoveToward(double current, double target, double maxStep) {
 
 double MoveTowardAngle(double currentRad, double targetRad, double maxStepRad) {
     return WrapRadiansPi(currentRad + std::clamp(WrapRadiansPi(targetRad - currentRad), -maxStepRad, maxStepRad));
+}
+
+float MoveTowardFloat(float current, float target, float maxStep) {
+    const float delta = target - current;
+    if (std::abs(delta) <= maxStep) {
+        return target;
+    }
+    return current + std::copysign(maxStep, delta);
+}
+
+std::string NormalizeFlightGearPropertyPath(std::string path) {
+    while (!path.empty() && path.front() == '/') {
+        path.erase(path.begin());
+    }
+    return path;
+}
+
+std::string LowerAscii(std::string value) {
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+float GetFlightGearPropertyValue(const std::unordered_map<std::string, float>& properties, const std::string& path, float fallback = 0.0f) {
+    const auto found = properties.find(NormalizeFlightGearPropertyPath(path));
+    return (found != properties.end()) ? found->second : fallback;
+}
+
+void SetFlightGearPropertyValue(std::unordered_map<std::string, float>& properties, const std::string& path, float value) {
+    properties[NormalizeFlightGearPropertyPath(path)] = value;
+}
+
+bool FlightGearPropertyIsTrue(const std::unordered_map<std::string, float>& properties, const std::string& path) {
+    return GetFlightGearPropertyValue(properties, path, 0.0f) > 0.5f;
+}
+
+bool IsFlightGearLightObjectName(const std::string& objectName) {
+    const std::string lower = LowerAscii(objectName);
+    return lower.find("light") != std::string::npos ||
+        lower.find("strobe") != std::string::npos ||
+        lower.find("beacon") != std::string::npos ||
+        lower.find("taxi") != std::string::npos ||
+        lower.find("landing") != std::string::npos ||
+        lower.find("rednav") != std::string::npos ||
+        lower.find("greennav") != std::string::npos ||
+        lower.find("navlight") != std::string::npos;
+}
+
+bool FlightGearAnimationTargetsLight(const flight::FlightGearAnimation& animation) {
+    for (const std::string& objectName : animation.objectNames) {
+        if (IsFlightGearLightObjectName(objectName)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float EvaluateFlightGearAnimationValue(
+    const flight::FlightGearAnimation& animation,
+    const std::unordered_map<std::string, float>& properties) {
+    const float raw = GetFlightGearPropertyValue(properties, animation.property, 0.0f);
+    float value = raw * animation.factor + animation.offset;
+    if (!animation.interpolation.empty()) {
+        if (raw <= animation.interpolation.front().input) {
+            value = animation.interpolation.front().output;
+        } else if (raw >= animation.interpolation.back().input) {
+            value = animation.interpolation.back().output;
+        } else {
+            for (size_t i = 1; i < animation.interpolation.size(); ++i) {
+                const auto& prev = animation.interpolation[i - 1u];
+                const auto& next = animation.interpolation[i];
+                if (raw <= next.input) {
+                    const float span = std::max(next.input - prev.input, 0.0001f);
+                    const float t = std::clamp((raw - prev.input) / span, 0.0f, 1.0f);
+                    value = prev.output + (next.output - prev.output) * t;
+                    break;
+                }
+            }
+        }
+        value = value * animation.factor + animation.offset;
+    }
+    return std::clamp(value, animation.minValue, animation.maxValue);
+}
+
+DirectX::XMMATRIX FlightGearCenteredRotationMatrix(const flight::FlightGearAnimation& animation, float angleDeg) {
+    DirectX::XMVECTOR axis = DirectX::XMVector3Normalize(DirectX::XMLoadFloat3(&animation.axis));
+    if (DirectX::XMVector3Equal(axis, DirectX::XMVectorZero())) {
+        axis = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    }
+    const auto& c = animation.center;
+    return DirectX::XMMatrixTranslation(-c.x, -c.y, -c.z) *
+        DirectX::XMMatrixRotationAxis(axis, DirectX::XMConvertToRadians(angleDeg)) *
+        DirectX::XMMatrixTranslation(c.x, c.y, c.z);
+}
+
+void UpdateFlightGearVisualAnimations(
+    VehicleRenderAsset& asset,
+    const std::unordered_map<std::string, float>& properties,
+    double dtSeconds) {
+    if (asset.meshParts.empty() || asset.flightGearAnimations.empty()) {
+        return;
+    }
+    if (asset.meshPartAnimationStates.size() != asset.meshParts.size()) {
+        asset.meshPartAnimationStates.resize(asset.meshParts.size());
+    }
+    if (asset.flightGearSpinAnglesDeg.size() != asset.flightGearAnimations.size()) {
+        asset.flightGearSpinAnglesDeg.assign(asset.flightGearAnimations.size(), 0.0f);
+    }
+    for (auto& state : asset.meshPartAnimationStates) {
+        state.visible = true;
+        DirectX::XMStoreFloat4x4(&state.localTransform, DirectX::XMMatrixIdentity());
+    }
+
+    const bool exteriorLightsOn = FlightGearPropertyIsTrue(properties, "__lights/on");
+    for (size_t animationIndex = 0; animationIndex < asset.flightGearAnimations.size(); ++animationIndex) {
+        const auto& animation = asset.flightGearAnimations[animationIndex];
+        bool selected = true;
+        if (animation.type == flight::FlightGearAnimation::Type::Select) {
+            if (!animation.conditionProperty.empty()) {
+                selected = FlightGearPropertyIsTrue(properties, animation.conditionProperty);
+                if (animation.conditionInvert) {
+                    selected = !selected;
+                }
+            } else if (!animation.property.empty()) {
+                selected = FlightGearPropertyIsTrue(properties, animation.property);
+            }
+            if (!exteriorLightsOn && FlightGearAnimationTargetsLight(animation)) {
+                selected = false;
+            }
+        }
+
+        DirectX::XMMATRIX transform = DirectX::XMMatrixIdentity();
+        if (animation.type == flight::FlightGearAnimation::Type::Rotate) {
+            transform = FlightGearCenteredRotationMatrix(animation, EvaluateFlightGearAnimationValue(animation, properties));
+        } else if (animation.type == flight::FlightGearAnimation::Type::Translate) {
+            const float distance = EvaluateFlightGearAnimationValue(animation, properties);
+            DirectX::XMFLOAT3 axis = animation.axis;
+            DirectX::XMVECTOR axisVec = DirectX::XMVector3Normalize(DirectX::XMLoadFloat3(&axis));
+            if (DirectX::XMVector3Equal(axisVec, DirectX::XMVectorZero())) {
+                axisVec = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+            }
+            DirectX::XMStoreFloat3(&axis, axisVec);
+            transform = DirectX::XMMatrixTranslation(axis.x * distance, axis.y * distance, axis.z * distance);
+        } else if (animation.type == flight::FlightGearAnimation::Type::Spin) {
+            const float rateRpm = EvaluateFlightGearAnimationValue(animation, properties);
+            float& spinAngle = asset.flightGearSpinAnglesDeg[animationIndex];
+            spinAngle = std::fmod(spinAngle + rateRpm * 6.0f * static_cast<float>(dtSeconds), 360.0f);
+            transform = FlightGearCenteredRotationMatrix(animation, spinAngle);
+        }
+
+        for (const std::string& objectName : animation.objectNames) {
+            const auto indices = asset.meshPartIndicesByObjectName.find(objectName);
+            if (indices == asset.meshPartIndicesByObjectName.end()) {
+                continue;
+            }
+            for (const size_t partIndex : indices->second) {
+                if (partIndex >= asset.meshPartAnimationStates.size()) {
+                    continue;
+                }
+                auto& state = asset.meshPartAnimationStates[partIndex];
+                if (animation.type == flight::FlightGearAnimation::Type::Select) {
+                    state.visible = state.visible && selected;
+                } else {
+                    DirectX::XMMATRIX current = DirectX::XMLoadFloat4x4(&state.localTransform);
+                    DirectX::XMStoreFloat4x4(&state.localTransform, current * transform);
+                }
+            }
+        }
+    }
 }
 
 const char* AirplaneRoutePhaseName(AirplaneRoutePhase phase) {
@@ -2792,8 +2967,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         if (spec.flightGearAircraft) {
             flight::FlightGearLoadOptions fgOptions{};
             std::vector<flight::FlightGearMeshPart> flightGearParts;
-            loaded = flight::LoadFlightGearAircraftParts(spec.path, flightGearParts, fgStats, fgOptions, loadError);
+            std::vector<flight::FlightGearAnimation> flightGearAnimations;
+            loaded = flight::LoadFlightGearAircraftParts(spec.path, flightGearParts, flightGearAnimations, fgStats, fgOptions, loadError);
             if (loaded) {
+                asset.flightGearAnimations = std::move(flightGearAnimations);
+                asset.flightGearSpinAnglesDeg.assign(asset.flightGearAnimations.size(), 0.0f);
                 asset.meshParts.reserve(flightGearParts.size());
                 for (auto& part : flightGearParts) {
                     if (!part.mesh.IsValid()) {
@@ -2809,8 +2987,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                     renderPart.rgbaPixels = std::move(part.texture.rgbaPixels);
                     renderPart.textureWidth = part.texture.width;
                     renderPart.textureHeight = part.texture.height;
+                    renderPart.objectName = part.objectName;
+                    const size_t partIndex = asset.meshParts.size();
+                    if (!part.objectName.empty()) {
+                        asset.meshPartIndicesByObjectName[part.objectName].push_back(partIndex);
+                    }
+                    for (const std::string& alias : part.objectAliases) {
+                        if (!alias.empty()) {
+                            asset.meshPartIndicesByObjectName[alias].push_back(partIndex);
+                        }
+                    }
                     asset.meshParts.push_back(std::move(renderPart));
                 }
+                asset.meshPartAnimationStates.resize(asset.meshParts.size());
             }
         } else {
             loaded = flight::LoadGlbMesh(spec.path, asset.mesh, asset.texture, spec.loadOptions, loadError);
@@ -2848,6 +3037,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
                 asset.textureStatus =
                     "FlightGear multi-texture: " + std::to_string(fgStats.texturesLoaded) + " textures, " +
                     std::to_string(asset.meshParts.size()) + " draw parts, " +
+                    std::to_string(asset.flightGearAnimations.size()) + " exterior animations, " +
                     std::to_string(fgStats.texturesMissing) + " missing, " + std::to_string(fgStats.acFilesLoaded) +
                     " AC files, " + std::to_string(fgStats.xmlFilesLoaded) + " XML files";
             } else if (asset.texture.IsValid()) {
@@ -3184,6 +3374,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
     };
 
     bool previousBackspace = false;
+    bool previousGearKey = false;
+    bool previousFlapRetractKey = false;
+    bool previousFlapExtendKey = false;
+    bool previousLightKey = false;
+    bool fgGearTargetDown = true;
+    float fgGearPositionNorm = 1.0f;
+    float fgFlapTargetNorm = 0.0f;
+    float fgFlapPositionNorm = 0.0f;
+    bool fgExteriorLightsOn = true;
     bool cockpitViewSelected = VehicleModeIsCockpit(vehicleMode);
     g_cockpitViewSelected = &cockpitViewSelected;
     bool fgAudioEnabled = true;
@@ -3223,6 +3422,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             if (!ok) {
                 vehicleModeStatus = "Vehicle mesh switch failed: " + meshUploadError;
                 return;
+            }
+            if (!asset.meshPartAnimationStates.empty()) {
+                renderer.SetPlanePartAnimationState(asset.meshPartAnimationStates);
             }
         } else {
             std::string meshUploadError;
@@ -3369,6 +3571,35 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         input.resetPressed = backspaceDown && !previousBackspace;
         previousBackspace = backspaceDown;
 
+        const bool flightGearExteriorControls = flightInputFocused && vehicleMode == VehicleMode::FlightGear737;
+        const bool gearKeyDown = flightGearExteriorControls && IsKeyDown('G');
+        if (gearKeyDown && !previousGearKey) {
+            fgGearTargetDown = !fgGearTargetDown;
+            vehicleModeStatus = fgGearTargetDown ? "FlightGear 737 landing gear deploying" : "FlightGear 737 landing gear retracting";
+        }
+        previousGearKey = gearKeyDown;
+
+        const bool flapRetractKeyDown = flightGearExteriorControls && IsKeyDown('Z');
+        if (flapRetractKeyDown && !previousFlapRetractKey) {
+            fgFlapTargetNorm = std::max(0.0f, fgFlapTargetNorm - 0.25f);
+            vehicleModeStatus = "FlightGear 737 flaps set to " + std::to_string(static_cast<int>(std::round(fgFlapTargetNorm * 100.0f))) + "%";
+        }
+        previousFlapRetractKey = flapRetractKeyDown;
+
+        const bool flapExtendKeyDown = flightGearExteriorControls && IsKeyDown('X');
+        if (flapExtendKeyDown && !previousFlapExtendKey) {
+            fgFlapTargetNorm = std::min(1.0f, fgFlapTargetNorm + 0.25f);
+            vehicleModeStatus = "FlightGear 737 flaps set to " + std::to_string(static_cast<int>(std::round(fgFlapTargetNorm * 100.0f))) + "%";
+        }
+        previousFlapExtendKey = flapExtendKeyDown;
+
+        const bool lightKeyDown = flightGearExteriorControls && IsKeyDown('L');
+        if (lightKeyDown && !previousLightKey) {
+            fgExteriorLightsOn = !fgExteriorLightsOn;
+            vehicleModeStatus = fgExteriorLightsOn ? "FlightGear 737 exterior lights visible" : "FlightGear 737 exterior lights hidden";
+        }
+        previousLightKey = lightKeyDown;
+
         sim.SetStart(editableStart);
         if (!VehicleModeIsMissile(vehicleMode)) {
             if (airplaneRouteState.active && input.resetPressed) {
@@ -3415,6 +3646,64 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             vehicleMode == VehicleMode::FlightGear737,
             VehicleModeIsCockpit(vehicleMode),
             dt * static_cast<double>(simTimeScale));
+
+        const float visualDt = static_cast<float>(dt * static_cast<double>(simTimeScale));
+        fgGearPositionNorm = MoveTowardFloat(fgGearPositionNorm, fgGearTargetDown ? 1.0f : 0.0f, visualDt / 5.0f);
+        fgFlapPositionNorm = MoveTowardFloat(fgFlapPositionNorm, fgFlapTargetNorm, visualDt / 4.0f);
+        if (vehicleMode == VehicleMode::FlightGear737) {
+            std::unordered_map<std::string, float> fgVisualProperties;
+            const float speedMps = static_cast<float>(std::max(0.0, activeSim.SpeedMps()));
+            const float speedKnots = speedMps * 1.94384449f;
+            const bool nearGround = activeSim.AltitudeMeters() < 15.0;
+            const float compression = (nearGround && fgGearPositionNorm > 0.8f) ? 0.20f : 0.0f;
+            const float rollControl =
+                (input.rollRight ? 1.0f : 0.0f) -
+                (input.rollLeft ? 1.0f : 0.0f);
+            const float pitchControl =
+                (input.pitchUp ? 1.0f : 0.0f) -
+                (input.pitchDown ? 1.0f : 0.0f);
+            const float yawControl =
+                (input.yawRight ? 1.0f : 0.0f) -
+                (input.yawLeft ? 1.0f : 0.0f);
+            const float n1Percent = std::clamp(18.0f + speedKnots * 0.18f, 18.0f, 96.0f);
+
+            SetFlightGearPropertyValue(fgVisualProperties, "__lights/on", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "sim/rendering/shaders/skydome", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/nav-lights", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/strobe", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/beacon", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/landing-lights", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/Taxi-light", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/RB-light", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/wing", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/logo-lights", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/wheel", fgExteriorLightsOn ? 1.0f : 0.0f);
+            SetFlightGearPropertyValue(fgVisualProperties, "controls/lighting/landing-lights-norm", fgExteriorLightsOn ? 1.0f : 0.0f);
+
+            SetFlightGearPropertyValue(fgVisualProperties, "surface-positions/flap-pos-norm", fgFlapPositionNorm);
+            SetFlightGearPropertyValue(fgVisualProperties, "surface-positions/flap-pos-norm[0]", fgFlapPositionNorm);
+            for (int gearIndex = 0; gearIndex < 3; ++gearIndex) {
+                const std::string prefix = "gear/gear[" + std::to_string(gearIndex) + "]";
+                SetFlightGearPropertyValue(fgVisualProperties, prefix + "/position-norm", fgGearPositionNorm);
+                SetFlightGearPropertyValue(fgVisualProperties, prefix + "/compression-norm", compression);
+                SetFlightGearPropertyValue(fgVisualProperties, prefix + "/compression-ft", compression * 1.5f);
+                SetFlightGearPropertyValue(fgVisualProperties, prefix + "/rollspeed-ms", fgGearPositionNorm > 0.85f ? speedMps : 0.0f);
+            }
+            SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[7]", rollControl);
+            SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[8]", rollControl);
+            SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[9]", pitchControl);
+            SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[10]", pitchControl);
+            SetFlightGearPropertyValue(fgVisualProperties, "sim/multiplay/generic/float[11]", yawControl);
+            SetFlightGearPropertyValue(fgVisualProperties, "engines/engine[0]/n1", n1Percent);
+            SetFlightGearPropertyValue(fgVisualProperties, "engines/engine[1]/n1", n1Percent);
+            SetFlightGearPropertyValue(fgVisualProperties, "engines/engine/n1", n1Percent);
+
+            VehicleRenderAsset& activeFgAsset = vehicleAssets[VehicleModeToIndex(VehicleMode::FlightGear737)];
+            UpdateFlightGearVisualAnimations(activeFgAsset, fgVisualProperties, visualDt);
+            if (appliedRenderMode == VehicleMode::FlightGear737 && appliedVehicleAssetReady) {
+                renderer.SetPlanePartAnimationState(activeFgAsset.meshPartAnimationStates);
+            }
+        }
         if (!cockpitViewRuntime.freelookActive) {
             const double halflife = std::max(static_cast<double>(cockpitViewConfig.recenterHalflifeSec), 0.01);
             const float decay = static_cast<float>(std::exp2(-dt / halflife));
@@ -4152,6 +4441,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             ImGui::Text("Pitch W/S, Roll A/D, Yaw Q/E");
             ImGui::Text("Throttle Up/Down arrows");
             ImGui::Text("Altitude R/F, Reset Backspace");
+            if (vehicleMode == VehicleMode::FlightGear737) {
+                ImGui::Text("737 exterior: Gear G, Flaps Z/X, Lights L");
+                ImGui::Text(
+                    "737 visual state: gear %.0f%%, flaps %.0f%%, lights %s",
+                    fgGearPositionNorm * 100.0f,
+                    fgFlapPositionNorm * 100.0f,
+                    fgExteriorLightsOn ? "on" : "off");
+            }
             if (VehicleModeIsCockpit(vehicleMode)) {
                 ImGui::TextUnformatted("Cockpit view: hold RMB and move mouse to look around.");
             }

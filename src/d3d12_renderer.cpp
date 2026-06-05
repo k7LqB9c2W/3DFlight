@@ -1026,6 +1026,8 @@ bool D3D12Renderer::SetPlaneMeshParts(const std::vector<PlaneMeshPart>& parts, s
         if (!dst.mesh.Upload(m_device.Get(), m_commandList.Get(), src.mesh, error)) {
             return false;
         }
+        dst.localTransform = src.localTransform;
+        dst.visible = src.visible;
 
         const bool hasTexture =
             src.textureWidth > 0 &&
@@ -1071,6 +1073,14 @@ bool D3D12Renderer::SetPlaneMeshParts(const std::vector<PlaneMeshPart>& parts, s
     m_planeMesh = {};
     m_hasModelAlbedoTexture = false;
     return true;
+}
+
+void D3D12Renderer::SetPlanePartAnimationState(const std::vector<PlanePartAnimationState>& states) {
+    const size_t count = std::min(states.size(), m_planeParts.size());
+    for (size_t i = 0; i < count; ++i) {
+        m_planeParts[i].localTransform = states[i].localTransform;
+        m_planeParts[i].visible = states[i].visible;
+    }
 }
 
 bool D3D12Renderer::SetPlaneTexture(const uint8_t* rgbaPixels, uint32_t width, uint32_t height, std::string& error) {
@@ -1873,9 +1883,17 @@ void D3D12Renderer::Render(const FlightSim& sim, ImDrawData* imguiDrawData) {
         m_commandList->SetPipelineState(m_planePso.Get());
         if (!m_planeParts.empty()) {
             obj.colorAndFlags = {1.0f, 1.0f, 1.0f, 1.0f};
-            std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * 3), &obj, sizeof(obj));
-            m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * 3);
-            for (const auto& part : m_planeParts) {
+            for (size_t partIndex = 0; partIndex < m_planeParts.size(); ++partIndex) {
+                const auto& part = m_planeParts[partIndex];
+                if (!part.visible) {
+                    continue;
+                }
+                ObjectConstants partObj = obj;
+                const DirectX::XMMATRIX local = DirectX::XMLoadFloat4x4(&part.localTransform);
+                DirectX::XMStoreFloat4x4(&partObj.model, DirectX::XMMatrixTranspose(local * model));
+                const UINT64 objectSlot = 3u + static_cast<UINT64>(partIndex);
+                std::memcpy(m_objectCbMapped[m_frameIndex] + (m_objectCbStride * objectSlot), &partObj, sizeof(partObj));
+                m_commandList->SetGraphicsRootConstantBufferView(1, objectCbGpuBase + m_objectCbStride * objectSlot);
                 m_commandList->SetGraphicsRootDescriptorTable(3, GpuSrv(part.srvIndex));
                 part.mesh.Draw(m_commandList.Get());
             }
@@ -2640,7 +2658,7 @@ bool D3D12Renderer::CreateConstantBuffers(std::string& error) {
         }
 
         D3D12_RESOURCE_DESC objectDesc = sceneDesc;
-        objectDesc.Width = m_objectCbStride * 4;
+        objectDesc.Width = m_objectCbStride * (3 + kMaxVehiclePartTextures);
 
         hr = m_device->CreateCommittedResource(
             &heapProps,

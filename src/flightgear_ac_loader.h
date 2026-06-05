@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <DirectXMath.h>
+
 #include "gltf_loader.h"
 #include "mesh.h"
 
@@ -27,6 +29,35 @@ struct FlightGearMeshPart {
     MeshData mesh;
     GlbMaterialTexture texture;
     std::string textureName;
+    std::string objectName;
+    std::vector<std::string> objectAliases;
+};
+
+struct FlightGearAnimationEntry {
+    float input = 0.0f;
+    float output = 0.0f;
+};
+
+struct FlightGearAnimation {
+    enum class Type {
+        Select,
+        Rotate,
+        Translate,
+        Spin,
+    };
+
+    Type type = Type::Rotate;
+    std::vector<std::string> objectNames;
+    std::string property;
+    std::string conditionProperty;
+    bool conditionInvert = false;
+    float factor = 1.0f;
+    float offset = 0.0f;
+    float minValue = -3.402823466e+38f;
+    float maxValue = 3.402823466e+38f;
+    DirectX::XMFLOAT3 center{0.0f, 0.0f, 0.0f};
+    DirectX::XMFLOAT3 axis{0.0f, 1.0f, 0.0f};
+    std::vector<FlightGearAnimationEntry> interpolation;
 };
 
 bool LoadFlightGearAircraftMesh(
@@ -40,6 +71,7 @@ bool LoadFlightGearAircraftMesh(
 bool LoadFlightGearAircraftParts(
     const std::filesystem::path& modelXmlPath,
     std::vector<FlightGearMeshPart>& outParts,
+    std::vector<FlightGearAnimation>& outAnimations,
     FlightGearLoadStats& outStats,
     const FlightGearLoadOptions& options,
     std::string& error);
